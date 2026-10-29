@@ -28,7 +28,7 @@ use crate::terminal::page_list::{Direction, NodePtr, PageList, Pin};
 use crate::terminal::point::{Coordinate, Tag};
 use crate::terminal::screen::Screen;
 use crate::terminal::selection::Selection;
-use crate::terminal::size::{self, CellCountInt};
+use crate::terminal::size::CellCountInt;
 use crate::terminal::style::{self, Style};
 
 /// Formats available.
@@ -2071,6 +2071,3 @@ fn write_codepoint(emit: Format, writer: &mut dyn Write, codepoint: u32) -> io::
         },
     }
 }
-
-#[allow(dead_code)]
-fn _size_check(_: size::CellCountInt) {}
