@@ -16,8 +16,12 @@ path = "src/main.rs"
 
 [features]
 default = []
+gtk = ["dep:gio", "dep:glib"]
 
 [dependencies]
+gio = { version = "0.21", optional = true }
+glib = { version = "0.21", optional = true }
+libc = "0.2"
 log = "0.4"
 
 [dev-dependencies]
