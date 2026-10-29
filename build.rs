@@ -13,6 +13,13 @@ fn main() {
 fn pkg_c_libraries() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    // Cross-checking the macOS target from another host (e.g.
+    // `cargo check --target x86_64-apple-darwin` on Linux) can't compile or
+    // link C code without an Apple SDK, and a check doesn't need it.
+    if target_os == "macos" && !cfg!(target_os = "macos") {
+        return;
+    }
+
     for lib in ["freetype2", "harfbuzz", "fontconfig", "oniguruma"] {
         if let Err(err) = pkg_config::Config::new().probe(lib) {
             panic!("pkg-config could not find system library {lib}: {err}");

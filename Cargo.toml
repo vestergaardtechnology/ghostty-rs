@@ -34,9 +34,12 @@ indexmap = "2"
 libc = "0.2"
 log = "0.4"
 memchr = "2"
+miniz_oxide = "0.8"
+naga = { version = "30", features = ["glsl-in", "glsl-out", "msl-out", "spv-in", "spv-out"] }
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+zune-jpeg = "0.5"
 
 [dev-dependencies]
 png = "0.18"
