@@ -1,4 +1,311 @@
 //! Port of `src/apprt/gtk/class/inspector_widget.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: partial — `src/inspector` is not ported, so the inspector UI
+//! itself (`Inspector.setup`/`render`) is a no-op stand-in; the widget runs
+//! against the `Surface`/core `Surface` stand-ins in `class::port_stubs`
+//! (TODO(port-dedupe)). Only built with the `inspector` Cargo feature.
+//!
+//! Zig keeps an unreferenced surface pointer plus a weak notify and reads
+//! the core surface from the dying surface in the notify. The port keeps a
+//! `GWeakRef`, the pointer (for identity) and the core surface it
+//! activated the inspector on, since a Rust wrapper can't be obtained for an
+//! object that is being finalized.
+#![cfg(all(feature = "gtk", feature = "inspector"))]
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::sync::LazyLock;
+
+use glib::prelude::*;
+use glib::subclass::prelude::*;
+use gtk4::prelude::*;
+use gtk4::subclass::prelude::*;
+use libadwaita::subclass::prelude::*;
+
+use crate::apprt::gtk::class::imgui_widget::{ImguiWidget, ImguiWidgetImpl};
+use crate::apprt::gtk::class::{self, Blueprint};
+
+// TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
+// and crate::surface::Surface (core).
+use crate::apprt::gtk::class::port_stubs::{CoreSurface, Surface};
+
+const LOG: &str = "gtk_ghostty_inspector_widget";
+
+/// The template of this class (Zig: `gresource.blueprint(...)`).
+pub const BLUEPRINT: Blueprint = Blueprint { major: 1, minor: 0, name: "inspector-widget" };
+
+/// Property names (Zig: `properties`).
+pub mod properties {
+    pub const SURFACE: &str = "surface";
+}
+
+/// Stand-in for `src/inspector/Inspector.zig`.
+// TODO(port-dedupe): replace with crate::inspector::Inspector
+struct Inspector;
+
+impl Inspector {
+    /// `Inspector.setup()`
+    fn setup() {}
+
+    /// `inspector.render(core_surface)`
+    fn render(_core_surface: &CoreSurface) {}
+}
+
+mod imp {
+    use super::*;
+
+    #[derive(Default, gtk4::CompositeTemplate)]
+    #[template(resource = "/com/mitchellh/ghostty/ui/1.0/inspector-widget.ui")]
+    pub struct InspectorWidget {
+        /// The surface that we are attached to. This is NOT referenced.
+        /// We attach a weak notify to the object.
+        pub surface: glib::WeakRef<Surface>,
+
+        /// The identity of `surface` (Zig compares the pointers).
+        pub surface_ptr: Cell<usize>,
+
+        /// The core surface the inspector was activated on.
+        pub core_surface: RefCell<Option<Rc<CoreSurface>>>,
+
+        /// The weak notify on `surface`.
+        pub weak_notify: RefCell<Option<glib::object::WeakRefNotify<Surface>>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for InspectorWidget {
+        const NAME: &'static str = "GhosttyInspectorWidget";
+        type Type = super::InspectorWidget;
+        type ParentType = ImguiWidget;
+
+        fn class_init(klass: &mut Self::Class) {
+            ImguiWidget::ensure_type();
+            Surface::ensure_type();
+            class::ensure_resources();
+            klass.bind_template();
+        }
+
+        fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
+            obj.init_template();
+        }
+    }
+
+    impl ObjectImpl for InspectorWidget {
+        fn properties() -> &'static [glib::ParamSpec] {
+            static PROPS: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
+                vec![glib::ParamSpecObject::builder::<Surface>(properties::SURFACE).build()]
+            });
+            PROPS.as_ref()
+        }
+
+        fn property(&self, _: usize, pspec: &glib::ParamSpec) -> glib::Value {
+            match pspec.name() {
+                properties::SURFACE => self.obj().get_surface().to_value(),
+                _ => unreachable!(),
+            }
+        }
+
+        fn set_property(&self, _: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+            match pspec.name() {
+                properties::SURFACE => {
+                    let surface: Option<Surface> = value.get().unwrap();
+                    self.obj().set_surface(surface.as_ref());
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        fn dispose(&self) {
+            // Clear our surface so it deactivates the inspector.
+            self.obj().set_surface(None);
+            self.dispose_template();
+        }
+    }
+
+    impl WidgetImpl for InspectorWidget {}
+    impl BinImpl for InspectorWidget {}
+
+    impl ImguiWidgetImpl for InspectorWidget {
+        /// Called to do initial setup of the UI.
+        fn setup(&self) {
+            Inspector::setup();
+        }
+
+        /// Called for every frame to draw the UI.
+        fn render(&self) {
+            let Some(core_surface) = self.obj().get_surface().and_then(|s| s.core()) else {
+                return;
+            };
+            if !core_surface.inspector_active() {
+                return;
+            }
+            Inspector::render(&core_surface);
+        }
+    }
+}
+
+glib::wrapper! {
+    /// Widget for displaying the Ghostty inspector.
+    pub struct InspectorWidget(ObjectSubclass<imp::InspectorWidget>)
+        @extends ImguiWidget, libadwaita::Bin, gtk4::Widget,
+        @implements gtk4::Accessible, gtk4::Buildable, gtk4::ConstraintTarget;
+}
+
+impl Default for InspectorWidget {
+    fn default() -> Self {
+        glib::Object::new()
+    }
+}
+
+fn object_ptr(surface: Option<&Surface>) -> usize {
+    surface.map_or(0, |s| s.as_ptr() as usize)
+}
+
+impl InspectorWidget {
+    //---------------------------------------------------------------
+    // Public methods
+
+    /// Queue a render of the Dear ImGui widget.
+    pub fn queue_render(&self) {
+        self.upcast_ref::<ImguiWidget>().queue_render();
+    }
+
+    //---------------------------------------------------------------
+    // Properties
+
+    pub fn get_surface(&self) -> Option<Surface> {
+        self.imp().surface.upgrade()
+    }
+
+    pub fn set_surface(&self, surface: Option<&Surface>) {
+        let priv_ = self.imp();
+
+        // Do nothing if we're not changing the value.
+        if object_ptr(surface) == priv_.surface_ptr.get() {
+            return;
+        }
+
+        // Setup our notification to happen at the end because we're
+        // changing values no matter what.
+        let _guard = self.freeze_notify();
+        self.notify(properties::SURFACE);
+
+        // Deactivate the inspector on the old surface if it exists
+        // and set our value to null.
+        if priv_.surface_ptr.get() != 0 {
+            priv_.surface_ptr.set(0);
+            priv_.surface.set(None);
+
+            // Remove our weak ref
+            if let Some(notify) = priv_.weak_notify.take() {
+                notify.disconnect();
+            }
+
+            // Deactivate the inspector
+            if let Some(core_surface) = priv_.core_surface.take() {
+                core_surface.deactivate_inspector();
+            }
+        }
+
+        // Activate the inspector on the new surface.
+        let Some(surface) = surface else { return };
+        let Some(core_surface) = surface.core() else { return };
+        if let Err(err) = core_surface.activate_inspector() {
+            log::warn!(target: LOG, "failed to activate inspector err={err:?}");
+            return;
+        }
+
+        // We use a weak reference on surface to determine if the surface
+        // was closed while our inspector was active.
+        let weak = self.downgrade();
+        let ptr = object_ptr(Some(surface));
+        let notify = surface.add_weak_ref_notify_local(move || {
+            if let Some(this) = weak.upgrade() {
+                this.surface_weak_notify(ptr);
+            }
+        });
+        priv_.weak_notify.replace(Some(notify));
+
+        // Store our surface. We don't need to ref this because we setup
+        // the weak notify above.
+        priv_.surface.set(Some(surface));
+        priv_.surface_ptr.set(ptr);
+        priv_.core_surface.replace(Some(core_surface));
+
+        self.queue_render();
+    }
+
+    //---------------------------------------------------------------
+    // Signal Handlers
+
+    fn surface_weak_notify(&self, surface: usize) {
+        let priv_ = self.imp();
+
+        // The weak notify docs call out that we can specifically use the
+        // pointer values for comparison, but the objects themselves are unsafe.
+        if priv_.surface_ptr.get() != surface {
+            return;
+        }
+
+        // The notify has fired, so there is nothing to disconnect.
+        let _ = priv_.weak_notify.take();
+
+        let Some(core_surface) = priv_.core_surface.take() else { return };
+        core_surface.deactivate_inspector();
+        priv_.surface_ptr.set(0);
+        priv_.surface.set(None);
+        self.notify(properties::SURFACE);
+
+        // Note: in the future we should probably show some content on our
+        // window to note that the surface went away in case our embedding
+        // widget doesn't close itself. As I type this, our window closes
+        // immediately when the surface goes away so you don't see this, but
+        // for completeness sake we should clean this up.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apprt::gtk::ext::test_gtk;
+
+    #[test]
+    fn blueprint_path() {
+        assert_eq!(
+            class::blueprint(BLUEPRINT),
+            "/com/mitchellh/ghostty/ui/1.0/inspector-widget.ui"
+        );
+    }
+
+    #[test]
+    fn surface_lifecycle() {
+        test_gtk::run(|| {
+            let w = InspectorWidget::default();
+            // The subclass overrides the virtual methods.
+            w.upcast_ref::<ImguiWidget>().setup();
+            w.upcast_ref::<ImguiWidget>().render();
+
+            let core = CoreSurface::new(1);
+            let surface = Surface::default();
+            surface.set_core(Some(core.clone()));
+
+            w.set_property(properties::SURFACE, &surface);
+            assert_eq!(w.get_surface().as_ref(), Some(&surface));
+            assert!(core.inspector_active());
+
+            w.set_surface(None);
+            assert!(!core.inspector_active());
+            assert!(w.get_surface().is_none());
+
+            // The surface going away deactivates the inspector.
+            w.set_surface(Some(&surface));
+            assert!(core.inspector_active());
+            let notified = std::rc::Rc::new(Cell::new(false));
+            let n = notified.clone();
+            w.connect_notify_local(Some(properties::SURFACE), move |_, _| n.set(true));
+            drop(surface);
+            assert!(!core.inspector_active());
+            assert!(notified.get());
+            assert!(w.get_surface().is_none());
+        });
+    }
+}

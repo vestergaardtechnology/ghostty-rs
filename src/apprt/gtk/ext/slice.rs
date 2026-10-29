@@ -10,7 +10,7 @@ use std::ffi::{CStr, CString};
 
 /// A boxed type that holds a list of string slices.
 #[derive(Debug, Clone, PartialEq, Eq, glib::Boxed)]
-#[boxed_type(name = "GhosttyStringList")]
+#[boxed_type(name = "GhosttyStringList", nullable)]
 pub struct StringList {
     pub strings: Vec<CString>,
 }
