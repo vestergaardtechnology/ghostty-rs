@@ -4,3 +4,7 @@
 #[path = "src/main.rs"]
 pub mod src;
 // @generated-mods-end
+
+// Re-export the package root (`@import("gtk4-layer-shell")`).
+#[cfg(feature = "gtk")]
+pub use self::src::*;

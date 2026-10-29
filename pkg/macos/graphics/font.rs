@@ -1,4 +1,5 @@
 //! Port of `src/macos/graphics/font.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
+pub type Glyph = super::c::CGGlyph;

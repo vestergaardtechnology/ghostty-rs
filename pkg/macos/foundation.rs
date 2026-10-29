@@ -1,6 +1,6 @@
 //! Port of `src/macos/foundation.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "foundation/array.rs"]
@@ -26,3 +26,17 @@ pub mod r#type;
 #[path = "foundation/url.rs"]
 pub mod url;
 // @generated-mods-end
+
+pub use array::{Array, MutableArray};
+pub use attributed_string::{AttributeKey, AttributedString, MutableAttributedString};
+pub use base::{ComparisonResult, FourCharCode, Range};
+pub use character_set::CharacterSet;
+pub use data::Data;
+pub use dictionary::{Dictionary, MutableDictionary};
+pub use number::{Number, NumberType};
+pub use r#type::{cf_release, cf_retain};
+pub use string::{
+    string_get_surrogate_pair_for_long_character, MutableString, String, StringComparison,
+    StringEncoding,
+};
+pub use url::{URLPathStyle, URL};
