@@ -538,12 +538,13 @@ pub struct DmabufQuery {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// EGL displays are per-platform singletons; serialize the tests that
-    /// initialize/terminate one.
-    static EGL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// initialize/terminate one. (Also taken by the renderer's GL tests,
+    /// `renderer::opengl::device::test_context`.)
+    pub(crate) static EGL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn has_extension_tokens() {
