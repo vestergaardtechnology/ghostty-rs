@@ -1,6 +1,6 @@
 //! Port of `src/cli.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "cli/action.rs"]
@@ -56,3 +56,7 @@ pub mod validate_config;
 #[path = "cli/version.rs"]
 pub mod version;
 // @generated-mods-end
+
+pub(crate) use self::args::compatibility_renamed;
+pub use self::args::CompatibilityHandler;
+pub use self::diagnostics::{Diagnostic, DiagnosticList, Location};
