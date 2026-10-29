@@ -127,15 +127,6 @@ pub mod standins {
             .collect()
     }
 
-    /// The bold color type of the terminal style (Zig
-    /// `terminal.style.Style.BoldColor`).
-    ///
-    /// TODO(port-dedupe): replace with crate::terminal::style::BoldColor
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum TerminalBoldColor {
-        Color(terminal_color::Rgb),
-        Bright,
-    }
 
     /// CodepointMap is a map of codepoints to a discovery descriptor of a font
     /// to use for that codepoint (Zig `font.CodepointMap`).
@@ -5817,10 +5808,10 @@ pub enum BoldColor {
 
 impl BoldColor {
     /// Convert to the terminal-native BoldColor type.
-    pub fn to_terminal(self) -> standins::TerminalBoldColor {
+    pub fn to_terminal(self) -> crate::terminal::style::BoldColor {
         match self {
-            BoldColor::Color(col) => standins::TerminalBoldColor::Color(col.to_terminal_rgb()),
-            BoldColor::Bright => standins::TerminalBoldColor::Bright,
+            BoldColor::Color(col) => crate::terminal::style::BoldColor::Color(col.to_terminal_rgb()),
+            BoldColor::Bright => crate::terminal::style::BoldColor::Bright,
         }
     }
 
