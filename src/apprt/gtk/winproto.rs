@@ -53,19 +53,7 @@ pub trait ApprtWindow {
 }
 
 /// `GlobalShortcuts.BindFailed`
-// TODO(port-dedupe): replace with
-// crate::apprt::gtk::class::global_shortcuts::BindFailed
-#[derive(Debug, Clone)]
-pub struct BindFailed {
-    pub trigger: binding::Trigger,
-    pub action: binding::Action,
-
-    /// May be empty.
-    pub message: String,
-
-    /// Revoked after binding rather than denied up front.
-    pub revoked: bool,
-}
+pub use super::class::global_shortcuts::BindFailed;
 
 /// The parts of `class/global_shortcuts.zig`'s `GlobalShortcuts` that the
 /// winproto shortcut backends use.
