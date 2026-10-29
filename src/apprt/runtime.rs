@@ -2,6 +2,8 @@
 //!
 //! STATUS: ported
 
+use std::fmt;
+
 /// Runtime is the runtime to use for Ghostty. All runtimes do not provide
 /// equivalent feature sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -16,39 +18,34 @@ pub enum Runtime {
 }
 
 impl Runtime {
-    /// The tag name as spelled in Zig (used for build options).
+    /// The default runtime for the current compilation target (Zig:
+    /// `default(target)`; the Rust port only ever asks about the target
+    /// being compiled).
+    pub const fn default() -> Runtime {
+        // The Linux and FreeBSD default is GTK because it is a full
+        // featured application.
+        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+            Runtime::Gtk
+        } else {
+            // Otherwise, we do NONE so we don't create an exe and we create
+            // libghostty. On macOS, Xcode is used to build the app that links
+            // to libghostty.
+            Runtime::None
+        }
+    }
+
+    /// The Zig tag name.
     pub const fn as_str(self) -> &'static str {
         match self {
             Runtime::None => "none",
             Runtime::Gtk => "gtk",
         }
     }
-
-    /// Zig: `default(target: std.Target)`. The Rust port takes the target
-    /// OS name as spelled by `cfg(target_os = "...")`.
-    #[allow(clippy::should_implement_trait)]
-    pub fn default(target_os: &str) -> Runtime {
-        match target_os {
-            // The Linux and FreeBSD default is GTK because it is a full
-            // featured application.
-            "linux" | "freebsd" => Runtime::Gtk,
-            // Otherwise, we do NONE so we don't create an exe and we create
-            // libghostty. On macOS, Xcode is used to build the app that links
-            // to libghostty.
-            _ => Runtime::None,
-        }
-    }
 }
 
-impl std::str::FromStr for Runtime {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "none" => Ok(Runtime::None),
-            "gtk" => Ok(Runtime::Gtk),
-            _ => Err(()),
-        }
+impl fmt::Display for Runtime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -57,11 +54,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_runtime() {
-        assert_eq!(Runtime::Gtk, Runtime::default("linux"));
-        assert_eq!(Runtime::Gtk, Runtime::default("freebsd"));
-        assert_eq!(Runtime::None, Runtime::default("macos"));
-        assert_eq!(Ok(Runtime::Gtk), "gtk".parse());
-        assert_eq!("none", Runtime::None.as_str());
+    fn runtime() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(Runtime::default(), Runtime::Gtk);
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(Runtime::default(), Runtime::None);
+        }
+        assert_eq!(Runtime::Gtk.to_string(), "gtk");
+        assert_eq!(Runtime::None.to_string(), "none");
     }
 }

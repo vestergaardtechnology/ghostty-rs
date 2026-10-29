@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::backend::Backend;
+use crate::pkg::freetype;
 
 /// Library implementation for the compile options.
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
@@ -27,63 +28,6 @@ const _: () = {
     let _ = Backend::Freetype;
 };
 
-/// Minimal stand-in for the FreeType binding of `pkg/freetype`.
-// TODO(port-dedupe): replace with crate::pkg::freetype (Library, Error)
-// once pkg/freetype is ported.
-pub mod freetype {
-    use std::ffi::c_int;
-    use std::ffi::c_void;
-
-    #[link(name = "freetype")]
-    extern "C" {
-        fn FT_Init_FreeType(alibrary: *mut *mut c_void) -> c_int;
-        fn FT_Done_FreeType(library: *mut c_void) -> c_int;
-    }
-
-    /// A FreeType error code.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Error(pub i32);
-
-    impl std::fmt::Display for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "FreeType error {}", self.0)
-        }
-    }
-
-    impl std::error::Error for Error {}
-
-    /// A handle to a FreeType library instance (`FT_Library`).
-    #[derive(Debug, Clone, Copy)]
-    pub struct Library {
-        pub handle: *mut c_void,
-    }
-
-    // SAFETY: FT_Library handles may be moved between threads; callers
-    // serialize face creation/destruction with `FreetypeLibrary::mutex`.
-    unsafe impl Send for Library {}
-    unsafe impl Sync for Library {}
-
-    impl Library {
-        pub fn init() -> Result<Library, Error> {
-            let mut handle: *mut c_void = std::ptr::null_mut();
-            // SAFETY: FT_Init_FreeType writes a valid handle on success.
-            let res = unsafe { FT_Init_FreeType(&mut handle) };
-            if res != 0 {
-                return Err(Error(res));
-            }
-            Ok(Library { handle })
-        }
-
-        pub fn deinit(&self) {
-            // SAFETY: the handle was created by FT_Init_FreeType and is
-            // only released once by `FreetypeLibrary::deinit`.
-            unsafe {
-                FT_Done_FreeType(self.handle);
-            }
-        }
-    }
-}
-
 /// Library backed by FreeType.
 ///
 /// This is cheap to clone: clones share the same FreeType library and
@@ -97,6 +41,12 @@ pub struct FreetypeLibrary {
     pub mutex: Arc<Mutex<()>>,
 }
 
+// SAFETY: an FT_Library handle may be used from multiple threads as long as
+// face creation/destruction is serialized, which `mutex` is for (this is
+// how the Zig code shares the library between threads).
+unsafe impl Send for FreetypeLibrary {}
+unsafe impl Sync for FreetypeLibrary {}
+
 pub type FreetypeInitError = freetype::Error;
 
 impl FreetypeLibrary {
@@ -106,8 +56,15 @@ impl FreetypeLibrary {
         Ok(FreetypeLibrary { lib, mutex })
     }
 
+    /// Release the FreeType library.
+    ///
+    /// Like the Zig version, this must be called exactly once (on one of
+    /// the clones), after every face created from this library has been
+    /// deinitialized.
     pub fn deinit(&mut self) {
-        self.lib.deinit();
+        // SAFETY: the library is not used after deinit (caller contract,
+        // same as the Zig `deinit`).
+        unsafe { self.lib.deinit() };
     }
 }
 
