@@ -29,8 +29,6 @@
 //! * The terminal fields Exec reads (`cols`, `rows`, `width_px`,
 //!   `height_px`, `flags.password_input`, `setPwd`) go through
 //!   [`terminal_standin`] until `Terminal` is ported (TODO(port-dedupe)).
-//! * `shell_integration` is a stand-in until `termio/shell_integration.zig`
-//!   lands (TODO(port-dedupe)).
 
 use std::cell::UnsafeCell;
 use std::ffi::{c_void, CString};
@@ -54,9 +52,8 @@ use crate::pty::{self as ptypkg, ProcessInfo, ProcessInfoValue, Pty};
 use crate::renderer;
 use crate::renderer::state::standin::Terminal;
 use crate::termio::backend;
+use crate::termio::shell_integration;
 use crate::termio::standin::{crash_surface, Termio, TermioThreadData};
-
-use self::shell_integration_standin as shell_integration;
 
 const LOG: &str = "io_exec";
 
@@ -131,6 +128,9 @@ pub enum Error {
     /// An event loop error.
     Xev(xev::Error),
 
+    /// Setting up shell integration failed.
+    ShellIntegration(shell_integration::Error),
+
     Unexpected,
 }
 
@@ -138,6 +138,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Pipe(e) => write!(f, "Pipe({e})"),
+            // Zig's error set is flattened, so show the inner error name.
+            Error::ShellIntegration(e) => fmt::Display::fmt(e, f),
             other => fmt::Debug::fmt(other, f),
         }
     }
@@ -188,6 +190,12 @@ impl From<ptypkg::WindowsSetSizeError> for Error {
 impl From<xev::Error> for Error {
     fn from(e: xev::Error) -> Self {
         Error::Xev(e)
+    }
+}
+
+impl From<shell_integration::Error> for Error {
+    fn from(e: shell_integration::Error) -> Self {
+        Error::ShellIntegration(e)
     }
 }
 
@@ -1209,7 +1217,7 @@ impl Subprocess {
                 &mut env,
                 cfg.shell_integration_features,
                 cfg.cursor_blink.unwrap_or(true),
-            );
+            )?;
 
             let force: Option<shell_integration::Shell> = match cfg.shell_integration {
                 ConfigShellIntegration::None => {
@@ -1234,7 +1242,7 @@ impl Subprocess {
             };
 
             let Some(integration) =
-                shell_integration::setup(dir, &default_shell_command, &mut env, force)
+                shell_integration::setup(dir, &default_shell_command, &mut env, force)?
             else {
                 log::warn!(
                     target: LOG,
@@ -2708,74 +2716,6 @@ pub mod terminal_standin {
     }
 }
 
-/// TODO(port-dedupe): replace with `crate::termio::shell_integration`
-/// once `termio/shell_integration.zig` is ported. Only `setupFeatures` is
-/// implemented; `setup` never detects a shell.
-pub mod shell_integration_standin {
-    use super::{configpkg, EnvMap, ShellIntegrationFeatures};
-
-    /// Shell types we support
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Shell {
-        Bash,
-        Elvish,
-        Fish,
-        Nushell,
-        Zsh,
-    }
-
-    /// The result of setting up a shell integration.
-    #[derive(Debug, Clone)]
-    pub struct ShellIntegration {
-        /// The successfully-integrated shell.
-        pub shell: Shell,
-
-        /// The command to use to start the shell with the integration.
-        pub command: configpkg::Command,
-    }
-
-    /// Set up the command execution environment for automatic
-    /// integrated shell integration. The stand-in never integrates.
-    pub fn setup(
-        _resource_dir: &str,
-        _command: &configpkg::Command,
-        _env: &mut EnvMap,
-        _force_shell: Option<Shell>,
-    ) -> Option<ShellIntegration> {
-        None
-    }
-
-    /// Set up the shell integration features environment variable.
-    pub fn setup_features(env: &mut EnvMap, features: ShellIntegrationFeatures, cursor_blink: bool) {
-        // Sorted (ignoring case) so that the output is deterministic.
-        let fields: [(&str, bool); 6] = [
-            ("cursor", features.cursor),
-            ("path", features.path),
-            ("ssh-env", features.ssh_env),
-            ("ssh-terminfo", features.ssh_terminfo),
-            ("sudo", features.sudo),
-            ("title", features.title),
-        ];
-
-        let mut out = String::new();
-        for (name, enabled) in fields {
-            if enabled {
-                if !out.is_empty() {
-                    out.push(',');
-                }
-                out.push_str(name);
-                if name == "cursor" {
-                    out.push_str(if cursor_blink { ":blink" } else { ":steady" });
-                }
-            }
-        }
-
-        if !out.is_empty() {
-            env.insert("GHOSTTY_SHELL_FEATURES".into(), out);
-        }
-    }
-}
-
 /// A test harness that runs an [`Exec`] backend under a real
 /// [`crate::termio::Thread`] with the stand-in `Termio` as a test double.
 #[cfg(all(test, unix))]
@@ -3482,11 +3422,12 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(10));
     }
 
-    // Extra (not in Zig): the standin shell features match the Zig order.
+    // Extra (not in Zig): shell features are set in the Zig order.
     #[test]
     fn shell_features() {
         let mut env = EnvMap::new();
-        shell_integration::setup_features(&mut env, ShellIntegrationFeatures::default(), true);
+        shell_integration::setup_features(&mut env, ShellIntegrationFeatures::default(), true)
+            .unwrap();
         assert_eq!(
             Some("cursor:blink,path,title"),
             env.get("GHOSTTY_SHELL_FEATURES").map(String::as_str)
@@ -3501,7 +3442,7 @@ mod tests {
             ssh_terminfo: false,
             path: false,
         };
-        shell_integration::setup_features(&mut env, none, true);
+        shell_integration::setup_features(&mut env, none, true).unwrap();
         assert!(env.get("GHOSTTY_SHELL_FEATURES").is_none());
     }
 }
