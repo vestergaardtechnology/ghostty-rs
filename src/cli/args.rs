@@ -239,6 +239,15 @@
 //!   like Zig fields without a default value (no reset on empty value,
 //!   required in auto-struct syntax).
 //! * `#[cfg]` attributes on fields are not supported.
+//! * The config key is `stringify!(field)` unless `as "zig-name"` is given;
+//!   raw identifiers (`r#type`) always need `as "type"`.
+//! * Field indices into [`Fields::FIELDS`] are the declaration order of the
+//!   non-private fields, i.e. the order of Zig's `config/key.zig` `Key`
+//!   enum, so a Rust `Key` enum with the same order can be used as an index
+//!   for [`FormatFields::format_field`] and [`ChangedFields::field_changed`].
+//! * Zig's `_arena`, `_replay_steps`, `_conditional_state`, etc. go in the
+//!   `private { ... }` block; they are not parsed, formatted or compared,
+//!   and in [`Fields::parse_auto_struct`] they take their default.
 
 use std::borrow::Cow;
 use std::ffi::{c_char, CStr};
