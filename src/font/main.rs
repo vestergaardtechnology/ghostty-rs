@@ -82,9 +82,8 @@ pub struct Options {
 
 /// Build options. The backend is the default backend for the target
 /// (the Ghostty application build).
-// TODO(port-dedupe): use crate::build_config font_backend once ported.
 pub const OPTIONS: Options = Options {
-    backend: Backend::default(backend::Target::current(), backend::WasmTarget::Browser),
+    backend: crate::build_config::FONT_BACKEND,
 };
 
 /// The styles that a family can take.

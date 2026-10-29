@@ -16,6 +16,7 @@
 use std::fmt;
 
 use crate::apprt::runtime::Runtime;
+use crate::font::backend::Backend as FontBackend;
 use crate::renderer::backend::Backend as RendererBackend;
 
 /// The release channel for the build (Zig: `build/Config.zig`
@@ -140,7 +141,10 @@ pub const FLATPAK: bool = false;
 /// Whether this is a Snap build (Zig build option `-Dsnap`, default false).
 pub const SNAP: bool = false;
 pub const APP_RUNTIME: Runtime = Runtime::default();
-pub const FONT_BACKEND: FontBackend = FontBackend::default();
+pub const FONT_BACKEND: FontBackend = FontBackend::default(
+    crate::font::backend::Target::current(),
+    crate::font::backend::WasmTarget::Browser,
+);
 pub const RENDERER: RendererBackend = RendererBackend::default();
 /// Enabled by default only for macOS, and other Unix-like systems like
 /// Linux and FreeBSD when using glibc.
@@ -201,111 +205,6 @@ impl Artifact {
 
 /// True if runtime safety checks are enabled.
 pub const IS_DEBUG: bool = cfg!(debug_assertions);
-
-/// The font backend (Zig: `font.Backend`).
-///
-/// TODO(port-dedupe): replace with `crate::font::backend::Backend` once
-/// `src/font/backend.zig` is ported (owned by the font port).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FontBackend {
-    /// FreeType for font rendering with no font discovery enabled.
-    Freetype,
-
-    /// FreeType for font rendering with a built-in Windows font directory
-    /// scanner.
-    FreetypeWindows,
-
-    /// Fontconfig for font discovery and FreeType for font rendering.
-    FontconfigFreetype,
-
-    /// CoreText for font discovery, rendering, and shaping (macOS).
-    Coretext,
-
-    /// CoreText for font discovery, FreeType for rendering, and
-    /// HarfBuzz for shaping (macOS).
-    CoretextFreetype,
-
-    /// CoreText for font discovery and rendering, HarfBuzz for shaping
-    CoretextHarfbuzz,
-
-    /// CoreText for font discovery and rendering, no shaping.
-    CoretextNoshape,
-
-    /// Use the browser font system and the Canvas API (wasm).
-    WebCanvas,
-}
-
-impl FontBackend {
-    /// Returns the default backend for the current target.
-    pub const fn default() -> FontBackend {
-        if cfg!(target_arch = "wasm32") {
-            return FontBackend::WebCanvas;
-        }
-        if cfg!(windows) {
-            return FontBackend::FreetypeWindows;
-        }
-        if cfg!(any(target_os = "macos", target_os = "ios")) {
-            FontBackend::Coretext
-        } else {
-            FontBackend::FontconfigFreetype
-        }
-    }
-
-    pub const fn has_freetype(self) -> bool {
-        matches!(
-            self,
-            FontBackend::Freetype
-                | FontBackend::FreetypeWindows
-                | FontBackend::FontconfigFreetype
-                | FontBackend::CoretextFreetype
-        )
-    }
-
-    pub const fn has_coretext(self) -> bool {
-        matches!(
-            self,
-            FontBackend::Coretext
-                | FontBackend::CoretextFreetype
-                | FontBackend::CoretextHarfbuzz
-                | FontBackend::CoretextNoshape
-        )
-    }
-
-    pub const fn has_fontconfig(self) -> bool {
-        matches!(self, FontBackend::FontconfigFreetype)
-    }
-
-    pub const fn has_harfbuzz(self) -> bool {
-        matches!(
-            self,
-            FontBackend::Freetype
-                | FontBackend::FreetypeWindows
-                | FontBackend::FontconfigFreetype
-                | FontBackend::CoretextFreetype
-                | FontBackend::CoretextHarfbuzz
-        )
-    }
-
-    /// The Zig tag name.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            FontBackend::Freetype => "freetype",
-            FontBackend::FreetypeWindows => "freetype_windows",
-            FontBackend::FontconfigFreetype => "fontconfig_freetype",
-            FontBackend::Coretext => "coretext",
-            FontBackend::CoretextFreetype => "coretext_freetype",
-            FontBackend::CoretextHarfbuzz => "coretext_harfbuzz",
-            FontBackend::CoretextNoshape => "coretext_noshape",
-            FontBackend::WebCanvas => "web_canvas",
-        }
-    }
-}
-
-impl fmt::Display for FontBackend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 #[cfg(test)]
 mod tests {
