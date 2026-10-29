@@ -1,4 +1,167 @@
 //! Port of `src/font/opentype/svg.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
+use std::cmp::Ordering;
+use std::fmt;
+
+use super::sfnt::{ReadError, Reader};
+
+/// Errors that can be returned from [`Svg::init`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvgError {
+    SvgVersionNotSupported,
+    EndOfStream,
+}
+
+impl From<ReadError> for SvgError {
+    fn from(e: ReadError) -> Self {
+        match e {
+            ReadError::EndOfStream => SvgError::EndOfStream,
+        }
+    }
+}
+
+impl fmt::Display for SvgError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SvgError::SvgVersionNotSupported => f.write_str("SVGVersionNotSupported"),
+            SvgError::EndOfStream => f.write_str("EndOfStream"),
+        }
+    }
+}
+
+impl std::error::Error for SvgError {}
+
+/// SVG glyphs description table.
+///
+/// This struct is focused purely on the operations we need for Ghostty,
+/// namely to be able to look up whether an glyph ID is present in the SVG
+/// table or not. This struct isn't meant to be a general purpose SVG table
+/// reader.
+///
+/// References:
+/// - https://www.w3.org/2013/10/SVG_in_OpenType/#thesvg
+/// - https://learn.microsoft.com/en-us/typography/opentype/spec/svg
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Svg<'a> {
+    /// The start and end glyph IDs (inclusive) that are present in the
+    /// table. This is used to very quickly include/exclude a glyph from
+    /// the table.
+    pub start_glyph_id: u16,
+    pub end_glyph_id: u16,
+
+    /// All records in the table.
+    pub records: &'a [[u8; 12]],
+}
+
+impl<'a> Svg<'a> {
+    pub fn init(data: &'a [u8]) -> Result<Svg<'a>, SvgError> {
+        let mut reader = Reader::fixed(data);
+
+        // Version
+        if reader.read_be::<u16>()? != 0 {
+            return Err(SvgError::SvgVersionNotSupported);
+        }
+
+        // Offset
+        let offset = reader.read_be::<u32>()? as usize;
+
+        // Seek to the offset to get our document list
+        if offset > data.len() {
+            return Err(SvgError::EndOfStream);
+        }
+        reader.seek = offset;
+
+        // Get our document records along with the start/end glyph range.
+        let len = reader.read_be::<u16>()? as usize;
+
+        // Port note: the Zig code reinterprets the rest of the data as
+        // records without a bounds check; here the record array (and the
+        // first record that is always read) must fit in the data.
+        let record_bytes = reader.take(len.max(1) * 12)?;
+        let (records, _) = record_bytes.as_chunks::<12>();
+        let records = &records[..len];
+
+        let start_range = glyph_range(&records[0])?;
+        let end_range = if len == 1 {
+            start_range
+        } else {
+            glyph_range(&records[len - 1])?
+        };
+
+        Ok(Svg {
+            start_glyph_id: start_range.0,
+            end_glyph_id: end_range.1,
+            records,
+        })
+    }
+
+    pub fn has_glyph(&self, glyph_id: u16) -> bool {
+        // Fast path: outside the table range
+        if glyph_id < self.start_glyph_id || glyph_id > self.end_glyph_id {
+            return false;
+        }
+
+        // Fast path, matches the start/end glyph IDs
+        if glyph_id == self.start_glyph_id || glyph_id == self.end_glyph_id {
+            return true;
+        }
+
+        // Slow path: binary search our records
+        self.records
+            .binary_search_by(|record| compare_glyph_id(glyph_id, record).reverse())
+            .is_ok()
+    }
+}
+
+fn compare_glyph_id(glyph_id: u16, record: &[u8; 12]) -> Ordering {
+    let Ok((start, end)) = glyph_range(record) else {
+        return Ordering::Less;
+    };
+    if glyph_id < start {
+        Ordering::Less
+    } else if glyph_id > end {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }
+}
+
+fn glyph_range(record: &[u8]) -> Result<(u16, u16), ReadError> {
+    let mut reader = Reader::fixed(record);
+    Ok((reader.read_be::<u16>()?, reader.read_be::<u16>()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svg() {
+        let test_font = crate::font::embedded::JULIA_MONO;
+
+        // TODO(port-dedupe): the Zig test loads the table through
+        // `font.Library`/`font.Face.copyTable` (FreeType's
+        // FT_Load_Sfnt_Table), which returns the same raw table bytes as
+        // reading it out of the SFNT directory. Switch to
+        // crate::font::Face::copy_table once face/freetype is ported.
+        let font = super::super::sfnt::Sfnt::init(test_font).unwrap();
+        let table = font.get_table(b"SVG ").unwrap().to_vec();
+
+        let svg = Svg::init(&table).unwrap();
+        assert_eq!(11482, svg.start_glyph_id);
+        assert_eq!(11482, svg.end_glyph_id);
+        assert!(svg.has_glyph(11482));
+    }
+
+    #[test]
+    fn svg_document_list_offset_past_end() {
+        let table: [u8; 6] = [
+            0, 0, // Version
+            0, 0, 0, 7, // Document list offset, one byte past end
+        ];
+
+        assert_eq!(Err(SvgError::EndOfStream), Svg::init(&table));
+    }
+}
