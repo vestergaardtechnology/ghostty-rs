@@ -9565,6 +9565,55 @@ mod tests {
         }
     }
 
+    /// The screen point of the top-left viewport cell.
+    fn vps(s: &PageList) -> Point {
+        s.get_cell(pt_viewport(0, 0)).unwrap().screen_point()
+    }
+
+    fn sb(total: usize, offset: usize, len: usize) -> Scrollbar {
+        Scrollbar { total, offset, len }
+    }
+
+    /// Run grow `rows * pages` times, pausing integrity checks on the
+    /// current tail page while it fills (Zig tests do this inline).
+    fn grow_paused(s: &mut PageList, count: usize) {
+        let mut cur_page = last(s);
+        pg(cur_page).pause_integrity_checks(true);
+        for _ in 0..count {
+            if let Some(new_page) = s.grow().unwrap() {
+                pg(cur_page).pause_integrity_checks(false);
+                cur_page = new_page;
+                pg(cur_page).pause_integrity_checks(true);
+            }
+        }
+        pg(cur_page).pause_integrity_checks(false);
+    }
+
+    /// A page usable as fake node data for metadata-only tests.
+    fn fake_nodes(count: usize, rows: CellCountInt) -> (TestPage, Vec<Node>) {
+        let page = TestPage(Page::init(Capacity::new(1, 1)).unwrap());
+        let mut data = page.0;
+        data.size = pagepkg::Size { cols: 1, rows };
+        let mut nodes: Vec<Node> = (0..count)
+            .map(|i| Node {
+                prev: None,
+                next: None,
+                data: NodeData::Resident(data),
+                serial: i as u64,
+                owned: Owned::Heap,
+            })
+            .collect();
+        let base = nodes.as_mut_ptr();
+        for i in 0..count {
+            unsafe {
+                let node = &mut *base.add(i);
+                node.prev = if i > 0 { NonNull::new(base.add(i - 1)) } else { None };
+                node.next = if i + 1 < count { NonNull::new(base.add(i + 1)) } else { None };
+            }
+        }
+        (page, nodes)
+    }
+
     #[test]
     fn page_list_builder_transfers_mixed_width_pages() {
         // Build two populated pages whose widths differ from each other and from
@@ -11185,5 +11234,1087 @@ mod tests {
             },
             s.scrollbar()
         );
+    }
+
+    #[test]
+    fn page_list_init_error() {
+        // Test every failure point in `init` and ensure that we don't
+        // leak memory (the pools assert this on drop) since we're exiting early.
+        for tag in InitFailPoint::ALL {
+            let tw = &INIT_TW;
+            tw.error_always(tag, AllocError::OutOfMemory);
+            assert_eq!(
+                AllocError::OutOfMemory,
+                PageList::init(Options {
+                    cols: 80,
+                    rows: 24,
+                    ..Default::default()
+                })
+                .unwrap_err()
+            );
+            tw.end(tripwire::ResetMode::Reset).unwrap();
+        }
+
+        // init calls initPages transitively, so let's check that if
+        // any failures happen in initPages, we also don't leak memory.
+        for tag in InitPagesFailPoint::ALL {
+            let tw = &INIT_PAGES_TW;
+            tw.error_always(tag, AllocError::OutOfMemory);
+
+            let cols: CellCountInt = if tag == InitPagesFailPoint::PageBufStd {
+                80
+            } else {
+                STD_CAPACITY.max_cols().unwrap() + 1
+            };
+            assert_eq!(
+                AllocError::OutOfMemory,
+                PageList::init(Options {
+                    cols,
+                    rows: 24,
+                    ..Default::default()
+                })
+                .unwrap_err()
+            );
+            tw.end(tripwire::ResetMode::Reset).unwrap();
+        }
+
+        // Try non-standard pages since they don't go in our pool.
+        for tag in [InitPagesFailPoint::PageBufNonStd] {
+            let tw = &INIT_PAGES_TW;
+            tw.error_after(tag, AllocError::OutOfMemory, 1);
+            assert_eq!(
+                AllocError::OutOfMemory,
+                PageList::init(Options {
+                    cols: STD_CAPACITY.max_cols().unwrap() + 1,
+                    rows: STD_CAPACITY.rows + 1,
+                    ..Default::default()
+                })
+                .unwrap_err()
+            );
+            tw.end(tripwire::ResetMode::Reset).unwrap();
+        }
+    }
+
+    #[test]
+    fn page_list_init_rows_across_two_pages() {
+        // Find a cap that makes it so that rows don't fit on one page.
+        let rows = 100;
+        let cap = {
+            let mut cap = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(50) }).unwrap();
+            while cap.rows >= rows {
+                cap = STD_CAPACITY
+                    .adjust(pagepkg::Adjustment {
+                        cols: Some(cap.cols + 50),
+                    })
+                    .unwrap();
+            }
+            cap
+        };
+
+        // Init
+        let mut s = init(cap.cols, rows);
+        assert!(s.viewport == Viewport::Active);
+        assert!(s.pages.first.is_some());
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Initial total rows should be our row count
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Scrollbar should be where we expect it
+        assert_eq!(sb(s.rows as usize, 0, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_init_more_than_max_cols() {
+        // Initialize with more columns than we can fit in our standard
+        // capacity. This is going to force us to go to a non-standard page
+        // immediately.
+        let mut s = init(STD_CAPACITY.max_cols().unwrap() + 1, 80);
+        assert!(s.viewport == Viewport::Active);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // We expect a single, non-standard page
+        assert!(s.pages.first.is_some());
+        assert!(pg(first(&s)).memory.len() > std_size());
+
+        // Initial total rows should be our row count
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Scrollbar should be where we expect it
+        assert_eq!(sb(s.rows as usize, 0, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_point_from_pin_active_no_history() {
+        let s = init(80, 24);
+
+        assert_eq!(
+            pt_active(0, 0),
+            s.point_from_pin(Tag::Active, pin_at(first(&s), 0, 0)).unwrap()
+        );
+        assert_eq!(
+            pt_active(4, 2),
+            s.point_from_pin(Tag::Active, pin_at(first(&s), 4, 2)).unwrap()
+        );
+    }
+
+    #[test]
+    fn page_list_point_from_pin_active_with_history() {
+        let mut s = init(80, 24);
+        s.grow_rows(30).unwrap();
+
+        assert_eq!(
+            pt_active(2, 0),
+            s.point_from_pin(Tag::Active, pin_at(first(&s), 2, 30)).unwrap()
+        );
+
+        // In history, invalid
+        assert!(s.point_from_pin(Tag::Active, pin_at(first(&s), 2, 21)).is_none());
+    }
+
+    #[test]
+    fn page_list_point_from_pin_active_from_prior_page() {
+        let mut s = init(80, 24);
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+
+        assert_eq!(
+            pt_active(2, 0),
+            s.point_from_pin(Tag::Active, pin_at(last(&s), 2, 0)).unwrap()
+        );
+
+        // Prior page
+        assert!(s.point_from_pin(Tag::Active, pin_at(first(&s), 0, 0)).is_none());
+    }
+
+    #[test]
+    fn page_list_point_from_pin_traverse_pages() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up at least 2 pages.
+        let page_cap = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, page_cap * 2);
+
+        {
+            let pages = s.total_pages();
+            let expected_y = page_cap * (pages - 2) + 5;
+
+            assert_eq!(
+                pt_screen(2, expected_y as u32),
+                s.point_from_pin(Tag::Screen, pin_at(prev(last(&s)), 2, 5)).unwrap()
+            );
+        }
+
+        // Prior page
+        assert!(s.point_from_pin(Tag::Active, pin_at(first(&s), 0, 0)).is_none());
+    }
+
+    #[test]
+    fn page_list_point_from_pin_rejects_overflowing_screen_coordinate() {
+        // Use maximum-height metadata-only pages to model a valid scrollback just
+        // beyond the u32 coordinate range without allocating their backing cells.
+        let page_count = 65_539;
+        let rows_per_page = CellCountInt::MAX;
+        let (_page, mut nodes) = fake_nodes(page_count, rows_per_page);
+
+        let mut s = init(1, 1);
+        let real_pages = s.pages;
+        let base = nodes.as_mut_ptr();
+        s.pages = List {
+            first: NonNull::new(base),
+            last: NonNull::new(unsafe { base.add(page_count - 1) }),
+        };
+
+        let result = s.point_from_pin(Tag::Screen, Pin::new(NonNull::new(unsafe { base.add(page_count - 1) }).unwrap()));
+        s.pages = real_pages;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn page_list_active_after_grow() {
+        let mut s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(s.rows as usize + 10, s.total_rows());
+
+        // Make sure all points make sense
+        assert_eq!(pt_screen(0, 10), s.get_cell(pt_viewport(0, 0)).unwrap().screen_point());
+        assert_eq!(pt_screen(0, 0), s.get_cell(pt_screen(0, 0)).unwrap().screen_point());
+        assert_eq!(pt_screen(0, 10), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        // Scrollbar should be in the active area
+        assert_eq!(sb(s.total_rows(), 10, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_grow_allows_exceeding_max_size_for_active_area() {
+        // Setup our initial page so that we fully take up one page.
+        let cap = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(5) }).unwrap();
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: cap.rows,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Grow once because we guarantee at least two pages of
+        // capacity so we want to get to that.
+        s.grow().unwrap();
+        let start_pages = s.total_pages();
+        assert!(start_pages >= 2);
+
+        // Surgically modify our pages so that they have a smaller size.
+        {
+            let mut it = s.pages.first;
+            while let Some(page) = it {
+                pg(page).size.rows = 1;
+                pg(page).capacity.rows = 1;
+                it = n(page).next;
+            }
+
+            // Avoid integrity check failures
+            s.total_rows = s.total_rows();
+        }
+
+        // Grow our row and ensure we don't prune pages because we need
+        // enough for the active area.
+        s.grow().unwrap();
+        assert_eq!(start_pages + 1, s.total_pages());
+    }
+
+    #[test]
+    fn page_list_grow_prune_required_with_a_single_page() {
+        // Need scrollback > 0 to have a scrollbar to test
+        let mut s = init(80, 24);
+
+        // This block is all test setup. There is nothing required about this
+        // behavior during a refactor. This is setting up a scenario that is
+        // possible to trigger a bug (#2280).
+        {
+            // Increase our capacity until our page is larger than the standard size.
+            // This is important because it triggers a scenario where our calculated
+            // minSize() which is supposed to accommodate 2 pages is no longer true.
+            loop {
+                let layout = Page::layout(n(first(&s)).capacity());
+                if layout.total_size > std_size() {
+                    break;
+                }
+                s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+                    .unwrap();
+            }
+            assert!(s.pages.first.is_some());
+            assert!(s.pages.first == s.pages.last);
+        }
+
+        // Figure out the remaining number of rows. This is the amount that
+        // can be added to the current page before we need to allocate a new
+        // page.
+        let rem = {
+            let page = first(&s);
+            n(page).capacity().rows - n(page).rows()
+        };
+        for _ in 0..rem {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // The next one we add will trigger a new page.
+        let new = s.grow().unwrap();
+        assert!(new.is_some());
+        assert!(new != s.pages.first);
+
+        // Scrollbar should be in the active area
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scrollbar_with_max_size_0_after_grow() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Grow some rows (simulates normal terminal output)
+        s.grow_rows(10).unwrap();
+
+        let sbar = s.scrollbar();
+
+        // With no scrollback (max_size = 0), total should equal rows
+        assert_eq!(s.rows as usize, sbar.total);
+
+        // With no scrollback, offset should be 0 (nowhere to scroll back to)
+        assert_eq!(0, sbar.offset);
+    }
+
+    #[test]
+    fn page_list_scroll_with_max_size_0_no_history() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        s.grow_rows(10).unwrap();
+
+        // Remember initial viewport position
+        let pt_before = vps(&s);
+
+        // Try to scroll backwards into "history" - should be no-op
+        s.scroll(Scroll::DeltaRow(-5));
+        assert!(s.viewport == Viewport::Active);
+
+        // Scroll to top - should also be no-op with no scrollback
+        s.scroll(Scroll::Top);
+        let pt_after = vps(&s);
+        assert_eq!(pt_before, pt_after);
+    }
+
+    #[test]
+    fn page_list_scroll_top() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        s.scroll(Scroll::Top);
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows(), 0, s.rows as usize), s.scrollbar());
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows(), 0, s.rows as usize), s.scrollbar());
+
+        s.scroll(Scroll::Active);
+        assert_eq!(pt_screen(0, 20), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_delta_row_back() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        s.scroll(Scroll::DeltaRow(-1));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize - 1, s.rows as usize),
+            s.scrollbar()
+        );
+
+        assert_eq!(pt_screen(0, 9), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 9), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize - 11, s.rows as usize),
+            s.scrollbar()
+        );
+
+        s.scroll(Scroll::DeltaRow(-1));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize - 12, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_delta_row_back_overflow() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        s.scroll(Scroll::DeltaRow(-100));
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows(), 0, s.rows as usize), s.scrollbar());
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows(), 0, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_minimum_row_delta() {
+        let mut s = init(10, 3);
+
+        // Create one row of history so scrolling all the way back has an
+        // observable result.
+        s.grow_rows(1).unwrap();
+        s.scroll(Scroll::DeltaRow(isize::MIN));
+
+        assert_eq!(Viewport::Top, s.viewport);
+    }
+
+    #[test]
+    fn page_list_scroll_delta_row_forward() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        s.scroll(Scroll::Top);
+        s.scroll(Scroll::DeltaRow(2));
+
+        assert_eq!(sb(s.total_rows(), 2, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 2), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 2), vps(&s));
+
+        assert_eq!(sb(s.total_rows(), 2, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_delta_row_forward_into_active() {
+        let mut s = init(80, 24);
+
+        s.scroll(Scroll::DeltaRow(2));
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_delta_row_back_without_space_preserves_active() {
+        let mut s = init(80, 24);
+        s.scroll(Scroll::DeltaRow(-1));
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_to_pin() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        s.scroll(Scroll::Pin(s.pin(pt_screen(2, 4)).unwrap()));
+
+        assert_eq!(sb(s.total_rows(), 4, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 4), vps(&s));
+
+        s.scroll(Scroll::Pin(s.pin(pt_screen(2, 5)).unwrap()));
+
+        assert_eq!(sb(s.total_rows(), 5, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 5), vps(&s));
+    }
+
+    #[test]
+    fn page_list_scroll_to_pin_in_active() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        s.scroll(Scroll::Pin(s.pin(pt_screen(2, 30)).unwrap()));
+
+        assert_eq!(
+            sb(s.total_rows(), s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+    }
+
+    #[test]
+    fn page_list_scroll_to_pin_at_top() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        s.scroll(Scroll::Pin(s.pin(pt_screen(2, 0)).unwrap()));
+
+        assert!(s.viewport == Viewport::Top);
+
+        assert_eq!(sb(s.total_rows(), 0, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_0() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        s.scroll(Scroll::Row(0));
+        assert!(s.viewport == Viewport::Top);
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 0, s.rows as usize), s.scrollbar());
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 0, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_in_scrollback() {
+        let mut s = init(80, 24);
+        s.grow_rows(20).unwrap();
+
+        assert_eq!(pt_screen(0, 20), vps(&s));
+
+        s.scroll(Scroll::Row(5));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, 5, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 5), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 5), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 5, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_in_middle() {
+        let mut s = init(80, 24);
+        s.grow_rows(50).unwrap();
+
+        let total = s.total_rows;
+        let midpoint = total / 2;
+        s.scroll(Scroll::Row(midpoint));
+
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, midpoint, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, midpoint as u32), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, midpoint as u32), vps(&s));
+
+        assert_eq!(sb(s.total_rows, midpoint, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_at_active_boundary() {
+        let mut s = init(80, 24);
+        s.grow_rows(20).unwrap();
+
+        let active_start = s.total_rows - s.rows as usize;
+
+        s.scroll(Scroll::Row(active_start));
+
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(pt_screen(0, active_start as u32), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+
+        s.grow_rows(10).unwrap();
+
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(
+            sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_beyond_active() {
+        let mut s = init(80, 24);
+        s.grow_rows(10).unwrap();
+
+        s.scroll(Scroll::Row(1000));
+
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_without_scrollback() {
+        let mut s = init(80, 24);
+
+        s.scroll(Scroll::Row(5));
+
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(pt_screen(0, 0), vps(&s));
+
+        assert_eq!(
+            sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_then_delta() {
+        let mut s = init(80, 24);
+        s.grow_rows(30).unwrap();
+
+        s.scroll(Scroll::Row(10));
+
+        assert!(s.viewport == Viewport::Pin);
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 10, s.rows as usize), s.scrollbar());
+
+        s.scroll(Scroll::DeltaRow(5));
+
+        assert!(s.viewport == Viewport::Pin);
+
+        assert_eq!(pt_screen(0, 15), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 15, s.rows as usize), s.scrollbar());
+
+        s.scroll(Scroll::DeltaRow(-3));
+
+        assert!(s.viewport == Viewport::Pin);
+
+        assert_eq!(pt_screen(0, 12), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 12, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_with_cache_fast_path_down() {
+        let mut s = init(80, 24);
+        s.grow_rows(50).unwrap();
+
+        s.scroll(Scroll::Row(10));
+
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, 10, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 10), vps(&s));
+
+        // Verify cache is populated
+        assert!(s.viewport_pin_row_offset.is_some());
+        assert_eq!(10, s.viewport_pin_row_offset.unwrap());
+
+        // Now scroll to a different row - this should use the fast path
+        s.scroll(Scroll::Row(20));
+
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, 20, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 20), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 20), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 20, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_to_row_with_cache_fast_path_up() {
+        let mut s = init(80, 24);
+        s.grow_rows(50).unwrap();
+
+        s.scroll(Scroll::Row(30));
+
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, 30, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 30), vps(&s));
+
+        // Verify cache is populated
+        assert!(s.viewport_pin_row_offset.is_some());
+        assert_eq!(30, s.viewport_pin_row_offset.unwrap());
+
+        // Now scroll up to a different row - this should use the fast path
+        s.scroll(Scroll::Row(15));
+
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, 15, s.rows as usize), s.scrollbar());
+
+        assert_eq!(pt_screen(0, 15), vps(&s));
+
+        s.grow_rows(10).unwrap();
+        assert_eq!(pt_screen(0, 15), vps(&s));
+
+        assert_eq!(sb(s.total_rows, 15, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_scroll_clear() {
+        let mut s = init(80, 24);
+
+        {
+            let cell = s.get_cell(pt_active(0, 0)).unwrap();
+            unsafe { *cell.cell = cp('A') };
+        }
+        {
+            let cell = s.get_cell(pt_active(0, 1)).unwrap();
+            unsafe { *cell.cell = cp('A') };
+        }
+
+        s.scroll_clear().unwrap();
+
+        assert_eq!(pt_screen(0, 2), vps(&s));
+    }
+
+    #[test]
+    fn page_list_jump_zero_prompts() {
+        let mut s = init(5, 3);
+        s.grow_rows(3).unwrap();
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        rac(page, 0, 1).0.set_semantic_prompt(SemanticPrompt::Prompt);
+        rac(page, 0, 5).0.set_semantic_prompt(SemanticPrompt::Prompt);
+
+        s.scroll(Scroll::DeltaPrompt(0));
+        assert!(s.viewport == Viewport::Active);
+
+        assert_eq!(
+            sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_jump_minimum_prompt_delta() {
+        let mut s = init(10, 3);
+
+        s.scroll(Scroll::DeltaPrompt(isize::MIN));
+        assert_eq!(Viewport::Active, s.viewport);
+    }
+
+    #[test]
+    fn screen_jump_back_one_prompt() {
+        let mut s = init(5, 3);
+        s.grow_rows(3).unwrap();
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        rac(page, 0, 1).0.set_semantic_prompt(SemanticPrompt::Prompt);
+        rac(page, 0, 5).0.set_semantic_prompt(SemanticPrompt::Prompt);
+
+        // Jump back
+        {
+            s.scroll(Scroll::DeltaPrompt(-1));
+            assert!(s.viewport == Viewport::Pin);
+            assert_eq!(
+                pt_screen(0, 1),
+                s.point_from_pin(Tag::Screen, s.pin(pt_viewport(0, 0)).unwrap()).unwrap()
+            );
+
+            assert_eq!(sb(s.total_rows, 1, s.rows as usize), s.scrollbar());
+        }
+        {
+            s.scroll(Scroll::DeltaPrompt(-1));
+            assert!(s.viewport == Viewport::Pin);
+            assert_eq!(
+                pt_screen(0, 1),
+                s.point_from_pin(Tag::Screen, s.pin(pt_viewport(0, 0)).unwrap()).unwrap()
+            );
+
+            assert_eq!(sb(s.total_rows, 1, s.rows as usize), s.scrollbar());
+        }
+
+        // Jump forward
+        {
+            s.scroll(Scroll::DeltaPrompt(1));
+            assert!(s.viewport == Viewport::Active);
+            assert_eq!(
+                sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+                s.scrollbar()
+            );
+        }
+        {
+            s.scroll(Scroll::DeltaPrompt(1));
+            assert!(s.viewport == Viewport::Active);
+            assert_eq!(
+                sb(s.total_rows, s.total_rows - s.rows as usize, s.rows as usize),
+                s.scrollbar()
+            );
+        }
+    }
+
+    #[test]
+    fn screen_jump_forward_prompt_skips_multiline_continuation() {
+        let mut s = init(5, 3);
+        s.grow_rows(7).unwrap();
+
+        // Multiline prompt on rows 1-3.
+        pin_rac(s.pin(pt_screen(0, 1)).unwrap()).0.set_semantic_prompt(SemanticPrompt::Prompt);
+        pin_rac(s.pin(pt_screen(0, 2)).unwrap())
+            .0
+            .set_semantic_prompt(SemanticPrompt::PromptContinuation);
+        pin_rac(s.pin(pt_screen(0, 3)).unwrap())
+            .0
+            .set_semantic_prompt(SemanticPrompt::PromptContinuation);
+
+        // Next prompt after command output.
+        pin_rac(s.pin(pt_screen(0, 6)).unwrap()).0.set_semantic_prompt(SemanticPrompt::Prompt);
+
+        // Starting at the first prompt line should jump to the next prompt,
+        // not to continuation lines.
+        s.scroll(Scroll::Row(1));
+        s.scroll(Scroll::DeltaPrompt(1));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(
+            pt_screen(0, 6),
+            s.point_from_pin(Tag::Screen, s.pin(pt_viewport(0, 0)).unwrap()).unwrap()
+        );
+
+        // Starting in the middle of continuation lines should also jump to
+        // the next prompt.
+        s.scroll(Scroll::Row(2));
+        s.scroll(Scroll::DeltaPrompt(1));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(
+            pt_screen(0, 6),
+            s.point_from_pin(Tag::Screen, s.pin(pt_viewport(0, 0)).unwrap()).unwrap()
+        );
+    }
+
+    #[test]
+    fn page_list_grow_fit_in_capacity() {
+        let mut s = init(80, 24);
+
+        // So we know we're using capacity to grow
+        let last = pg(last(&s));
+        assert!(last.size.rows < last.capacity.rows);
+
+        // Grow
+        assert!(s.grow().unwrap().is_none());
+        assert_eq!(pt_screen(0, 1), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+    }
+
+    #[test]
+    fn page_list_grow_allocate() {
+        let mut s = init(80, 24);
+
+        // Grow to capacity
+        let last_node = last(&s);
+        let last = pg(last_node);
+        for _ in 0..(last.capacity.rows - last.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // Grow, should allocate
+        let new = s.grow().unwrap().unwrap();
+        assert!(s.pages.last.unwrap() == new);
+        assert!(next(last_node) == new);
+        {
+            let cell = s.get_cell(pt_active(0, s.rows as u32 - 1)).unwrap();
+            assert!(cell.node == new);
+            assert_eq!(pt_screen(0, last.capacity.rows as u32), cell.screen_point());
+        }
+    }
+
+    #[test]
+    fn page_list_cell_screen_point_supports_long_scrollback() {
+        // A modest number of full-size page nodes is enough to exceed the u16
+        // row range without allocating any page backing memory. screenPoint only
+        // reads the linked metadata while calculating the absolute coordinate.
+        let page_count = 307;
+        let rows_per_page = STD_CAPACITY.rows;
+        let (_page, mut nodes) = fake_nodes(page_count, rows_per_page);
+
+        let expected_y: u32 = (page_count as u32 - 1) * rows_per_page as u32;
+        assert!(expected_y > CellCountInt::MAX as u32);
+
+        let cell = Cell {
+            node: NonNull::new(unsafe { nodes.as_mut_ptr().add(page_count - 1) }).unwrap(),
+            row: core::ptr::null_mut(),
+            cell: core::ptr::null_mut(),
+            row_idx: 0,
+            col_idx: 0,
+        };
+        assert_eq!(pt_screen(0, expected_y), cell.screen_point());
+    }
+
+    #[test]
+    fn page_list_set_max_bytes_prunes_immediately_and_can_be_raised() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 1,
+            max_size: None,
+            ..Default::default()
+        });
+
+        // Build four complete pages of history followed by the active row.
+        s.grow_rows(4 * page_rows).unwrap();
+        assert_eq!(5, s.total_pages());
+
+        let removed = first(&s);
+        let retained = prev(last(&s));
+        let removed_pin = s.track_pin(Pin::new(removed)).unwrap();
+        let retained_pin = s.track_pin(Pin::new(retained)).unwrap();
+
+        s.scroll(Scroll::Pin(*tp(retained_pin)));
+        assert_eq!(3 * page_rows, s.scrollbar().offset);
+
+        // The active-area minimum is two pages. Lowering below that immediately
+        // removes all older complete historical pages.
+        s.set_max_bytes(Some(PagePool::item_size()));
+        assert_eq!(PagePool::item_size(), s.limits.bytes.explicit);
+        assert_eq!(2 * PagePool::item_size(), s.limits.max(LimitKey::Bytes));
+        assert_eq!(s.limits.max(LimitKey::Bytes), s.page_size);
+        assert_eq!(2, s.total_pages());
+        assert_eq!(page_rows, s.total_rows - s.rows as usize);
+        assert_eq!(retained, first(&s));
+        assert_eq!(retained, tp(removed_pin).node);
+        assert!(tp(removed_pin).garbage);
+        assert_eq!(retained, tp(retained_pin).node);
+        assert!(!tp(retained_pin).garbage);
+        assert_eq!(0, s.scrollbar().offset);
+
+        // Raising the limit doesn't allocate or otherwise change retained data,
+        // but subsequent growth can exceed the previous effective limit.
+        let limited_size = s.page_size;
+        let limited_rows = s.total_rows;
+        s.set_max_bytes(Some(8 * PagePool::item_size()));
+        assert_eq!(limited_size, s.page_size);
+        assert_eq!(limited_rows, s.total_rows);
+        s.grow_rows(2 * page_rows).unwrap();
+        assert!(s.page_size > limited_size);
+
+        // Null restores unlimited growth and likewise preserves current data.
+        let raised_size = s.page_size;
+        let raised_rows = s.total_rows;
+        s.set_max_bytes(None);
+        assert_eq!(usize::MAX, s.limits.bytes.explicit);
+        assert_eq!(raised_size, s.page_size);
+        assert_eq!(raised_rows, s.total_rows);
+        s.grow_rows(5 * page_rows).unwrap();
+        assert!(s.page_size > 8 * PagePool::item_size());
+
+        s.untrack_pin(retained_pin);
+        s.untrack_pin(removed_pin);
+    }
+
+    #[test]
+    fn page_list_set_max_bytes_zero_preserves_active_boundary() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 1,
+            max_size: None,
+            ..Default::default()
+        });
+
+        // Make the sole page larger than the effective zero-byte limit. Its first
+        // row will be history, but the same indivisible page also contains active.
+        while s.page_size <= s.limits.bytes.min {
+            s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+                .unwrap();
+        }
+        s.grow().unwrap();
+        assert_eq!(1, s.total_pages());
+        assert_eq!(first(&s), s.get_top_left(Tag::Active).node);
+        assert!(s.get_top_left(Tag::Active).y > 0);
+
+        s.scroll(Scroll::Top);
+        assert!(s.viewport == Viewport::Top);
+
+        s.set_max_bytes(Some(0));
+        assert_eq!(0, s.limits.bytes.explicit);
+        assert!(s.page_size > s.limits.max(LimitKey::Bytes));
+        assert_eq!(1, s.total_pages());
+        assert!(s.viewport == Viewport::Active);
+        assert_eq!(sb(s.rows as usize, 0, s.rows as usize), s.scrollbar());
+
+        // No-scrollback mode cannot be moved back into the retained boundary row.
+        s.scroll(Scroll::Top);
+        assert!(s.viewport == Viewport::Active);
+    }
+
+    #[test]
+    fn page_list_set_max_lines_prunes_immediately_and_can_be_raised() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+        let lowered_lines = page_rows + page_rows / 2;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 1,
+            max_size: None,
+            max_lines: None,
+        });
+
+        s.grow_rows(4 * page_rows).unwrap();
+        assert_eq!(5, s.total_pages());
+
+        let removed = first(&s);
+        let retained = prev(last(&s));
+        let removed_pin = s.track_pin(Pin::new(removed)).unwrap();
+        let retained_pin = s.track_pin(Pin::new(retained)).unwrap();
+
+        s.scroll(Scroll::Pin(*tp(retained_pin)));
+        assert_eq!(3 * page_rows, s.scrollbar().offset);
+
+        // Whole-page enforcement undershoots a non-page-aligned line limit.
+        s.set_max_lines(Some(lowered_lines));
+        assert_eq!(lowered_lines, s.limits.lines.explicit);
+        assert_eq!(lowered_lines, s.limits.max(LimitKey::Lines));
+        assert_eq!(page_rows, s.total_rows - s.rows as usize);
+        assert_eq!(2, s.total_pages());
+        assert_eq!(retained, first(&s));
+        assert_eq!(retained, tp(removed_pin).node);
+        assert!(tp(removed_pin).garbage);
+        assert_eq!(retained, tp(retained_pin).node);
+        assert!(!tp(retained_pin).garbage);
+        assert_eq!(0, s.scrollbar().offset);
+
+        let limited_size = s.page_size;
+        let limited_rows = s.total_rows;
+        s.set_max_lines(Some(4 * page_rows));
+        assert_eq!(limited_size, s.page_size);
+        assert_eq!(limited_rows, s.total_rows);
+        s.grow_rows(2 * page_rows).unwrap();
+        assert!(s.total_rows - s.rows as usize > lowered_lines);
+
+        let raised_size = s.page_size;
+        let raised_rows = s.total_rows;
+        s.set_max_lines(None);
+        assert_eq!(usize::MAX, s.limits.lines.explicit);
+        assert_eq!(raised_size, s.page_size);
+        assert_eq!(raised_rows, s.total_rows);
+        s.grow_rows(3 * page_rows).unwrap();
+        assert!(s.total_rows - s.rows as usize > 4 * page_rows);
+
+        s.untrack_pin(retained_pin);
+        s.untrack_pin(removed_pin);
     }
 }
