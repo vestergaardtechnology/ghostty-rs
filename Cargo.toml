@@ -6,6 +6,9 @@ description = "Rust port of the Ghostty terminal emulator"
 license = "MIT"
 autobins = false
 
+# Each checkout (including agent worktrees nested under .claude/) is its own workspace root.
+[workspace]
+
 [lib]
 name = "ghostty"
 path = "src/root.rs"
