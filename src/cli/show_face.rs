@@ -2,11 +2,12 @@
 //!
 //! STATUS: partial — the font grid (`font.SharedGridSet`, `SharedGrid`,
 //! `CodepointResolver`, `Collection`) is not ported yet; [`grid`] is a
-//! stand-in resolver (TODO(port-dedupe)) that checks Ghostty's sprites,
-//! then the configured `font-family*` faces, then Fontconfig fallback
-//! discovery. It does not know the embedded default fonts (JetBrains Mono,
-//! Symbols Nerd Font, emoji), so codepoints Ghostty would render from them
-//! are reported from the system font that provides them instead.
+//! stand-in resolver (TODO(port-dedupe)) built on the ported font discovery
+//! that checks Ghostty's sprites, then the configured `font-family*` faces,
+//! then fallback discovery. It does not know the embedded default fonts
+//! (JetBrains Mono, Symbols Nerd Font, emoji) or codepoint-map overrides, so
+//! codepoints Ghostty would render from them are reported from the system
+//! font that provides them instead.
 
 use std::io::{self, BufWriter, Write};
 
