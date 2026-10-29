@@ -22,21 +22,49 @@ default = []
 inspector = []
 # Crash reporting via the Sentry native SDK (links the system `sentry` C library).
 sentry = []
-gtk = ["dep:gio", "dep:glib"]
+gtk = [
+    "dep:gdk4-wayland",
+    "dep:gdk4-x11",
+    "dep:gio",
+    "dep:glib",
+    "dep:gtk4",
+    "dep:libadwaita",
+    "dep:wayland-backend",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-plasma",
+    "dep:wayland-scanner",
+    "dep:x11",
+]
+# gtk4-layer-shell support for the GTK quick terminal. Needs the system
+# `gtk4-layer-shell-0` library, so it is not part of `gtk` itself.
+gtk-layer-shell = ["gtk", "dep:gtk4-layer-shell"]
 
 [dependencies]
 base64 = "0.22"
+gdk4-wayland = { version = "0.10", optional = true, features = ["v4_12", "wayland_crate"] }
+gdk4-x11 = { version = "0.10", optional = true, features = ["v4_4", "xlib"] }
 getrandom = "0.3"
 gio = { version = "0.21", optional = true }
 glib = { version = "0.21", optional = true }
+gtk4 = { version = "0.10", optional = true, features = ["v4_14"] }
+gtk4-layer-shell = { version = "0.7", optional = true }
 half = "2"
 indexmap = "2"
+libadwaita = { version = "0.8", optional = true, features = ["v1_5"] }
 libc = "0.2"
 log = "0.4"
 memchr = "2"
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+
+wayland-backend = { version = "0.3", optional = true, features = ["client_system"] }
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
+wayland-protocols-plasma = { version = "0.3", optional = true, features = ["client"] }
+wayland-scanner = { version = "0.31", optional = true }
+x11 = { version = "2", optional = true, features = ["xlib"] }
 
 [dev-dependencies]
 png = "0.18"

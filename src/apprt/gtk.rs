@@ -1,6 +1,11 @@
 //! Port of `src/apprt/gtk.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: partial — only the module tree is set up; the re-exports of
+//! `App`/`Surface`/`resourcesDir` wait for `App.zig`, `Surface.zig` and
+//! `class/*.zig` to be ported.
+//!
+//! The whole GTK apprt is only built with the `gtk` Cargo feature.
+#![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "gtk/adw_version.rs"]
