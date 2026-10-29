@@ -155,6 +155,11 @@ fn map_png_error(err: png::DecodingError) -> DecodeError {
 /// to weaker randomness.
 pub static RANDOM_SECURE: RwLock<Option<RandomSecureFn>> = RwLock::new(None);
 
+/// Serializes tests that set [`RANDOM_SECURE`], since it is process-global
+/// and Rust runs tests in parallel (Zig runs them sequentially).
+#[cfg(test)]
+pub(crate) static RANDOM_SECURE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Replace the secure random override (writes [`RANDOM_SECURE`]).
 pub fn set_random_secure(f: Option<RandomSecureFn>) {
     *RANDOM_SECURE.write().unwrap_or_else(|e| e.into_inner()) = f;
@@ -212,6 +217,10 @@ mod tests {
         fn fail(_: &mut [u8]) -> Result<(), RandomSecureError> {
             Err(RandomSecureError::EntropyUnavailable)
         }
+
+        let _guard = RANDOM_SECURE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Without the override a failing Io fails.
         let mut buf = [0u8; 8];

@@ -19,6 +19,7 @@ default = []
 inspector = []
 
 [dependencies]
+base64 = "0.22"
 getrandom = "0.3"
 half = "2"
 indexmap = "2"
