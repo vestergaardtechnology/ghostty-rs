@@ -600,10 +600,8 @@ mod tests {
     /// `build_options.artifact == .ghostty`
     const ARTIFACT_IS_GHOSTTY: bool = matches!(build_options::ARTIFACT, Artifact::Ghostty);
 
-    /// TODO(port-dedupe): replace with
-    /// `crate::termio::message::Message::WriteReq::Small::MAX`
-    /// (`MessageData(u8, 38)`).
-    const WRITE_REQ_SMALL_MAX: usize = 38;
+    /// `termio.Message.WriteReq.Small.Max`
+    const WRITE_REQ_SMALL_MAX: usize = crate::termio::message::WriteReqSmall::MAX;
 
     #[test]
     fn keys() {

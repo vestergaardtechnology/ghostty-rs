@@ -97,8 +97,8 @@ pub fn init_global_domain() -> Result<(), InitError> {
 /// Translate a message for the Ghostty domain (Zig: `_`).
 ///
 /// The returned string is either `msgid` itself or a translation owned by
-/// gettext, which lives for the rest of the program.
-pub fn gettext(msgid: &'static CStr) -> &'static CStr {
+/// gettext, which lives for the rest of the program (so it outlives `'a`).
+pub fn gettext<'a>(msgid: &'a CStr) -> &'a CStr {
     if !BUILD_I18N {
         return msgid;
     }

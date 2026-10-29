@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use indexmap::IndexMap;
 
+use crate::config::formatter::{self, EntryFormatter};
 use super::config::OptionAsAlt;
 
 /// Aliases for modifier names.
@@ -507,18 +508,21 @@ impl RemapSet {
     }
 
     /// Used by Formatter. Required by Config.
-    pub fn format_entry(&self, formatter: &mut EntryFormatter<'_>) -> std::io::Result<()> {
+    pub fn format_entry(
+        &self,
+        formatter: &mut EntryFormatter<'_>,
+    ) -> Result<(), formatter::Error> {
         if self.map.is_empty() {
-            formatter.format_entry_void()?;
+            formatter.format_entry(&())?;
             return Ok(());
         }
 
         for (from, to) in self.map.iter() {
             let mut writer: Vec<u8> = Vec::with_capacity(64);
-            format_mod(&mut writer, *from)?;
+            format_mod(&mut writer, *from).map_err(|_| formatter::Error::WriteFailed)?;
             writer.push(b'=');
-            format_mod(&mut writer, *to)?;
-            formatter.format_entry_bytes(&writer)?;
+            format_mod(&mut writer, *to).map_err(|_| formatter::Error::WriteFailed)?;
+            formatter.format_entry(&*String::from_utf8_lossy(&writer))?;
         }
 
         Ok(())
@@ -732,41 +736,10 @@ impl Mask {
     }
 }
 
-/// Minimal stand-in for the config entry formatter.
-///
-/// TODO(port-dedupe): replace with crate::config::formatter::EntryFormatter
-/// (and `entry_formatter`).
-pub struct EntryFormatter<'a> {
-    pub name: &'a str,
-    pub writer: &'a mut dyn std::io::Write,
-}
-
-/// TODO(port-dedupe): replace with crate::config::formatter::entry_formatter
-pub fn entry_formatter<'a>(
-    name: &'a str,
-    writer: &'a mut dyn std::io::Write,
-) -> EntryFormatter<'a> {
-    EntryFormatter { name, writer }
-}
-
-impl EntryFormatter<'_> {
-    /// `formatEntry(void, {})`
-    pub fn format_entry_void(&mut self) -> std::io::Result<()> {
-        write!(self.writer, "{} = \n", self.name)
-    }
-
-    /// `formatEntry([]const u8, value)`
-    pub fn format_entry_bytes(&mut self, value: &[u8]) -> std::io::Result<()> {
-        self.writer.write_all(self.name.as_bytes())?;
-        self.writer.write_all(b" = ")?;
-        self.writer.write_all(value)?;
-        self.writer.write_all(b"\n")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::formatter::entry_formatter;
 
     fn m(f: impl FnOnce(&mut Mods)) -> Mods {
         let mut v = Mods::EMPTY;
@@ -1071,17 +1044,17 @@ mod tests {
 
     #[test]
     fn remap_set_format_entry_empty() {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = String::new();
 
         let set = RemapSet::empty();
         set.format_entry(&mut entry_formatter("key-remap", &mut buf))
             .unwrap();
-        assert_eq!(b"key-remap = \n".as_slice(), buf.as_slice());
+        assert_eq!("key-remap = \n", buf);
     }
 
     #[test]
     fn remap_set_format_entry_single_sided() {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = String::new();
 
         let mut set = RemapSet::empty();
 
@@ -1090,15 +1063,12 @@ mod tests {
 
         set.format_entry(&mut entry_formatter("key-remap", &mut buf))
             .unwrap();
-        assert_eq!(
-            b"key-remap = left_ctrl=left_super\n".as_slice(),
-            buf.as_slice()
-        );
+        assert_eq!("key-remap = left_ctrl=left_super\n", buf);
     }
 
     #[test]
     fn remap_set_format_entry_unsided_creates_two_entries() {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = String::new();
 
         let mut set = RemapSet::empty();
 
@@ -1108,14 +1078,14 @@ mod tests {
         set.format_entry(&mut entry_formatter("key-remap", &mut buf))
             .unwrap();
         // Unsided creates both left and right mappings
-        let written = String::from_utf8(buf).unwrap();
+        let written = buf;
         assert!(written.contains("left_ctrl=left_super"));
         assert!(written.contains("right_ctrl=left_super"));
     }
 
     #[test]
     fn remap_set_format_entry_right_sided() {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = String::new();
 
         let mut set = RemapSet::empty();
 
@@ -1124,10 +1094,7 @@ mod tests {
 
         set.format_entry(&mut entry_formatter("key-remap", &mut buf))
             .unwrap();
-        assert_eq!(
-            b"key-remap = left_alt=right_ctrl\n".as_slice(),
-            buf.as_slice()
-        );
+        assert_eq!("key-remap = left_alt=right_ctrl\n", buf);
     }
 
     // Port-specific: the bit layout round-trips.

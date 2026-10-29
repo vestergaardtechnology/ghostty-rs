@@ -37,9 +37,7 @@ use super::key_mods::{self, Mod, ModsBacking};
 use crate::terminal::hash_map::Wyhash;
 use crate::unicode::uucode;
 
-// TODO(port-dedupe): replace with crate::config::formatter::EntryFormatter
-// (the stand-in lives in key_mods.rs and is shared with it).
-pub use super::key_mods::{entry_formatter, EntryFormatter};
+use crate::config::formatter::{self, EntryFormatter};
 
 /// A binding maps some input trigger to an action.
 #[derive(Debug, Clone, PartialEq)]
@@ -2641,7 +2639,7 @@ impl Value {
         &self,
         buffer: &mut Vec<u8>,
         formatter: &mut EntryFormatter<'_>,
-    ) -> io::Result<()> {
+    ) -> Result<(), formatter::Error> {
         match self {
             Value::Leader(set) => {
                 // We'll rewind to this position after each sub-entry,
@@ -2662,7 +2660,7 @@ impl Value {
                 // the full sequence of keys needed to reach this action.
                 buffer.push(b'=');
                 leaf.action.format_to(buffer);
-                formatter.format_entry_bytes(buffer)
+                formatter.format_entry(&*String::from_utf8_lossy(buffer))
             }
 
             Value::LeafChained(leaf) => {
@@ -2671,7 +2669,7 @@ impl Value {
                     if i == 0 {
                         buffer.push(b'=');
                         action.format_to(buffer);
-                        formatter.format_entry_bytes(buffer)?;
+                        formatter.format_entry(&*String::from_utf8_lossy(buffer))?;
                     } else {
                         // Zig rewinds the shared buffer to 0 to write
                         // `chain=...`, clobbering the shared prefix; a
@@ -2679,7 +2677,7 @@ impl Value {
                         // corrupting the prefix for sibling entries.
                         let mut chain = b"chain=".to_vec();
                         action.format_to(&mut chain);
-                        formatter.format_entry_bytes(&chain)?;
+                        formatter.format_entry(&*String::from_utf8_lossy(&chain))?;
                     }
                     buffer.truncate(pos);
                 }
@@ -4910,17 +4908,17 @@ mod tests {
     /// Format the entries of the binding for trigger `t` like
     /// `formatEntry` in Config.zig does.
     fn format_entries_for(s: &Set, t: Trigger) -> String {
-        let mut output: Vec<u8> = Vec::new();
+        let mut output = String::new();
         let mut buf: Vec<u8> = Vec::new();
 
         let entry = s.get(t).unwrap();
         // Write the trigger first (as formatEntry in Config.zig does)
         entry.key_ptr.format(&mut buf).unwrap();
         {
-            let mut formatter = entry_formatter("keybind", &mut output);
+            let mut formatter = crate::config::formatter::entry_formatter("keybind", &mut output);
             entry.value_ptr.format_entries(&mut buf, &mut formatter).unwrap();
         }
-        String::from_utf8(output).unwrap()
+        output
     }
 
     #[test]

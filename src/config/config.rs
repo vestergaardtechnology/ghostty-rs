@@ -5502,11 +5502,7 @@ impl ParseCli for KeyRemapSet {
 
 impl FormatEntry for KeyRemapSet {
     fn format_entry(&self, f: &mut EntryFormatter<'_>) -> Result<(), formatterpkg::Error> {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut ef = crate::input::key_mods::entry_formatter(f.name, &mut buf);
-        KeyRemapSet::format_entry(self, &mut ef).map_err(|_| formatterpkg::Error::WriteFailed)?;
-        f.writer.write_str(&String::from_utf8_lossy(&buf))?;
-        Ok(())
+        KeyRemapSet::format_entry(self, f)
     }
 }
 
@@ -8559,21 +8555,13 @@ impl Keybinds {
             return formatter.format_entry(&());
         }
 
-        // The binding formatter writes bytes; collect them and forward.
         fn forward(
             formatter: &mut EntryFormatter<'_>,
             prefix: Vec<u8>,
             v: &binding::Value,
         ) -> Result<(), formatterpkg::Error> {
-            let mut out: Vec<u8> = Vec::new();
             let mut buffer = prefix;
-            {
-                let mut f = crate::input::key_mods::entry_formatter(formatter.name, &mut out);
-                v.format_entries(&mut buffer, &mut f)
-                    .map_err(|_| formatterpkg::Error::OutOfMemory)?;
-            }
-            formatter.writer.write_str(&String::from_utf8_lossy(&out))?;
-            Ok(())
+            v.format_entries(&mut buffer, formatter)
         }
 
         // Format root set bindings
