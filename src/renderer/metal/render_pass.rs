@@ -56,6 +56,17 @@ pub struct Draw {
     pub instance_count: usize,
 }
 
+impl Draw {
+    /// A draw with the Zig field default `instance_count = 1`.
+    pub const fn new(r#type: mtl::MTLPrimitiveType, vertex_count: usize) -> Draw {
+        Draw {
+            r#type,
+            vertex_count,
+            instance_count: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RenderPass {
     /// MTLRenderCommandEncoder
