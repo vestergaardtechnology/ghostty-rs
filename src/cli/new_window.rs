@@ -2,9 +2,11 @@
 //!
 //! STATUS: ported
 //!
-//! The GTK apprt's `App.performIpc` is not ported yet; [`apprt_ipc`]
-//! provides a stand-in `App` (TODO(port-dedupe)) shared with `+new-tab`
-//! and `+toggle-quick-terminal`.
+//! The GTK apprt's `App` is not ported yet; [`apprt_ipc`] provides its
+//! `performIpc` (TODO(port-dedupe)) shared with `+new-tab` and
+//! `+toggle-quick-terminal`. With the `gtk` feature it dispatches to the
+//! ported `apprt/gtk/ipc/*`; without it, it performs the same D-Bus calls
+//! through the `gdbus` command line tool.
 
 use std::ffi::CStr;
 use std::io::{self, BufWriter, Write};
@@ -224,11 +226,14 @@ fn run_args<I: ArgIterator + ?Sized, W: Write + ?Sized>(args_iter: &mut I, stder
 /// (`apprt/gtk/ipc/*.zig`).
 ///
 /// TODO(port-dedupe): replace with `crate::apprt::App::perform_ipc` once
-/// the GTK apprt is ported (the IPC types are `crate::apprt::ipc`). The GTK IPC
-/// is a D-Bus `org.gtk.Actions.Activate` call; without linking GIO, this
-/// stand-in performs the same call through the `gdbus` command line tool
-/// (the exact commands are documented in the Zig sources).
+/// `apprt/gtk/App.zig` is ported (the IPC types are `crate::apprt::ipc`).
+/// With the `gtk` feature this dispatches to `crate::apprt::gtk::ipc`
+/// exactly like `App.performIpc`. Without it (GIO not linked), the same
+/// D-Bus `org.gtk.Actions.Activate` call is made through the `gdbus`
+/// command line tool (the exact commands are documented in the Zig sources).
 pub mod apprt_ipc {
+    #![cfg_attr(feature = "gtk", allow(dead_code))]
+
     use std::ffi::CStr;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -255,6 +260,25 @@ pub mod apprt_ipc {
             if !cfg!(any(target_os = "linux", target_os = "freebsd")) {
                 return Ok(false);
             }
+
+            #[cfg(feature = "gtk")]
+            return {
+                use crate::apprt::gtk::ipc;
+                match action {
+                    Action::NewWindow(v) => ipc::new_window::new_window(*target, v),
+                    Action::NewTab(v) => ipc::new_tab::new_tab(*target, v),
+                    Action::ToggleQuickTerminal => {
+                        ipc::toggle_quick_terminal::toggle_quick_terminal(*target)
+                    }
+                }
+            };
+
+            #[cfg(not(feature = "gtk"))]
+            Self::perform_ipc_gdbus(target, action)
+        }
+
+        /// `performIpc` through the `gdbus` command line tool.
+        fn perform_ipc_gdbus(target: &Target<'_>, action: &Action<'_>) -> Result<bool, Errors> {
             match action {
                 Action::NewWindow(v) => {
                     // `(as)`: the arguments.
