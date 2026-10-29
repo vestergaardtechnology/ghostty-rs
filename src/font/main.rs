@@ -1,6 +1,6 @@
 //! Port of `src/font/main.zig`.
 //!
-//! STATUS: partial — `sprite_index`, `default_fallback_adjustment` and the `CodepointResolver`, `Collection`, `Shaper`, `ShaperCache`, `SharedGrid`, `SharedGridSet` re-exports are missing (their modules are not ported yet).
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "atlas.rs"]
@@ -52,6 +52,8 @@ pub mod sprite;
 pub use self::atlas::Atlas;
 pub use self::backend::Backend;
 pub use self::codepoint_map::CodepointMap;
+pub use self::codepoint_resolver::CodepointResolver;
+pub use self::collection::Collection;
 pub use self::deferred_face::DeferredFace;
 pub use self::discovery::Descriptor;
 pub use self::discovery::Discover;
@@ -59,11 +61,16 @@ pub use self::face::Face;
 pub use self::glyph::Glyph;
 pub use self::library::Library;
 pub use self::metrics::Metrics;
+pub use self::shape::Cache as ShaperCache;
+pub use self::shape::Shaper;
+pub use self::shared_grid::SharedGrid;
+pub use self::shared_grid_set::SharedGridSet;
 pub use self::sprite::Face as SpriteFace;
 pub use self::sprite::Sprite;
 
 // If we're targeting wasm then we export some wasm APIs: in Rust the
-// `#[no_mangle]` exports of `deferred_face::wasm` and `face::web_canvas::wasm`
+// `#[no_mangle]` exports of `deferred_face::wasm`, `face::web_canvas::wasm`
+// and `shaper::web_canvas::wasm`
 // are compiled on wasm32 automatically (Zig references them in a comptime
 // block).
 
@@ -90,6 +97,38 @@ pub enum Style {
     BoldItalic = 3,
 }
 
+impl Style {
+    /// All styles in declaration order (Zig `std.enums.values(Style)`).
+    pub const ALL: [Style; 4] = [Style::Regular, Style::Bold, Style::Italic, Style::BoldItalic];
+
+    /// The Zig tag name of this style.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Style::Regular => "regular",
+            Style::Bold => "bold",
+            Style::Italic => "italic",
+            Style::BoldItalic => "bold_italic",
+        }
+    }
+
+    /// Inverse of `as u8` (the Zig backing integer).
+    pub const fn from_int(v: u8) -> Option<Style> {
+        match v {
+            0 => Some(Style::Regular),
+            1 => Some(Style::Bold),
+            2 => Some(Style::Italic),
+            3 => Some(Style::BoldItalic),
+            _ => None,
+        }
+    }
+}
+
+impl Default for Style {
+    fn default() -> Style {
+        Style::Regular
+    }
+}
+
 /// The presentation for an emoji.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -97,3 +136,11 @@ pub enum Presentation {
     Text = 0,  // U+FE0E
     Emoji = 1, // U+FEOF
 }
+
+/// A FontIndex that can be used to use the sprite font directly.
+pub const SPRITE_INDEX: collection::Index = collection::Index::init_special(collection::Special::Sprite);
+
+/// The default font size adjustment we use when loading fallback fonts.
+///
+/// TODO: Add user configuration for this instead of hard-coding it.
+pub const DEFAULT_FALLBACK_ADJUSTMENT: collection::SizeAdjustment = collection::SizeAdjustment::IcWidth;
