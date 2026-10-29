@@ -5,7 +5,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 br="$1"; msg="${2:-merge $1}"
 git checkout -q main
-git merge --no-ff --no-edit -m "$msg" "$br" || { echo "MERGE CONFLICT"; git status --short | grep -E '^(UU|AA|DU|UD)' ; exit 2; }
+if ! git merge --no-ff --no-edit -m "$msg" "$br"; then
+  others=$(git diff --name-only --diff-filter=U | grep -v -E '^Cargo\.(toml|lock)$' || true)
+  if [ -n "$others" ]; then echo "MERGE CONFLICT"; echo "$others"; exit 2; fi
+  python3 tools/resolve_cargo_conflict.py Cargo.toml
+  git checkout --ours Cargo.lock 2>/dev/null || true
+  cargo metadata -q --format-version 1 >/dev/null
+  git add Cargo.toml Cargo.lock && git commit -q --no-edit
+fi
 python3 tools/scaffold.py >/dev/null
 if ! git diff --quiet; then git commit -qam "scaffold: refresh generated mod blocks"; fi
 cargo build --all-targets 2>&1 | grep -E '^(error|warning: unused)' | head -20 || true
