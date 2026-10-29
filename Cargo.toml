@@ -19,6 +19,7 @@ default = []
 
 [dependencies]
 log = "0.4"
+memchr = "2"
 
 [dev-dependencies]
 
