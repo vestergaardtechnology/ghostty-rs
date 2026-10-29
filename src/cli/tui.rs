@@ -32,6 +32,7 @@ pub const CAN_PRETTY_PRINT: bool = !cfg!(any(
 pub mod vaxis {
     use std::cell::RefCell;
     use std::fs::File;
+    use std::rc::Rc;
     use std::io::{self, BufWriter, Write};
     use std::time::Duration;
 
@@ -545,6 +546,20 @@ pub mod vaxis {
         }
     }
 
+    /// Returns a Window comprising the entire screen.
+    pub fn window_for(screen: &RefCell<Screen>) -> Window<'_> {
+        let s = screen.borrow();
+        Window {
+            x_off: 0,
+            y_off: 0,
+            parent_x_off: 0,
+            parent_y_off: 0,
+            width: s.width,
+            height: s.height,
+            screen,
+        }
+    }
+
     // -----------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------
@@ -987,7 +1002,9 @@ pub mod vaxis {
 
     /// The vaxis state: the screen being drawn and the last rendered one.
     pub struct Vaxis {
-        pub screen: RefCell<Screen>,
+        /// Shared so that windows can be created without borrowing the
+        /// `Vaxis` (see [`window_for`]).
+        pub screen: Rc<RefCell<Screen>>,
         screen_last: Screen,
         pub caps: Capabilities,
         state: State,
@@ -1006,7 +1023,7 @@ pub mod vaxis {
     impl Vaxis {
         pub fn init() -> Vaxis {
             Vaxis {
-                screen: RefCell::new(Screen::default()),
+                screen: Rc::new(RefCell::new(Screen::default())),
                 screen_last: Screen::default(),
                 caps: Capabilities::default(),
                 state: State::default(),
@@ -1046,16 +1063,7 @@ pub mod vaxis {
 
         /// Returns a Window comprising the entire terminal screen.
         pub fn window(&self) -> Window<'_> {
-            let screen = self.screen.borrow();
-            Window {
-                x_off: 0,
-                y_off: 0,
-                parent_x_off: 0,
-                parent_y_off: 0,
-                width: screen.width,
-                height: screen.height,
-                screen: &self.screen,
-            }
+            window_for(&self.screen)
         }
 
         pub fn enter_alt_screen<W: Write + ?Sized>(&mut self, tty: &mut W) -> io::Result<()> {
