@@ -44,14 +44,8 @@ impl Location {
 }
 
 /// The Ghostty resources directory, if any.
-// TODO(port-dedupe): replace with
-// `crate::global::resources_dir().app()` (which also searches relative to
-// the executable).
 fn resources_dir_app() -> Option<String> {
-    match std::env::var("GHOSTTY_RESOURCES_DIR") {
-        Ok(dir) if !dir.is_empty() => Some(dir),
-        _ => None,
-    }
+    crate::global::resources_dir().app().map(str::to_owned)
 }
 
 /// An entry returned by [`LocationIterator::next`].

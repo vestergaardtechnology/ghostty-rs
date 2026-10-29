@@ -180,125 +180,7 @@ pub const REGEX: &str = concat!(
 mod tests {
     use super::*;
 
-    /// Minimal Oniguruma bindings for the test.
-    // TODO(port-dedupe): replace with the `pkg/oniguruma` wrapper
-    // (`oni.Regex`, `oni.testing.ensureInit`).
-    mod onig {
-        use std::ffi::{c_int, c_uchar, c_uint, c_void};
-        use std::sync::Once;
-
-        #[repr(C)]
-        pub struct OnigRegion {
-            pub allocated: c_int,
-            pub num_regs: c_int,
-            pub beg: *mut c_int,
-            pub end: *mut c_int,
-            pub history_root: *mut c_void,
-        }
-
-        #[repr(C)]
-        pub struct OnigErrorInfo {
-            pub enc: *mut c_void,
-            pub par: *mut c_uchar,
-            pub par_end: *mut c_uchar,
-        }
-
-        #[link(name = "onig")]
-        extern "C" {
-            static mut OnigEncodingUTF8: c_void;
-            static mut OnigDefaultSyntax: *mut c_void;
-            fn onig_initialize(encodings: *mut *mut c_void, n: c_int) -> c_int;
-            fn onig_new(
-                reg: *mut *mut c_void,
-                pattern: *const c_uchar,
-                pattern_end: *const c_uchar,
-                option: c_uint,
-                enc: *mut c_void,
-                syntax: *mut c_void,
-                einfo: *mut OnigErrorInfo,
-            ) -> c_int;
-            fn onig_free(reg: *mut c_void);
-            fn onig_region_new() -> *mut OnigRegion;
-            fn onig_region_free(region: *mut OnigRegion, free_self: c_int);
-            fn onig_search(
-                reg: *mut c_void,
-                str: *const c_uchar,
-                end: *const c_uchar,
-                start: *const c_uchar,
-                range: *const c_uchar,
-                region: *mut OnigRegion,
-                option: c_uint,
-            ) -> c_int;
-        }
-
-        static INIT: Once = Once::new();
-
-        pub struct Regex(*mut c_void);
-
-        impl Regex {
-            pub fn new(pattern: &str) -> Regex {
-                // SAFETY: plain FFI calls with valid pointers; the encoding
-                // and syntax globals are provided by libonig.
-                unsafe {
-                    let enc = std::ptr::addr_of_mut!(OnigEncodingUTF8);
-                    INIT.call_once(|| {
-                        let mut encs = [enc];
-                        assert_eq!(0, onig_initialize(encs.as_mut_ptr(), 1));
-                    });
-                    let mut reg: *mut c_void = std::ptr::null_mut();
-                    let mut einfo = OnigErrorInfo {
-                        enc: std::ptr::null_mut(),
-                        par: std::ptr::null_mut(),
-                        par_end: std::ptr::null_mut(),
-                    };
-                    let p = pattern.as_bytes();
-                    let rc = onig_new(
-                        &mut reg,
-                        p.as_ptr(),
-                        p.as_ptr().add(p.len()),
-                        0,
-                        enc,
-                        OnigDefaultSyntax,
-                        &mut einfo,
-                    );
-                    assert_eq!(0, rc, "onig_new failed");
-                    Regex(reg)
-                }
-            }
-
-            /// Returns the (start, end) of the whole match, if any.
-            pub fn search(&self, input: &str) -> Option<(usize, usize, usize)> {
-                // SAFETY: the region is freed below; input pointers are valid
-                // for the duration of the call.
-                unsafe {
-                    let region = onig_region_new();
-                    let s = input.as_bytes();
-                    let start = s.as_ptr();
-                    let end = start.add(s.len());
-                    let rc = onig_search(self.0, start, end, start, end, region, 0);
-                    let result = if rc >= 0 {
-                        let r = &*region;
-                        Some((
-                            r.num_regs as usize,
-                            *r.beg as usize,
-                            *r.end as usize,
-                        ))
-                    } else {
-                        None
-                    };
-                    onig_region_free(region, 1);
-                    result
-                }
-            }
-        }
-
-        impl Drop for Regex {
-            fn drop(&mut self) {
-                // SAFETY: created by onig_new.
-                unsafe { onig_free(self.0) }
-            }
-        }
-    }
+    use crate::pkg::oniguruma as oni;
 
     struct Case {
         input: &'static str,
@@ -316,7 +198,15 @@ mod tests {
 
     #[test]
     fn url_regex() {
-        let re = onig::Regex::new(REGEX);
+        oni::testing::ensure_init().unwrap();
+        let mut re = oni::Regex::init(
+            REGEX.as_bytes(),
+            oni::types::Option::default(),
+            oni::Encoding::utf8(),
+            oni::Syntax::default(),
+            None,
+        )
+        .unwrap();
 
         // The URL cases to test what our regex matches. Feel free to add to this
         // as we find bugs or just want more coverage.
@@ -425,11 +315,11 @@ mod tests {
         ];
 
         for case in &cases {
-            let (count, start, end) = re
-                .search(case.input)
-                .unwrap_or_else(|| panic!("no match for input: {}", case.input));
-            assert_eq!(case.num_matches, count, "input: {}", case.input);
-            let m = &case.input[start..end];
+            let reg = re
+                .search(case.input.as_bytes(), oni::types::Option::default())
+                .unwrap_or_else(|_| panic!("no match for input: {}", case.input));
+            assert_eq!(case.num_matches, reg.count(), "input: {}", case.input);
+            let m = &case.input[reg.starts()[0] as usize..reg.ends()[0] as usize];
             assert_eq!(case.expect, m, "input: {}", case.input);
         }
 
@@ -452,7 +342,11 @@ mod tests {
             "//foo",
         ];
         for input in no_match_cases {
-            assert!(re.search(input).is_none(), "unexpected match: {}", input);
+            assert!(
+                re.search(input.as_bytes(), oni::types::Option::default()).is_err(),
+                "unexpected match: {}",
+                input
+            );
         }
     }
 }
