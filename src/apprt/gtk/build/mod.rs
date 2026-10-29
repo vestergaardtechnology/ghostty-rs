@@ -1,4 +1,5 @@
 //! Module grouping (no Zig counterpart file; mirrors a directory).
+#![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "blueprint.rs"]
