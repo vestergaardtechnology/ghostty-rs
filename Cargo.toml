@@ -16,8 +16,10 @@ path = "src/main.rs"
 
 [features]
 default = []
+inspector = []
 
 [dependencies]
+indexmap = "2"
 log = "0.4"
 memchr = "2"
 
