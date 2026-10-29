@@ -13244,4 +13244,747 @@ mod tests {
         assert!(row_at(np, 2).dirty());
         assert!(!row_at(np, 3).dirty());
     }
+
+    /// Grow the last page to capacity (integrity paused) then allocate one more page.
+    fn fill_then_grow_page(s: &mut PageList) {
+        let page1_node = last(s);
+        let page1 = pg(page1_node);
+        pg(page1_node).pause_integrity_checks(true);
+        for _ in 0..(page1.capacity.rows - page1.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+        pg(page1_node).pause_integrity_checks(false);
+        assert!(s.grow().unwrap().is_some());
+    }
+
+    #[test]
+    fn page_list_page_iterator_single_page() {
+        let s = init(80, 24);
+
+        // The viewport should be within a single page
+        assert!(n(first(&s)).next.is_none());
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::RightDown, pt_active(0, 0), None);
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(s.rows, chunk.end);
+        }
+
+        // Should only have one chunk
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_two_pages() {
+        let mut s = init(80, 24);
+
+        // Grow to capacity
+        fill_then_grow_page(&mut s);
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::RightDown, pt_active(0, 0), None);
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            let start = n(chunk.node).rows() - s.rows + 1;
+            assert_eq!(start, chunk.start);
+            assert_eq!(n(chunk.node).rows(), chunk.end);
+        }
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == last(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(1, chunk.end);
+        }
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_history_two_pages() {
+        let mut s = init(80, 24);
+
+        // Grow to capacity
+        fill_then_grow_page(&mut s);
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::RightDown, pt_history(0, 0), None);
+        {
+            let active_tl = s.get_top_left(Tag::Active);
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(active_tl.y, chunk.end);
+        }
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_reverse_single_page() {
+        let s = init(80, 24);
+
+        // The viewport should be within a single page
+        assert!(n(first(&s)).next.is_none());
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::LeftUp, pt_active(0, 0), None);
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(s.rows, chunk.end);
+        }
+
+        // Should only have one chunk
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_reverse_two_pages() {
+        let mut s = init(80, 24);
+
+        // Grow to capacity
+        fill_then_grow_page(&mut s);
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::LeftUp, pt_active(0, 0), None);
+        let mut count: usize = 0;
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == last(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(1, chunk.end);
+            count += (chunk.end - chunk.start) as usize;
+        }
+        {
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            let start = n(chunk.node).rows() - s.rows + 1;
+            assert_eq!(start, chunk.start);
+            assert_eq!(n(chunk.node).rows(), chunk.end);
+            count += (chunk.end - chunk.start) as usize;
+        }
+        assert!(it.next().is_none());
+        assert_eq!(s.rows as usize, count);
+    }
+
+    #[test]
+    fn page_list_page_iterator_reverse_history_two_pages() {
+        let mut s = init(80, 24);
+
+        // Grow to capacity
+        fill_then_grow_page(&mut s);
+
+        // Iterate the active area
+        let mut it = s.page_iterator(Direction::LeftUp, pt_history(0, 0), None);
+        {
+            let active_tl = s.get_top_left(Tag::Active);
+            let chunk = it.next().unwrap();
+            assert!(chunk.node == first(&s));
+            assert_eq!(0, chunk.start);
+            assert_eq!(active_tl.y, chunk.end);
+        }
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_reverse_count_includes_row_zero() {
+        let s = init(2, 2);
+
+        let mut it = PageIterator {
+            row: Some(s.get_top_left(Tag::Screen)),
+            limit: PageIteratorLimit::Count(1),
+            direction: Direction::LeftUp,
+        };
+        let chunk = it.next().unwrap();
+        assert_eq!(0, chunk.start);
+        assert_eq!(1, chunk.end);
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_page_iterator_count_crosses_page_boundaries() {
+        let mut s = init(80, 24);
+
+        let first = first(&s);
+        pg(first).pause_integrity_checks(true);
+        while n(first).rows() < n(first).capacity().rows {
+            s.grow().unwrap();
+        }
+        pg(first).pause_integrity_checks(false);
+        let second = s.grow().unwrap().unwrap();
+
+        let mut down = PageIterator {
+            row: Some(pin_at(first, 0, n(first).rows() - 1)),
+            limit: PageIteratorLimit::Count(2),
+            direction: Direction::RightDown,
+        };
+        {
+            let chunk = down.next().unwrap();
+            assert_eq!(first, chunk.node);
+            assert_eq!(n(first).rows() - 1, chunk.start);
+            assert_eq!(n(first).rows(), chunk.end);
+        }
+        {
+            let chunk = down.next().unwrap();
+            assert_eq!(second, chunk.node);
+            assert_eq!(0, chunk.start);
+            assert_eq!(1, chunk.end);
+        }
+        assert!(down.next().is_none());
+
+        let mut up = PageIterator {
+            row: Some(Pin::new(second)),
+            limit: PageIteratorLimit::Count(2),
+            direction: Direction::LeftUp,
+        };
+        {
+            let chunk = up.next().unwrap();
+            assert_eq!(second, chunk.node);
+            assert_eq!(0, chunk.start);
+            assert_eq!(1, chunk.end);
+        }
+        {
+            let chunk = up.next().unwrap();
+            assert_eq!(first, chunk.node);
+            assert_eq!(n(first).rows() - 1, chunk.start);
+            assert_eq!(n(first).rows(), chunk.end);
+        }
+        assert!(up.next().is_none());
+    }
+
+    #[test]
+    fn page_list_cell_iterator() {
+        let s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        fill_x(&s, 0);
+
+        let mut it = s.cell_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        assert_eq!(pt_screen(0, 0), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(1, 0), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(0, 1), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(1, 1), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_cell_iterator_reverse() {
+        let s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        fill_x(&s, 0);
+
+        let mut it = s.cell_iterator(Direction::LeftUp, pt_screen(0, 0), None);
+        assert_eq!(pt_screen(1, 1), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(0, 1), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(1, 0), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert_eq!(pt_screen(0, 0), s.point_from_pin(Tag::Screen, it.next().unwrap()).unwrap());
+        assert!(it.next().is_none());
+    }
+
+    fn prompt_list(cols: CellCountInt, rows: CellCountInt) -> PageList {
+        let s = init_opts(Options {
+            cols,
+            rows,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        s
+    }
+
+    fn set_prompt(page: &Page, y: usize, v: SemanticPrompt) {
+        row_at(page, y).set_semantic_prompt(v);
+    }
+
+    fn sem_cell(c: char, sem: SemanticContent) -> PCell {
+        let mut cell = cp(c);
+        cell.set_semantic_content(sem);
+        cell
+    }
+
+    /// Write `c` with semantic content `sem` to cells `xs` of row `y`.
+    fn sem_fill(page: &Page, y: usize, xs: core::ops::Range<usize>, c: char, sem: SemanticContent) {
+        for x in xs {
+            *cell_at(page, x, y) = sem_cell(c, sem);
+        }
+    }
+
+    /// Only set the semantic content of cells `xs` of row `y`.
+    fn sem_mark(page: &Page, y: usize, xs: core::ops::Range<usize>, sem: SemanticContent) {
+        for x in xs {
+            cell_at(page, x, y).set_semantic_content(sem);
+        }
+    }
+
+    fn pfp(s: &PageList, p: Pin) -> Point {
+        s.point_from_pin(Tag::Screen, p).unwrap()
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_left_up() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+        // Normal prompt
+        set_prompt(page, 3, SemanticPrompt::Prompt);
+        // Continuation
+        set_prompt(page, 6, SemanticPrompt::Prompt);
+        set_prompt(page, 7, SemanticPrompt::PromptContinuation);
+        set_prompt(page, 8, SemanticPrompt::PromptContinuation);
+        // Broken continuation that has non-prompts in between
+        set_prompt(page, 12, SemanticPrompt::PromptContinuation);
+
+        let mut it = s.prompt_iterator(Direction::LeftUp, pt_screen(0, 0), None);
+        assert_eq!(pt_screen(0, 12), pfp(&s, it.next().unwrap()));
+        assert_eq!(pt_screen(0, 6), pfp(&s, it.next().unwrap()));
+        assert_eq!(pt_screen(0, 3), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_right_down() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+        // Normal prompt
+        set_prompt(page, 3, SemanticPrompt::Prompt);
+        // Continuation (prompt on row 6, continuation on rows 7-8)
+        set_prompt(page, 6, SemanticPrompt::Prompt);
+        set_prompt(page, 7, SemanticPrompt::PromptContinuation);
+        set_prompt(page, 8, SemanticPrompt::PromptContinuation);
+        // Broken continuation that has non-prompts in between (orphaned continuation at row 12)
+        set_prompt(page, 12, SemanticPrompt::PromptContinuation);
+
+        let mut it = s.prompt_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        assert_eq!(pt_screen(0, 3), pfp(&s, it.next().unwrap()));
+        assert_eq!(pt_screen(0, 6), pfp(&s, it.next().unwrap()));
+        assert_eq!(pt_screen(0, 12), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_right_down_continuation_at_start() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+
+        // Prompt continuation at row 0 (no prior rows - simulates trimmed scrollback)
+        set_prompt(page, 0, SemanticPrompt::PromptContinuation);
+        set_prompt(page, 1, SemanticPrompt::PromptContinuation);
+        // Normal prompt later
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+
+        let mut it = s.prompt_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        // Should return the first continuation line since there's no prior prompt
+        assert_eq!(pt_screen(0, 0), pfp(&s, it.next().unwrap()));
+        assert_eq!(pt_screen(0, 5), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_right_down_with_prompt_before_continuation() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 2, continuation on rows 3-4
+        // Starting iteration from row 3 should still find the prompt at row 2
+        set_prompt(page, 2, SemanticPrompt::Prompt);
+        set_prompt(page, 3, SemanticPrompt::PromptContinuation);
+        set_prompt(page, 4, SemanticPrompt::PromptContinuation);
+
+        // Start iteration from row 3 (middle of the continuation)
+        // Since we start on a continuation line, we treat it as the prompt start
+        // (handles case where scrollback pruned the actual prompt)
+        let mut it = s.prompt_iterator(Direction::RightDown, pt_screen(0, 3), None);
+        // Returns row 3 since that's the first prompt-related line we encounter
+        assert_eq!(pt_screen(0, 3), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_right_down_limit_inclusive() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Iterate with limit at row 5 (the prompt row) - should include it
+        let mut it = s.prompt_iterator(Direction::RightDown, pt_screen(0, 0), Some(pt_screen(0, 5)));
+        assert_eq!(pt_screen(0, 5), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_prompt_iterator_left_up_limit_inclusive() {
+        let s = prompt_list(2, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Iterate with limit at row 10 (the prompt row) - should include it
+        // tl_pt is the limit (upper bound), bl_pt is the start point for left_up
+        let mut it = s.prompt_iterator(Direction::LeftUp, pt_screen(0, 10), Some(pt_screen(0, 15)));
+        assert_eq!(pt_screen(0, 10), pfp(&s, it.next().unwrap()));
+        assert!(it.next().is_none());
+    }
+
+    fn hl_check(s: &PageList, at: Point, content: SemanticContent, start: Point, end: Point) {
+        let hl = s.highlight_semantic_content(s.pin(at).unwrap(), content).unwrap();
+        assert_eq!(start, pfp(s, hl.start));
+        assert_eq!(end, pfp(s, hl.end));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_prompt() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // Start the prompt for the first 5 cols
+        sem_fill(page, 5, 0..5, 'A', SemanticContent::Prompt);
+        // Next 3 let's make input
+        sem_fill(page, 5, 5..8, 'B', SemanticContent::Input);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        hl_check(&s, pt_screen(2, 5), SemanticContent::Prompt, pt_screen(0, 5), pt_screen(7, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_prompt_with_output() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 3 cols are prompt
+        sem_fill(page, 5, 0..3, '$', SemanticContent::Prompt);
+        // Next 4 are input
+        sem_fill(page, 5, 3..7, 'l', SemanticContent::Input);
+        // Rest is output (shouldn't be included in prompt highlight)
+        sem_fill(page, 5, 7..10, 'o', SemanticContent::Output);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting from prompt should include prompt and input, but stop at output
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Prompt, pt_screen(0, 5), pt_screen(6, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_prompt_multiline() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt starts on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First row is all prompt
+        sem_fill(page, 5, 0..10, '$', SemanticContent::Prompt);
+        // Row 6 continues with input
+        sem_fill(page, 6, 0..5, 'c', SemanticContent::Input);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting should span both rows
+        hl_check(&s, pt_screen(2, 5), SemanticContent::Prompt, pt_screen(0, 5), pt_screen(4, 6));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_prompt_only() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5 with only prompt content (no input)
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        sem_fill(page, 5, 0..5, '$', SemanticContent::Prompt);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting should only include the prompt cells
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Prompt, pt_screen(0, 5), pt_screen(4, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_prompt_to_end_of_screen() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Single prompt on row 15, no following prompt
+        set_prompt(page, 15, SemanticPrompt::Prompt);
+        sem_fill(page, 15, 0..3, '$', SemanticContent::Prompt);
+        sem_fill(page, 15, 3..8, 'c', SemanticContent::Input);
+
+        // Highlighting should include prompt and input up to column 7
+        hl_check(&s, pt_screen(0, 15), SemanticContent::Prompt, pt_screen(0, 15), pt_screen(7, 15));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_basic() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 3 cols are prompt
+        sem_fill(page, 5, 0..3, '$', SemanticContent::Prompt);
+        // Next 5 are input
+        sem_fill(page, 5, 3..8, 'l', SemanticContent::Input);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting input should only include input cells
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Input, pt_screen(3, 5), pt_screen(7, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_with_output() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 2 cols are prompt
+        sem_fill(page, 5, 0..2, '$', SemanticContent::Prompt);
+        // Next 3 are input
+        sem_fill(page, 5, 2..5, 'c', SemanticContent::Input);
+        // Rest is output
+        sem_fill(page, 5, 5..10, 'o', SemanticContent::Output);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting input should stop at output
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Input, pt_screen(2, 5), pt_screen(4, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_multiline_with_continuation() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 2 cols are prompt
+        sem_fill(page, 5, 0..2, '$', SemanticContent::Prompt);
+        // Rest is input
+        sem_fill(page, 5, 2..10, 'c', SemanticContent::Input);
+        // Row 6 has continuation prompt then more input
+        sem_fill(page, 6, 0..2, '>', SemanticContent::Prompt);
+        sem_fill(page, 6, 2..6, 'd', SemanticContent::Input);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting input should span both rows, skipping continuation prompts
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Input, pt_screen(2, 5), pt_screen(5, 6));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_no_input_returns_null() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5 with only prompt, then immediately output
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 3 cols are prompt
+        sem_fill(page, 5, 0..3, '$', SemanticContent::Prompt);
+        // Rest is output (no input!)
+        sem_fill(page, 5, 3..10, 'o', SemanticContent::Output);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting input should return null when there's no input
+        let hl = s.highlight_semantic_content(s.pin(pt_screen(0, 5)).unwrap(), SemanticContent::Input);
+        assert!(hl.is_none());
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_to_end_of_screen() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Single prompt on row 15, no following prompt
+        set_prompt(page, 15, SemanticPrompt::Prompt);
+        sem_fill(page, 15, 0..2, '$', SemanticContent::Prompt);
+        sem_fill(page, 15, 2..7, 'c', SemanticContent::Input);
+
+        // Highlighting input with no following prompt
+        hl_check(&s, pt_screen(0, 15), SemanticContent::Input, pt_screen(2, 15), pt_screen(6, 15));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_input_prompt_only_returns_null() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5 with only prompt content, no input or output
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // All cells are prompt
+        sem_fill(page, 5, 0..10, '$', SemanticContent::Prompt);
+        // Mark rows 6-9 as prompt to ensure no input before next prompt
+        for y in 6..10 {
+            sem_mark(page, y, 0..10, SemanticContent::Prompt);
+        }
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting input should return null when there's only prompts
+        let hl = s.highlight_semantic_content(s.pin(pt_screen(0, 5)).unwrap(), SemanticContent::Input);
+        assert!(hl.is_none());
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_basic() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 2 cols are prompt
+        sem_fill(page, 5, 0..2, '$', SemanticContent::Prompt);
+        // Next 3 are input
+        sem_fill(page, 5, 2..5, 'l', SemanticContent::Input);
+        // Cols 5-7 are output
+        sem_fill(page, 5, 5..8, 'o', SemanticContent::Output);
+        // Mark remaining cells as prompt to bound the output
+        sem_mark(page, 5, 8..10, SemanticContent::Prompt);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting output should only include output cells
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Output, pt_screen(5, 5), pt_screen(7, 5));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_multiline() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 2 cols are prompt
+        sem_fill(page, 5, 0..2, '$', SemanticContent::Prompt);
+        // Next 2 are input
+        sem_fill(page, 5, 2..4, 'l', SemanticContent::Input);
+        // Rest of row 5 is output
+        sem_fill(page, 5, 4..10, 'o', SemanticContent::Output);
+        // Row 6 is all output
+        sem_fill(page, 6, 0..10, 'o', SemanticContent::Output);
+        // Row 7 has partial output then input to bound it
+        sem_fill(page, 7, 0..5, 'o', SemanticContent::Output);
+        sem_mark(page, 7, 5..10, SemanticContent::Input);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting output should span multiple rows
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Output, pt_screen(4, 5), pt_screen(4, 7));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_stops_at_next_prompt() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 2 cols are prompt
+        sem_fill(page, 5, 0..2, '$', SemanticContent::Prompt);
+        // Next 2 are input
+        sem_fill(page, 5, 2..4, 'l', SemanticContent::Input);
+        // Rest is output
+        sem_fill(page, 5, 4..10, 'o', SemanticContent::Output);
+        // Row 6 has output then prompt starts
+        sem_fill(page, 6, 0..3, 'o', SemanticContent::Output);
+        // Next prompt marker on same row
+        sem_fill(page, 6, 3..6, '$', SemanticContent::Prompt);
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting output should stop before prompt/input
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Output, pt_screen(4, 5), pt_screen(2, 6));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_to_end_of_screen() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Single prompt on row 15, no following prompt
+        set_prompt(page, 15, SemanticPrompt::Prompt);
+        sem_fill(page, 15, 0..2, '$', SemanticContent::Prompt);
+        sem_fill(page, 15, 2..4, 'c', SemanticContent::Input);
+        sem_fill(page, 15, 4..10, 'o', SemanticContent::Output);
+        // Row 16 has output then prompt to bound it
+        sem_fill(page, 16, 0..8, 'o', SemanticContent::Output);
+        sem_mark(page, 16, 8..10, SemanticContent::Prompt);
+
+        // Highlighting output with no following prompt
+        hl_check(&s, pt_screen(0, 15), SemanticContent::Output, pt_screen(4, 15), pt_screen(7, 16));
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_no_output_returns_null() {
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5 with only prompt and input, no output
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 3 cols are prompt
+        sem_fill(page, 5, 0..3, '$', SemanticContent::Prompt);
+        // Rest is input (must explicitly mark all cells to avoid default .output)
+        sem_fill(page, 5, 3..10, 'c', SemanticContent::Input);
+        // Mark rows 6-9 as input to ensure no output between prompts
+        for y in 6..10 {
+            sem_mark(page, y, 0..10, SemanticContent::Input);
+        }
+        // Prompt on row 10 (no output between prompts)
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting output should return null when there's no output
+        let hl = s.highlight_semantic_content(s.pin(pt_screen(0, 5)).unwrap(), SemanticContent::Output);
+        assert!(hl.is_none());
+    }
+
+    #[test]
+    fn page_list_highlight_semantic_content_output_skips_empty_cells() {
+        // Tests that empty cells with default .output semantic content are
+        // not selected as output. This can happen when a prompt/input line
+        // doesn't fill the entire row - trailing cells have default .output.
+        let s = prompt_list(10, 20);
+        let page = pg(first(&s));
+
+        // Prompt on row 5 - only fills first 3 cells, rest are empty with default .output
+        set_prompt(page, 5, SemanticPrompt::Prompt);
+        // First 3 cols are prompt with text
+        sem_fill(page, 5, 0..3, '$', SemanticContent::Prompt);
+        // Cells 3-9 are empty (codepoint = 0) with default .output semantic content
+        // This simulates what happens when a short prompt is written
+
+        // Row 6 has input (short, doesn't fill line)
+        sem_fill(page, 6, 0..4, 'l', SemanticContent::Input);
+        // Cells 4-9 are empty with default .output
+
+        // Row 7-8 have actual output with text
+        for y in 7..9 {
+            sem_fill(page, y, 0..5, 'o', SemanticContent::Output);
+        }
+
+        // Prompt on row 10
+        set_prompt(page, 10, SemanticPrompt::Prompt);
+
+        // Highlighting output should skip empty cells on rows 5-6 and find
+        // the actual output starting at row 7
+        hl_check(&s, pt_screen(0, 5), SemanticContent::Output, pt_screen(0, 7), pt_screen(4, 8));
+    }
 }
