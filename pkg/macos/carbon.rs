@@ -1,6 +1,6 @@
 //! Port of `src/macos/carbon.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "carbon/c.rs"]
