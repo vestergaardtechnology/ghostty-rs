@@ -6,12 +6,10 @@
 use crate::os::resourcesdir::NoSpaceLeft;
 use crate::os::{self as internal_os, ResourcesDir};
 
-/// `build_config.flatpak` (the `-Dflatpak` build option, false by default).
-// TODO(port-dedupe): replace with crate::build_config::FLATPAK
-const BUILD_CONFIG_FLATPAK: bool = false;
+use crate::build_config;
 
 pub fn resources_dir() -> Result<ResourcesDir, NoSpaceLeft> {
-    if BUILD_CONFIG_FLATPAK {
+    if build_config::FLATPAK {
         // Only consult Flatpak runtime data for host case.
         if internal_os::is_flatpak() {
             let mut result = ResourcesDir {
