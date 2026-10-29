@@ -1,6 +1,6 @@
-//! Port of `src/fontconfig/main.zig`.
+//! Port of `pkg/fontconfig/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "c.rs"]
@@ -32,3 +32,16 @@ pub mod test;
 #[path = "value.rs"]
 pub mod value;
 // @generated-mods-end
+
+pub use char_set::CharSet;
+pub use common::{MatchKind, Property, Result, Slant, Spacing, Weight};
+pub use config::Config;
+pub use error::Error;
+pub use font_set::FontSet;
+pub use init::{fini, init, init_load_config, init_load_config_and_fonts, version};
+pub use lang_set::LangSet;
+pub use matrix::Matrix;
+pub use object_set::ObjectSet;
+pub use pattern::Pattern;
+pub use range::Range;
+pub use value::{Type, Value, ValueBinding};
