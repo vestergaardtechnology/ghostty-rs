@@ -13987,4 +13987,982 @@ mod tests {
         // the actual output starting at row 7
         hl_check(&s, pt_screen(0, 5), SemanticContent::Output, pt_screen(0, 7), pt_screen(4, 8));
     }
+
+    #[test]
+    fn page_list_erase() {
+        let mut s = init(80, 24);
+        assert_eq!(1, s.total_pages());
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+        assert_eq!(6, s.total_pages());
+
+        // Our total rows should be large
+        assert!(s.total_rows > s.rows as usize);
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(None);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // We should be back to just one page
+        assert_eq!(1, s.total_pages());
+        assert!(s.pages.first == s.pages.last);
+    }
+
+    #[test]
+    fn page_list_erase_reaccounts_page_size() {
+        let mut s = init(80, 24);
+        let start_size = s.page_size;
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+        assert!(s.page_size > start_size);
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(None);
+        assert_eq!(start_size, s.page_size);
+    }
+
+    #[test]
+    fn page_list_erase_row_with_tracked_pin_resets_to_top_left() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+
+        // Our total rows should be large
+        assert!(s.total_rows > s.rows as usize);
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_history(0, 0)).unwrap()).unwrap();
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(None);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Our pin should move to the first page
+        assert_eq!(first(&s), tp(p).node);
+        assert_eq!(0, tp(p).y);
+        assert_eq!(0, tp(p).x);
+
+        // Its row was erased, so it should be garbage
+        assert!(tp(p).garbage);
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_erase_history_marks_pins_in_erased_rows_as_garbage() {
+        let mut s = init(80, 24);
+
+        // A few rows of history on the same page as the active area.
+        for _ in 0..10 {
+            s.grow().unwrap();
+        }
+        assert_eq!(34, s.total_rows);
+
+        let history = s.track_pin(s.pin(pt_history(0, 5)).unwrap()).unwrap();
+        let active = s.track_pin(s.pin(pt_active(0, 2)).unwrap()).unwrap();
+
+        s.erase_history(None);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // The history row is gone, the active row just moved up.
+        assert!(tp(history).garbage);
+        assert!(!tp(active).garbage);
+        assert_eq!(pt_screen(0, 2), s.point_from_pin(Tag::Screen, *tp(active)).unwrap());
+
+        s.untrack_pin(active);
+        s.untrack_pin(history);
+    }
+
+    #[test]
+    fn page_list_erase_row_with_tracked_pin_shifts() {
+        let mut s = init(80, 24);
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(2, 4)).unwrap()).unwrap();
+
+        // Erase only a few rows in our active
+        s.erase_active(3);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Our pin should move to the first page
+        assert_eq!(first(&s), tp(p).node);
+        assert_eq!(0, tp(p).y);
+        assert_eq!(2, tp(p).x);
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_erase_row_with_tracked_pin_is_erased() {
+        let mut s = init(80, 24);
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(2, 2)).unwrap()).unwrap();
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_active(3);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Our pin should move to the first page
+        assert_eq!(first(&s), tp(p).node);
+        assert_eq!(0, tp(p).y);
+        assert_eq!(0, tp(p).x);
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_erase_resets_viewport_to_active_if_moves_within_active() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+
+        // Move our viewport to the top
+        s.scroll(Scroll::DeltaRow(-(s.total_rows as isize)));
+        assert!(s.viewport == Viewport::Top);
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(None);
+        assert!(s.viewport == Viewport::Active);
+    }
+
+    #[test]
+    fn page_list_erase_resets_viewport_if_inside_erased_page_but_not_active() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+
+        // Move our viewport to the top
+        s.scroll(Scroll::DeltaRow(-(s.total_rows as isize)));
+        assert!(s.viewport == Viewport::Top);
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(Some(pt_history(0, 2)));
+        assert!(s.viewport == Viewport::Top);
+    }
+
+    #[test]
+    fn page_list_erase_resets_viewport_to_active_if_top_is_inside_active() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up at least 5 pages.
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_paused(&mut s, cap_rows * 5);
+
+        // Move our viewport to the top
+        s.scroll(Scroll::Top);
+
+        // Erase the entire history, we should be back to just our active set.
+        s.erase_history(None);
+        assert!(s.viewport == Viewport::Active);
+    }
+
+    #[test]
+    fn page_list_erase_active_regrows_automatically() {
+        let mut s = init(80, 24);
+        assert!(s.total_rows() == s.rows as usize);
+        s.erase_active(10);
+        assert!(s.total_rows() == s.rows as usize);
+    }
+
+    #[test]
+    fn page_list_erase_a_one_row_active() {
+        let mut s = init(10, 1);
+        assert_eq!(1, s.total_pages());
+
+        // Write our letter
+        let page = pg(first(&s));
+        for y in 0..s.rows as usize {
+            *cell_at(page, 0, y) = cp('A');
+        }
+
+        s.erase_active(0);
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // The row should be empty
+        let get = s.get_cell(pt_active(0, 0)).unwrap();
+        assert_eq!(0, unsafe { (*get.cell).content_codepoint() });
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_less_than_full_row() {
+        let mut s = init(80, 10);
+
+        // Pins
+        let p_top = s.track_pin(s.pin(pt_active(0, 5)).unwrap()).unwrap();
+        let p_bot = s.track_pin(s.pin(pt_active(0, 8)).unwrap()).unwrap();
+        let p_out = s.track_pin(s.pin(pt_active(0, 9)).unwrap()).unwrap();
+
+        // Erase only a few rows in our active
+        s.erase_row_bounded(pt_active(0, 5), 3);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // The erased rows should be dirty
+        assert!(s.is_dirty(pt_active(0, 5)));
+        assert!(s.is_dirty(pt_active(0, 6)));
+        assert!(s.is_dirty(pt_active(0, 7)));
+
+        assert_eq!(first(&s), tp(p_top).node);
+        assert_eq!(4, tp(p_top).y);
+        assert_eq!(0, tp(p_top).x);
+
+        assert_eq!(first(&s), tp(p_bot).node);
+        assert_eq!(7, tp(p_bot).y);
+        assert_eq!(0, tp(p_bot).x);
+
+        assert_eq!(first(&s), tp(p_out).node);
+        assert_eq!(9, tp(p_out).y);
+        assert_eq!(0, tp(p_out).x);
+
+        s.untrack_pin(p_out);
+        s.untrack_pin(p_bot);
+        s.untrack_pin(p_top);
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_with_pin_at_top() {
+        let mut s = init(80, 10);
+
+        // Pins
+        let p_top = s.track_pin(s.pin(pt_active(5, 0)).unwrap()).unwrap();
+
+        // Erase only a few rows in our active
+        s.erase_row_bounded(pt_active(0, 0), 3);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // The erased rows should be dirty
+        assert!(s.is_dirty(pt_active(0, 0)));
+        assert!(s.is_dirty(pt_active(0, 1)));
+        assert!(s.is_dirty(pt_active(0, 2)));
+
+        assert_eq!(first(&s), tp(p_top).node);
+        assert_eq!(0, tp(p_top).y);
+        assert_eq!(0, tp(p_top).x);
+
+        s.untrack_pin(p_top);
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_full_rows_single_page() {
+        let mut s = init(80, 10);
+
+        // Pins
+        let p_in = s.track_pin(s.pin(pt_active(0, 7)).unwrap()).unwrap();
+        let p_out = s.track_pin(s.pin(pt_active(0, 9)).unwrap()).unwrap();
+
+        // Erase only a few rows in our active
+        s.erase_row_bounded(pt_active(0, 5), 10);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // The erased rows should be dirty
+        for y in 5..10 {
+            assert!(s.is_dirty(pt_active(0, y)));
+        }
+
+        // Our pin should move to the first page
+        assert_eq!(first(&s), tp(p_in).node);
+        assert_eq!(6, tp(p_in).y);
+        assert_eq!(0, tp(p_in).x);
+
+        assert_eq!(first(&s), tp(p_out).node);
+        assert_eq!(8, tp(p_out).y);
+        assert_eq!(0, tp(p_out).x);
+
+        s.untrack_pin(p_out);
+        s.untrack_pin(p_in);
+    }
+
+    /// Grow so the active area straddles two pages: the first page is
+    /// full and the last page holds 5 rows.
+    fn straddle_two_pages(s: &mut PageList) {
+        let page = pg(last(s));
+        page.pause_integrity_checks(true);
+        for _ in 0..(page.capacity.rows - page.size.rows) {
+            s.grow().unwrap();
+        }
+        page.pause_integrity_checks(false);
+        s.grow_rows(5).unwrap();
+        assert_eq!(2, s.total_pages());
+        assert_eq!(5, n(last(s)).rows());
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_full_rows_two_pages() {
+        let mut s = init(80, 10);
+
+        // Grow to two pages so our active area straddles
+        straddle_two_pages(&mut s);
+
+        // Pins
+        let p_first = s.track_pin(s.pin(pt_active(0, 4)).unwrap()).unwrap();
+        let p_first_out = s.track_pin(s.pin(pt_active(0, 3)).unwrap()).unwrap();
+        let p_in = s.track_pin(s.pin(pt_active(0, 8)).unwrap()).unwrap();
+        let p_out = s.track_pin(s.pin(pt_active(0, 9)).unwrap()).unwrap();
+
+        {
+            assert_eq!(prev(last(&s)), tp(p_first).node);
+            assert_eq!(n(tp(p_first).node).rows() - 1, tp(p_first).y);
+            assert_eq!(0, tp(p_first).x);
+
+            assert_eq!(prev(last(&s)), tp(p_first_out).node);
+            assert_eq!(n(tp(p_first_out).node).rows() - 2, tp(p_first_out).y);
+            assert_eq!(0, tp(p_first_out).x);
+
+            assert_eq!(last(&s), tp(p_in).node);
+            assert_eq!(3, tp(p_in).y);
+            assert_eq!(0, tp(p_in).x);
+
+            assert_eq!(last(&s), tp(p_out).node);
+            assert_eq!(4, tp(p_out).y);
+            assert_eq!(0, tp(p_out).x);
+        }
+
+        // Erase only a few rows in our active
+        s.erase_row_bounded(pt_active(0, 4), 4);
+
+        // The erased rows should be dirty
+        for y in 4..8 {
+            assert!(s.is_dirty(pt_active(0, y)));
+        }
+
+        // In page in first page is shifted
+        assert_eq!(prev(last(&s)), tp(p_first).node);
+        assert_eq!(n(tp(p_first).node).rows() - 2, tp(p_first).y);
+        assert_eq!(0, tp(p_first).x);
+
+        // Out page in first page should not be shifted
+        assert_eq!(prev(last(&s)), tp(p_first_out).node);
+        assert_eq!(n(tp(p_first_out).node).rows() - 2, tp(p_first_out).y);
+        assert_eq!(0, tp(p_first_out).x);
+
+        // In page is shifted
+        assert_eq!(last(&s), tp(p_in).node);
+        assert_eq!(2, tp(p_in).y);
+        assert_eq!(0, tp(p_in).x);
+
+        // Out page is not shifted
+        assert_eq!(last(&s), tp(p_out).node);
+        assert_eq!(4, tp(p_out).y);
+        assert_eq!(0, tp(p_out).x);
+
+        s.untrack_pin(p_out);
+        s.untrack_pin(p_in);
+        s.untrack_pin(p_first_out);
+        s.untrack_pin(p_first);
+    }
+
+    fn uri_for(x: usize) -> Vec<u8> {
+        format!("http://example.com/{}", x).into_bytes()
+    }
+
+    /// Shared setup for the hyperlink-dense erase tests.
+    fn hyperlink_dense_setup(s: &mut PageList, link_count: usize) {
+        // Grow to two pages so our active area straddles them: the first
+        // page is exactly full and the second page holds the last 5 rows
+        // of the active area.
+        straddle_two_pages(s);
+
+        // Mark each active row with a codepoint so we can verify the
+        // shift afterwards. Row y gets codepoint '0' + y at x = 0.
+        for y in 0..10u32 {
+            let row_pin = s.pin(pt_active(0, y)).unwrap();
+            *pin_rac(row_pin).1 = cpu('0' as u32 + y);
+        }
+
+        // Fill the top row of the second page (active y=5) with more
+        // unique hyperlinks ('A' through 'J') than the first page's
+        // default hyperlink capacity can hold. We must increase the
+        // second page's capacity to even create such a row; the first
+        // page keeps its default capacity.
+        while pg(last(s)).hyperlink_set.layout.cap <= link_count {
+            s.increase_capacity(last(s), Some(IncreaseCapacity::HyperlinkBytes))
+                .unwrap();
+        }
+        assert!(pg(first(s)).hyperlink_set.layout.cap < link_count);
+        {
+            let page = pg(last(s));
+            for x in 0..link_count {
+                let uri = uri_for(x);
+                let id = page
+                    .insert_hyperlink(&hyperlink::Hyperlink {
+                        id: hyperlink::HyperlinkId::Implicit(x as u32),
+                        uri: std::borrow::Cow::Borrowed(&uri),
+                    })
+                    .unwrap();
+                let (row, cell) = rac(page, x, 0);
+                *cell = cpu('A' as u32 + x as u32);
+                page.set_hyperlink(row, cell, id).unwrap();
+                unsafe { page.hyperlink_set.use_(page.memory, id) };
+            }
+        }
+    }
+
+    fn hyperlink_dense_check(s: &PageList, link_count: usize) {
+        // Every cell of the dense row must still resolve to a real
+        // hyperlink entry with the correct URI. A half-applied erase
+        // leaves cells whose hyperlink flag is set but that have no map
+        // entry, which aborts in clearCells later.
+        for x in 0..link_count {
+            let list_cell = s.get_cell(pt_active(x as CellCountInt, 4)).unwrap();
+            let cell = unsafe { &*list_cell.cell };
+            assert!(cell.hyperlink());
+            let page = pg(list_cell.node);
+            let id = page.lookup_hyperlink(cell).unwrap();
+            let link = unsafe { &*page.hyperlink_set.get(page.memory, id) };
+            assert_eq!(&uri_for(x)[..], unsafe { link.uri.slice(page.memory) });
+        }
+
+        // All pages must pass integrity checks.
+        let mut node_ = s.pages.first;
+        while let Some(node) = node_ {
+            pg(node).assert_integrity();
+            node_ = n(node).next;
+        }
+    }
+
+    #[test]
+    fn page_list_erase_row_hyperlink_dense_row_crosses_page_boundary() {
+        // Regression test: when eraseRow shifts rows up across a page
+        // boundary, the top row of the next page is cloned into the last
+        // row of the previous page. If the previous page doesn't have
+        // enough capacity for the managed memory of that row (hyperlinks,
+        // styles, etc.) the error propagated out AFTER the previous page
+        // had already been rotated and its tracked pins moved, leaving
+        // the page list half-mutated.
+        //
+        // eraseRow must instead increase the destination page's capacity
+        // and retry, the same way insertLines/deleteLines and
+        // cursorScrollAbove handle their cross-page copies.
+        let mut s = init(80, 10);
+        let link_count: usize = 10;
+        hyperlink_dense_setup(&mut s, link_count);
+
+        // Track a pin in the shifted region of the first page to verify
+        // it survives the capacity change of its node.
+        let p = s.track_pin(s.pin(pt_active(3, 1)).unwrap()).unwrap();
+
+        // Erase the first active row. The dense hyperlink row must cross
+        // the page boundary into the first page, which requires growing
+        // the first page's hyperlink capacity.
+        s.erase_row(pt_active(0, 0));
+
+        // Every remaining row shifted up by one: the '0' marker row was
+        // erased, the dense row moved up across the page boundary to
+        // row 4, and the last row was cleared.
+        let expected: [u32; 10] = ['1' as u32, '2' as u32, '3' as u32, '4' as u32, 'A' as u32, '6' as u32, '7' as u32, '8' as u32, '9' as u32, 0];
+        for (y, cp) in expected.iter().enumerate() {
+            let list_cell = s.get_cell(pt_active(0, y as u32)).unwrap();
+            assert_eq!(*cp, unsafe { (*list_cell.cell).content_codepoint() });
+        }
+
+        hyperlink_dense_check(&s, link_count);
+
+        // Our tracked pin shifted up by one row and still points into
+        // the (possibly replaced) first page.
+        assert_eq!(first(&s), tp(p).node);
+        let p_pt = s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord();
+        assert_eq!(3, p_pt.x);
+        assert_eq!(0, p_pt.y);
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_hyperlink_dense_row_crosses_page_boundary() {
+        // Same as the eraseRow variant above but for eraseRowBounded,
+        // which has the same rotate-then-clone structure and had the
+        // same bug: a cross-page row clone failure propagated out after
+        // the first page had already been rotated.
+        let mut s = init(80, 10);
+        let link_count: usize = 10;
+        hyperlink_dense_setup(&mut s, link_count);
+
+        // Erase the first active row with a limit that extends into the
+        // second page (5 rows remain in the first page, so a limit of 6
+        // forces the cross-page path). The dense hyperlink row must cross
+        // the page boundary into the first page.
+        s.erase_row_bounded(pt_active(0, 0), 6);
+
+        // Rows within the limit shifted up by one: the '0' marker row was
+        // erased, the dense row moved up across the page boundary to
+        // row 4, row 6 is the new blank row, and rows past the limit are
+        // unchanged.
+        let expected: [u32; 10] = ['1' as u32, '2' as u32, '3' as u32, '4' as u32, 'A' as u32, '6' as u32, 0, '7' as u32, '8' as u32, '9' as u32];
+        for (y, cp) in expected.iter().enumerate() {
+            let list_cell = s.get_cell(pt_active(0, y as u32)).unwrap();
+            assert_eq!(*cp, unsafe { (*list_cell.cell).content_codepoint() });
+        }
+
+        hyperlink_dense_check(&s, link_count);
+    }
+
+    #[test]
+    fn page_list_clone() {
+        let s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 0), None)).unwrap();
+        assert_eq!(s.rows as usize, s2.total_rows());
+    }
+
+    #[test]
+    fn page_list_clone_partial_trimmed_right() {
+        let mut s = init(80, 20);
+        assert_eq!(s.rows as usize, s.total_rows());
+        s.grow_rows(30).unwrap();
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 0), Some(pt_screen(0, 39)))).unwrap();
+        assert_eq!(40, s2.total_rows());
+    }
+
+    #[test]
+    fn page_list_clone_partial_trimmed_left() {
+        let mut s = init(80, 20);
+        assert_eq!(s.rows as usize, s.total_rows());
+        s.grow_rows(30).unwrap();
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 10), None)).unwrap();
+        assert_eq!(40, s2.total_rows());
+    }
+
+    #[test]
+    fn page_list_clone_partial_trimmed_left_reclaims_styles() {
+        let mut s = init(80, 20);
+        assert_eq!(s.rows as usize, s.total_rows());
+        s.grow_rows(30).unwrap();
+
+        // Style the rows we're trimming
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            let mut style = stylepkg::Style::default();
+            style.flags.bold = true;
+            let style_id = unsafe { page.styles.add(page.memory, style) }.unwrap();
+
+            let mut it = s.row_iterator(Direction::LeftUp, pt_screen(0, 0), Some(pt_screen(0, 9)));
+            while let Some(p) = it.next() {
+                let (row, cell) = pin_rac(p);
+                row.set_styled(true);
+                let mut c = cp('A');
+                c.set_style_id(style_id);
+                *cell = c;
+                unsafe { page.styles.use_(page.memory, style_id) };
+            }
+
+            // We're over-counted by 1 because `add` implies `use`.
+            unsafe { page.styles.release(page.memory, style_id) };
+
+            // Expect to have one style
+            assert_eq!(1, page.styles.count());
+        }
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 10), None)).unwrap();
+        assert_eq!(40, s2.total_rows());
+
+        {
+            assert!(s2.pages.first == s2.pages.last);
+            let page = pg(first(&s2));
+            assert_eq!(0, page.styles.count());
+        }
+    }
+
+    #[test]
+    fn page_list_clone_partial_trimmed_both() {
+        let mut s = init(80, 20);
+        assert_eq!(s.rows as usize, s.total_rows());
+        s.grow_rows(30).unwrap();
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 10), Some(pt_screen(0, 35)))).unwrap();
+        assert_eq!(26, s2.total_rows());
+    }
+
+    #[test]
+    fn page_list_clone_less_than_active() {
+        let s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        let s2 = s.clone(clone_opts(pt_active(0, 5), None)).unwrap();
+        assert_eq!(s.rows as usize, s2.total_rows());
+    }
+
+    #[test]
+    fn page_list_clone_remap_tracked_pin() {
+        let mut s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Put a tracked pin in the screen
+        let p = s.track_pin(s.pin(pt_active(0, 6)).unwrap()).unwrap();
+
+        let mut pin_remap = TrackedPinsRemap::new();
+        let s2 = s
+            .clone(Clone {
+                top: pt_active(0, 5),
+                bot: None,
+                tracked_pins: Some(&mut pin_remap),
+            })
+            .unwrap();
+
+        // We should be able to find our tracked pin
+        let p2 = *pin_remap.get(&p).unwrap();
+        assert_eq!(pt_active(0, 1), s2.point_from_pin(Tag::Active, *tp(p2)).unwrap());
+
+        drop(s2);
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_clone_remap_tracked_pin_not_in_cloned_area() {
+        let mut s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Put a tracked pin in the screen
+        let p = s.track_pin(s.pin(pt_active(0, 3)).unwrap()).unwrap();
+
+        let mut pin_remap = TrackedPinsRemap::new();
+        let s2 = s
+            .clone(Clone {
+                top: pt_active(0, 5),
+                bot: None,
+                tracked_pins: Some(&mut pin_remap),
+            })
+            .unwrap();
+
+        // We should be able to find our tracked pin
+        assert!(pin_remap.get(&p).is_none());
+
+        drop(s2);
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_clone_full_dirty() {
+        let mut s = init(80, 24);
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Mark a row as dirty
+        s.mark_dirty(pt_active(0, 0));
+        s.mark_dirty(pt_active(0, 12));
+        s.mark_dirty(pt_active(0, 23));
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 0), None)).unwrap();
+        assert_eq!(s.rows as usize, s2.total_rows());
+
+        // Should still be dirty
+        assert!(s2.is_dirty(pt_active(0, 0)));
+        assert!(!s2.is_dirty(pt_active(0, 1)));
+        assert!(s2.is_dirty(pt_active(0, 12)));
+        assert!(!s2.is_dirty(pt_active(0, 14)));
+        assert!(s2.is_dirty(pt_active(0, 23)));
+    }
+
+    fn no_reflow(cols: Option<CellCountInt>, rows: Option<CellCountInt>) -> Resize {
+        Resize {
+            cols,
+            rows,
+            reflow: false,
+            ..Default::default()
+        }
+    }
+
+    fn bg_rgb_cell(r: u8, g: u8, b: u8) -> PCell {
+        let mut c = PCell::default();
+        c.set_content_tag(ContentTag::BgColorRgb);
+        c.set_content_color_rgb(pagepkg::Rgb { r, g, b });
+        c
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(3, s.total_rows());
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 2)).unwrap()).unwrap();
+
+        // Resize
+        s.resize(no_reflow(None, Some(10))).unwrap();
+        assert_eq!(10, s.rows);
+        assert_eq!(10, s.total_rows());
+
+        // Our cursor should not move because we have no scrollback so
+        // we just grew.
+        assert_eq!(pt_active(0, 2), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        assert_eq!(pt_screen(0, 0), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows_with_history() {
+        let mut s = init(10, 3);
+        s.grow_rows(50).unwrap();
+        assert_eq!(pt_screen(0, 50), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 2)).unwrap()).unwrap();
+
+        // Resize
+        s.resize(no_reflow(None, Some(5))).unwrap();
+        assert_eq!(5, s.rows);
+        assert_eq!(53, s.total_rows());
+
+        // Our cursor should move since it's in the scrollback
+        assert_eq!(pt_active(0, 4), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        assert_eq!(pt_screen(0, 48), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(10, s.total_rows());
+
+        // This is required for our writing below to work
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write into all rows so we don't get trim behavior
+        for y in 0..s.rows as usize {
+            *cell_at(page, 0, y) = cp('A');
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(5))).unwrap();
+        assert_eq!(5, s.rows);
+        assert_eq!(10, s.total_rows());
+        assert_eq!(pt_screen(0, 5), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_one_rows() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(10, s.total_rows());
+
+        // This is required for our writing below to work
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write into all rows so we don't get trim behavior
+        for y in 0..s.rows as usize {
+            *cell_at(page, 0, y) = cp('A');
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(1))).unwrap();
+        assert_eq!(1, s.rows);
+        assert_eq!(10, s.total_rows());
+        assert_eq!(pt_screen(0, 9), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_cursor_on_bottom() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(10, s.total_rows());
+
+        // This is required for our writing below to work
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write into all rows so we don't get trim behavior
+        for y in 0..s.rows as usize {
+            *cell_at(page, 0, y) = cpu(y as u32);
+        }
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 9)).unwrap()).unwrap();
+        {
+            let cursor = s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord();
+            let get = s.get_cell(pt_active(cursor.x, cursor.y)).unwrap();
+            assert_eq!(9, unsafe { (*get.cell).content_codepoint() });
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(5))).unwrap();
+        assert_eq!(5, s.rows);
+        assert_eq!(10, s.total_rows());
+
+        // Our cursor should move since it's in the scrollback
+        assert_eq!(pt_active(0, 4), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        assert_eq!(pt_screen(0, 5), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_cursor_in_scrollback() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(10, s.total_rows());
+
+        // This is required for our writing below to work
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write into all rows so we don't get trim behavior
+        for y in 0..s.rows as usize {
+            *cell_at(page, 0, y) = cpu(y as u32);
+        }
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 2)).unwrap()).unwrap();
+        {
+            let cursor = s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord();
+            let get = s.get_cell(pt_active(cursor.x, cursor.y)).unwrap();
+            assert_eq!(2, unsafe { (*get.cell).content_codepoint() });
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(5))).unwrap();
+        assert_eq!(5, s.rows);
+        assert_eq!(10, s.total_rows());
+
+        // Our cursor should move since it's in the scrollback
+        assert!(s.point_from_pin(Tag::Active, *tp(p)).is_none());
+        assert_eq!(pt_screen(0, 2), s.point_from_pin(Tag::Screen, *tp(p)).unwrap());
+
+        assert_eq!(pt_screen(0, 5), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_trims_blank_lines() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 5,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write codepoint into first line
+        *cell_at(page, 0, 0) = cp('A');
+
+        // Fill remaining lines with a background color
+        for y in 1..s.rows as usize {
+            *cell_at(page, 0, y) = bg_rgb_cell(0xFF, 0, 0);
+        }
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 0)).unwrap()).unwrap();
+        {
+            let cursor = s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord();
+            let get = s.get_cell(pt_active(cursor.x, cursor.y)).unwrap();
+            assert_eq!('A' as u32, unsafe { (*get.cell).content_codepoint() });
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(2))).unwrap();
+        assert_eq!(2, s.rows);
+        assert_eq!(2, s.total_rows());
+
+        // Our cursor should not move since we trimmed
+        assert_eq!(pt_active(0, 0), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        assert_eq!(pt_screen(0, 0), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_trims_blank_lines_cursor_in_blank_line() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 5,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write codepoint into first line
+        *cell_at(page, 0, 0) = cp('A');
+
+        // Fill remaining lines with a background color
+        for y in 1..s.rows as usize {
+            *cell_at(page, 0, y) = bg_rgb_cell(0xFF, 0, 0);
+        }
+
+        // Put a tracked pin in a blank line
+        let p = s.track_pin(s.pin(pt_active(0, 3)).unwrap()).unwrap();
+
+        // Resize
+        s.resize(no_reflow(None, Some(2))).unwrap();
+        assert_eq!(2, s.rows);
+        assert_eq!(4, s.total_rows());
+
+        // Our cursor should not move since we trimmed
+        assert_eq!(pt_active(0, 1), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_trims_blank_lines_erases_pages() {
+        let mut s = init_opts(Options {
+            cols: 100,
+            rows: 5,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Resize to take up two pages
+        {
+            let rows = page.capacity.rows + 10;
+            s.resize(no_reflow(None, Some(rows))).unwrap();
+            assert_eq!(2, s.total_pages());
+        }
+
+        // Write codepoint into first line
+        *cell_at(page, 0, 0) = cp('A');
+
+        // Resize down. Every row except the first is blank so we
+        // should erase the second page.
+        s.resize(no_reflow(None, Some(5))).unwrap();
+        assert_eq!(5, s.rows);
+        assert_eq!(5, s.total_rows());
+        assert_eq!(1, s.total_pages());
+    }
 }
