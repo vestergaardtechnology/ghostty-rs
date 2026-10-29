@@ -5718,4 +5718,1578 @@ mod tests {
         assert_eq!(expected, t.screens.active.cursor.x as usize);
     }
 
+    #[test]
+    fn terminal_graphemewidth_parity() {
+        expect_grapheme_width_parity(&[ 0x2764, 0xFE0F ]);
+        expect_grapheme_width_parity(&[ 'x' as u32, 0xFE0F, 0xFE0F ]);
+        expect_grapheme_width_parity(&[ 0x231A, 0xFE0E, 0xFE0F ]);
+        expect_grapheme_width_parity(&[ 0x1F3F4, 0x200D, 0x2620, 0xFE0F ]);
+        expect_grapheme_width_parity(&[ 0x1F468, 0x200D, 0x1F469, 0x200D, 0x1F467 ]);
+        expect_grapheme_width_parity(&[ 0x23, 0xFE0F, 0x20E3 ]);
+        expect_grapheme_width_parity(&[ '1' as u32, 0x20E3 ]);
+        expect_grapheme_width_parity(&[ 0x1F44B, 0x1F3FF ]);
+        expect_grapheme_width_parity(&[ 0x1F1E6, 0x1F1E7, 0x1F1E8 ]);
+        expect_grapheme_width_parity(&[ 'a' as u32, 'b' as u32 ]);
+        expect_grapheme_width_parity(&[ 0x0301, 0x0302 ]);
+    }
+
+    #[test]
+    fn terminal_vs16_doesn_t_make_character_with_2027_disabled() {
+        let mut t = init(5, 5);
+
+        // Disable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, false);
+
+        t.print(0x2764).unwrap(); // Heart
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("❤️", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2764, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+    }
+
+    #[test]
+    fn terminal_ignored_vs16_doesn_t_mark_dirty() {
+        let mut t = init(5, 5);
+
+        // Disable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, false);
+
+        t.print(0x2764).unwrap(); // Heart
+        assert!(t.is_dirty(scr(0, 0)));
+
+        t.clear_dirty();
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+        assert!(!t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs16_non_grapheme() {
+        let mut t = init(80, 80);
+
+        // https://github.com/mitchellh/ghostty/issues/1482
+        t.print('x' as u32).unwrap();
+        t.print(0xFE0F).unwrap();
+
+        // We should have 1 narrow cell.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('x' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+        }
+    }
+
+    #[test]
+    fn terminal_invalid_vs16_doesn_t_mark_dirty() {
+        let mut t = init(5, 5);
+
+        // Disable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, false);
+
+        t.print('x' as u32).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+
+        t.clear_dirty();
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+        assert!(!t.is_dirty(scr(0, 0)));
+    }
+
+    // https://github.com/ghostty-org/ghostty/pull/12596
+    #[test]
+    fn terminal_variation_selectors_apply_to_preceding_codepoint() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // Pirate flag: black flag + ZWJ + skull and crossbones + VS16.
+        t.print(0x1F3F4).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x2620).unwrap();
+        t.print(0xFE0F).unwrap();
+
+        let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+        let cell = cl(list_cell.cell);
+        assert_eq!(0x1F3F4, cell.content_codepoint());
+        assert!(cell.has_grapheme());
+        assert_eq!(&[ 0x200D, 0x2620, 0xFE0F ][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+    }
+
+    #[test]
+    fn terminal_print_multicodepoint_grapheme_mode_2027() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/289
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Row should be dirty
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F468, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(4, cps.len());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_keypad_sequence_vs15() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // This is: "#︎" (number sign with text presentation selector)
+        t.print(0x23).unwrap(); // # Number sign (valid base)
+        t.print(0xFE0E).unwrap(); // VS15 (text presentation selector)
+
+        // VS15 should combine with the base character into a single grapheme cluster,
+        // taking 1 cell (narrow character).
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        // Row should be dirty
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // The base emoji should be in cell 0 with the skin tone as a grapheme
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x23, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_keypad_sequence_vs16() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // This is: "#️" (number sign with emoji presentation selector)
+        t.print(0x23).unwrap(); // # Number sign (valid base)
+        t.print(0xFE0F).unwrap(); // VS16 (emoji presentation selector)
+
+        // VS16 should combine with the base character into a single grapheme cluster,
+        // taking 2 cells (wide character).
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Row should be dirty
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // The base emoji should be in cell 0 with the skin tone as a grapheme
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x23, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_fitzpatrick_skin_tone_next_valid_base() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // This is: "👋🏿" (waving hand with dark skin tone)
+        t.print(0x1F44B).unwrap(); // 👋 Waving hand (valid base)
+        t.print(0x1F3FF).unwrap(); // 🏿 Dark skin tone modifier
+
+        // The skin tone should combine with the base emoji into a single grapheme cluster,
+        // taking 2 cells (wide character).
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Row should be dirty
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // The base emoji should be in cell 0 with the skin tone as a grapheme
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F44B, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_fitzpatrick_skin_tone_next_to_non_base() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // This is: "🏿" (which may not render correctly in your editor!)
+        t.print(0x22).unwrap(); // "
+        t.print(0x1F3FF).unwrap(); // Dark skin tone
+        t.print(0x22).unwrap(); // "
+
+        // We should have 4 cells taken up. Importantly, the skin tone
+        // should not join with the quotes.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(4, t.screens.active.cursor.x);
+
+        // Row should be dirty
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x22, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F3FF, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(3, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x22, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_multicodepoint_grapheme_marks_dirty_on_every_codepoint() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/289
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0x200D).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0x1F469).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0x200D).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0x1F467).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+    }
+
+    #[test]
+    fn terminal_vs15_to_make_narrow_character() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print(0x2614).unwrap(); // Umbrella with rain drops, width=2
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        t.print(0xFE0E).unwrap(); // VS15 to make narrow
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        // VS15 should send us back a cell since our char is no longer wide.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("☔︎", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2614, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+    }
+
+    #[test]
+    fn terminal_vs15_on_already_narrow_emoji() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print(0x26C8).unwrap(); // Thunder cloud and rain, width=1
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0xFE0E).unwrap(); // VS15 to make narrow
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        // Character takes up one cell
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("⛈︎", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x26C8, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs15_following_emoji_is_wide() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print('\u{1F9E0}' as u32).unwrap(); // 🧠
+        t.print(0xFE0E).unwrap(); // not valid with U+1F9E0 as base
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('\u{1F9E0}' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs15_in_emoji_zwj_sequence() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print('\u{1F469}' as u32).unwrap(); // 👩
+        t.print(0xFE0E).unwrap(); // not valid with U+1F469 as base
+        t.print('\u{200D}' as u32).unwrap(); // ZWJ
+        t.print('\u{1F466}' as u32).unwrap(); // 👦
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('\u{1F469}' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[ '\u{200D}' as u32, '\u{1F466}' as u32 ][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_vs15_to_make_narrow_character_with_pending_wrap() {
+        let mut t = init(4, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        assert!(t.modes.get(Mode::Wraparound));
+
+        t.print(0x1F34B).unwrap(); // Lemon, width=2
+        t.print(0x2614).unwrap(); // Umbrella with rain drops, width=2
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        // We only move to the end of the line because we're in a pending wrap
+        // state.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(3, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        t.print(0xFE0E).unwrap(); // VS15 to make narrow
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        // VS15 should clear the pending wrap state
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(3, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("🍋☔︎", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2614, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+
+        // VS15 should not affect the previous grapheme
+        {
+            let lemon_cell = cl(t.screens.active.pages.get_cell(scr(0, 0)).unwrap().cell);
+            assert_eq!(0x1F34B, lemon_cell.content_codepoint());
+            assert_eq!(Wide::Wide, lemon_cell.wide());
+            let spacer_cell = cl(t.screens.active.pages.get_cell(scr(1, 0)).unwrap().cell);
+            assert_eq!(0, spacer_cell.content_codepoint());
+            assert_eq!(Wide::SpacerTail, spacer_cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_vs15_narrows_wide_cell_under_cursor_with_wraparound_disabled() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.modes.set(Mode::Wraparound, false);
+
+        // First create a wide cell spanning columns 4 and 5.
+        t.set_cursor_pos(1, 4);
+        t.print(0x2614).unwrap();
+
+        // Make column 4 the right margin and put the cursor on the wide base.
+        // With wraparound disabled, grapheme lookup selects the cell under the
+        // cursor when it has content.
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(1, 4);
+        t.set_cursor_pos(1, 4);
+        t.print(0xFE0E).unwrap();
+
+        assert_eq!(3, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        let base = cl(t.screens.active.pages.get_cell(scr(3, 0)).unwrap().cell);
+        assert_eq!(Wide::Narrow, base.wide());
+        assert!(base.has_grapheme());
+        let tail = cl(t.screens.active.pages.get_cell(scr(4, 0)).unwrap().cell);
+        assert_eq!(Wide::Narrow, tail.wide());
+    }
+
+    #[test]
+    fn terminal_vs15_narrows_wide_cell_under_restored_pending_cursor() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(1, 4);
+
+        // Save a pending-wrap cursor at column 4.
+        t.set_cursor_pos(1, 4);
+        t.print('X' as u32).unwrap();
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.save_cursor();
+
+        // Widen the margin and replace that cell with a wide character.
+        t.set_left_and_right_margin(1, 5);
+        t.set_cursor_pos(1, 4);
+        t.print(0x2614).unwrap();
+
+        // Restoring also restores pending_wrap, so grapheme lookup selects the
+        // wide base under the cursor rather than its spacer tail.
+        t.restore_cursor();
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.print(0xFE0E).unwrap();
+
+        assert_eq!(4, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        let base = cl(t.screens.active.pages.get_cell(scr(3, 0)).unwrap().cell);
+        assert_eq!(Wide::Narrow, base.wide());
+        assert!(base.has_grapheme());
+        let tail = cl(t.screens.active.pages.get_cell(scr(4, 0)).unwrap().cell);
+        assert_eq!(Wide::Narrow, tail.wide());
+    }
+
+    #[test]
+    fn terminal_vs16_to_make_wide_character_on_next_line() {
+        let mut t = init(3, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.cursor_right(2);
+        t.print('#' as u32).unwrap();
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+        assert!(t.is_dirty(scr(2, 0)));
+        t.clear_dirty();
+
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+
+        assert!(t.is_dirty(scr(2, 0)));
+        t.clear_dirty();
+        assert_eq!(1, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        {
+            // Previous cell turns into spacer_head
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerHead, cell.wide());
+        }
+        {
+            // '#' cell is wide
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('#' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[0xFE0F][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            // spacer_tail
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_vs16_to_make_wide_character_on_next_line_with_hyperlink() {
+        // Regression test for the crash fixed in print's grapheme `.wide` path:
+        // writing a spacer_head at the screen edge before row.wrap() was set.
+        let mut t = init(3, 5);
+
+        // Enable grapheme clustering and activate a hyperlink so printCell
+        // calls cursorSetHyperlink (which runs page integrity checks).
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+
+        t.cursor_right(2);
+        t.print('#' as u32).unwrap();
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        // Without the fix, this panicked with UnwrappedSpacerHead.
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+
+        assert_eq!(1, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        {
+            // Previous cell turns into spacer_head and remains hyperlinked.
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::SpacerHead, cell.wide());
+            assert!(cell.hyperlink());
+            assert!(rw(list_cell.row).wrap());
+        }
+        {
+            // '#' cell is now wide and still hyperlinked.
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('#' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[0xFE0F][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+            assert!(cell.hyperlink());
+        }
+        {
+            // spacer_tail inherits hyperlink as part of the same grapheme cell.
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+            assert!(cell.hyperlink());
+        }
+    }
+
+    #[test]
+    fn terminal_vs16_widening_when_the_spacer_tail_grows_the_page() {
+        // Regression test for a stale cell pointer in print's grapheme `.wide`
+        // path: writing the spacer tail can grow the page to fit the hyperlink,
+        // which replaces the page and invalidates the pointer to the wide cell.
+        let mut t = init(20, 10);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+
+        // Fill the page hyperlink map until a single slot is left. The '#' below
+        // takes that slot so the spacer tail is what forces the page to grow.
+        loop {
+            let page = cursor_page(t.screens.active);
+            let map = unsafe { page.hyperlink_map.map(page.memory) };
+            if map.max_load() - map.count() == 1 { break; }
+            t.print('x' as u32).unwrap();
+        }
+
+        let x = t.screens.active.cursor.x;
+        let y = t.screens.active.cursor.y;
+        t.print('#' as u32).unwrap();
+
+        // Without the fix this crashed appending to a freed page.
+        t.print(0xFE0F).unwrap();
+
+        {
+            // '#' is wide and carries the VS16 grapheme.
+            let list_cell = t.screens.active.pages.get_cell(act(x, y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('#' as u32, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+            assert!(cell.has_grapheme());
+            assert_eq!(
+                &[0xFE0F][..],
+                nd(list_cell.node).page().lookup_grapheme(cell).unwrap(),
+            );
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(x + 1, y)).unwrap();
+            assert_eq!(Wide::SpacerTail, cl(list_cell.cell).wide());
+        }
+    }
+
+    #[test]
+    fn terminal_grapheme_transfer_when_widening_wraps_to_the_next_line() {
+        // Covers print's grapheme `.wide` path where the previous cell already
+        // holds grapheme data and has to be moved to the wrapped row.
+        let mut t = init(3, 5);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.cursor_right(2);
+
+        // A narrow emoji, then ZWJ, then a second emoji. The ZWJ attaches
+        // without changing the width, so the cell has grapheme data by the time
+        // the second emoji widens it.
+        t.print(0x263A).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x2764).unwrap();
+
+        {
+            // The old cell becomes a spacer head on the wrapped row.
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            assert_eq!(Wide::SpacerHead, cl(list_cell.cell).wide());
+            assert!(rw(list_cell.row).wrap());
+        }
+        {
+            // The grapheme moved with the base codepoint.
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x263A, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!(
+                &[ 0x200D, 0x2764 ][..],
+                nd(list_cell.node).page().lookup_grapheme(cell).unwrap(),
+            );
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 1)).unwrap();
+            assert_eq!(Wide::SpacerTail, cl(list_cell.cell).wide());
+        }
+    }
+
+    #[test]
+    fn terminal_grapheme_transfer_when_widening_wraps_below_the_scroll_region() {
+        let mut t = init(3, 3);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.set_top_and_bottom_margin(1, 2);
+        t.set_cursor_pos(3, 3);
+        t.print(0x2764).unwrap(); // Heart
+        t.print(0x200D).unwrap(); // ZWJ
+        t.print(0x1F44D).unwrap(); // Thumbs up
+
+        let base = t.screens.active.pages.get_cell(act(0, 2)).unwrap();
+        assert_eq!(0x2764, cl(base.cell).codepoint());
+        assert_eq!(
+            &[ 0x200D, 0x1F44D ][..],
+            nd(base.node).page().lookup_grapheme(cl(base.cell)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn terminal_grapheme_transfer_when_widening_scrolls_a_single_row() {
+        for alternate in [false, true] {
+            for margins in [false, true] {
+                let mut t = init(5, 1);
+
+                t.modes.set(Mode::GraphemeCluster, true);
+                if alternate { t.switch_screen(ScreenKey::Alternate).unwrap(); }
+
+                // Leave a grapheme on the row above, in scrollback. It must stay
+                // there untouched when the cluster wraps below it.
+                t.set_cursor_pos(1, 5);
+                t.print('a' as u32).unwrap();
+                t.print(0x0301).unwrap(); // Combining acute accent
+                t.index().unwrap();
+
+                if margins {
+                    t.modes.set(Mode::EnableLeftAndRightMargin, true);
+                    t.set_left_and_right_margin(3, 0);
+                }
+                t.set_cursor_pos(1, 5);
+                t.print(0x2764).unwrap(); // Heart
+                t.print(0x200D).unwrap(); // ZWJ
+                t.print(0x1F44D).unwrap(); // Thumbs up
+
+                let x: CellCountInt = if margins { 2 } else { 0 };
+                let base = t.screens.active.pages.get_cell(act(x, 0)).unwrap();
+                assert_eq!(0x2764, cl(base.cell).codepoint());
+                assert_eq!(
+                    &[ 0x200D, 0x1F44D ][..],
+                    nd(base.node).page().lookup_grapheme(cl(base.cell)).unwrap(),
+                );
+
+                // The alternate screen has no scrollback to check.
+                if !alternate {
+                    let history = t.screens.active.pages.get_cell(scr(4, 0)).unwrap();
+                    assert_eq!('a' as u32, cl(history.cell).codepoint());
+                    assert_eq!(&[0x0301][..], nd(history.node).page().lookup_grapheme(cl(history.cell)).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_grapheme_transfer_when_widening_wraps_to_a_page_without_grapheme_capacity() {
+        let rows = pagepkg::STD_CAPACITY.rows;
+        let cols = pagepkg::STD_CAPACITY.cols;
+        let mut t = init(cols, rows);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // Fill the first page so the bottom row of the screen is on a second
+        // page, then compact that page so it has no grapheme capacity.
+        t.cursor_down(rows as usize - 1);
+        for _ in rows..nd(t.screens.active.pages.pages.first.unwrap()).capacity().rows + 1 {
+            t.index().unwrap();
+        }
+        let mut sp = t.screens.active;
+        let pages = &mut sp.pages;
+        assert!(pages.pages.first != pages.pages.last);
+        assert!(pages.compact(pages.pages.last.unwrap()).unwrap().is_some());
+        assert_eq!(0, nd(pages.pages.last.unwrap()).capacity().grapheme_bytes);
+
+        t.set_cursor_pos(rows as usize - 1, cols as usize);
+        t.print(0x2764).unwrap(); // Heart
+        t.print(0x200D).unwrap(); // ZWJ
+        t.print(0x1F44D).unwrap(); // Thumbs up
+
+        // The re-attach had to grow the page's grapheme capacity.
+        assert!(nd(pages.pages.last.unwrap()).capacity().grapheme_bytes > 0);
+        let base = pages.get_cell(act(0, rows - 1)).unwrap();
+        assert_eq!(pages.pages.last.unwrap(), base.node);
+        assert_eq!(Wide::Wide, cl(base.cell).wide());
+        assert_eq!(0x2764, cl(base.cell).codepoint());
+        assert_eq!(
+            &[ 0x200D, 0x1F44D ][..],
+            nd(base.node).page().lookup_grapheme(cl(base.cell)).unwrap(),
+        );
+    }
+
+    #[test]
+    fn terminal_vs16_to_make_wide_character_with_pending_wrap() {
+        let mut t = init(3, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.cursor_right(1);
+        t.print('#' as u32).unwrap();
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        {
+            // '#' cell is wide
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('#' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[0xFE0F][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            // spacer_tail
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_vs16_to_make_wide_character_with_mode_2027() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print(0x2764).unwrap(); // Heart
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("❤️", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2764, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+    }
+
+    #[test]
+    fn terminal_vs16_repeated_with_mode_2027() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print(0x2764).unwrap(); // Heart
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+        t.print(0x2764).unwrap(); // Heart
+        t.print(0xFE0F).unwrap(); // VS16 to make wide
+
+        assert!(t.is_dirty(scr(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("❤️❤️", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2764, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x2764, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs16_grapheme() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/1482
+        t.print('x' as u32).unwrap();
+        t.print(0xFE0F).unwrap(); // invalid VS16
+
+        // We should have 1 cells taken up, and narrow.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('x' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs16_with_second_char() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/1482
+        t.print('x' as u32).unwrap();
+        t.print(0xFE0F).unwrap();
+        t.print('y' as u32).unwrap();
+
+        // We should have 2 cells taken up, from two separate narrow characters.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('x' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('y' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_grapheme_o_o_with_nonspacing_mark_should_be_narrow() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print('o' as u32).unwrap();
+        t.print(0x0300).unwrap(); // combining grave accent
+
+        // We should have 1 cell taken up.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('o' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[0x0300][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_devanagari_grapheme_should_be_wide() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // क्‍ष
+        t.print(0x0915).unwrap();
+        t.print(0x094D).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x0937).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x0915, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[ 0x094D, 0x200D, 0x0937 ][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_devanagari_grapheme_should_be_wide_on_next_line() {
+        let mut t = init(3, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.cursor_right(2);
+
+        // क्‍ष
+        t.print(0x0915).unwrap();
+        t.print(0x094D).unwrap();
+        t.print(0x200D).unwrap();
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        // This one increases the width to wide
+        t.print(0x0937).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(1, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        {
+            // Previous cell turns into spacer_head
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerHead, cell.wide());
+        }
+        {
+            // Devanagari grapheme is wide
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x0915, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[ 0x094D, 0x200D, 0x0937 ][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_devanagari_grapheme_should_be_wide_on_next_page() {
+        let rows = pagepkg::STD_CAPACITY.rows;
+        let cols = pagepkg::STD_CAPACITY.cols;
+        let mut t = init(cols, rows);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.cursor_down(rows as usize - 1);
+
+        for _ in rows..nd(t.screens.active.pages.pages.first.unwrap()).capacity().rows {
+            t.index().unwrap();
+        }
+
+        t.cursor_right(cols as usize - 1);
+
+        assert_eq!(cols - 1, t.screens.active.cursor.x);
+        assert_eq!(rows - 1, t.screens.active.cursor.y);
+
+        // क्‍ष
+        t.print(0x0915).unwrap();
+        t.print(0x094D).unwrap();
+        t.print(0x200D).unwrap();
+        assert_eq!(cols - 1, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        // This one increases the width to wide
+        t.print(0x0937).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(rows - 1, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert!(!t.screens.active.cursor.pending_wrap);
+
+        {
+            // Previous cell turns into spacer_head
+            let list_cell = t.screens.active.pages.get_cell(act(cols - 1, rows - 2)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerHead, cell.wide());
+        }
+        {
+            // Devanagari grapheme is wide
+            let list_cell = t.screens.active.pages.get_cell(act(0, rows - 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x0915, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&[ 0x094D, 0x200D, 0x0937 ][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(1, rows - 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_invalid_vs16_with_second_char_combining() {
+        let mut t = init(80, 80);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/1482
+        t.print('n' as u32).unwrap();
+        t.print(0xFE0F).unwrap(); // invalid VS16
+        t.print(0x0303).unwrap(); // combining tilde
+
+        // We should have 1 cells taken up, and narrow.
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('n' as u32, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(&['\u{0303}' as u32][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_overwrite_grapheme_should_clear_grapheme_data() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print(0x26C8).unwrap(); // Thunder cloud and rain
+        t.print(0xFE0E).unwrap(); // VS15 to make narrow
+        assert!(t.is_dirty(scr(0, 0)));
+        t.clear_dirty();
+
+        t.set_cursor_pos(1, 1);
+        t.print('A' as u32).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('A' as u32, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_overwrite_multicodepoint_grapheme_clears_grapheme_data() {
+        let mut t = init(10, 10);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/289
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // We should have one cell with graphemes
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.grapheme_count());
+
+        // Move back and overwrite wide
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.print('X' as u32).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+        assert_eq!(0, page.grapheme_count());
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_overwrite_multicodepoint_grapheme_tail_clears_grapheme_data() {
+        let mut t = init(10, 10);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // https://github.com/mitchellh/ghostty/issues/289
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have 2 cells taken up. It is one character but "wide".
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        // We should have one cell with graphemes
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.grapheme_count());
+
+        // Move back and overwrite wide
+        t.set_cursor_pos(1, 2);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(" X", str);
+        }
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+        assert_eq!(0, page.grapheme_count());
+    }
+
+    #[test]
+    fn terminal_print_breaks_valid_grapheme_cluster_with_prepend_ascii_for_speed() {
+        let mut t = init(5, 5);
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        // Make sure we're not at cursor.x == 0 for the next char.
+        t.print('_' as u32).unwrap();
+
+        // U+0600 ARABIC NUMBER SIGN (Prepend)
+        t.print(0x0600).unwrap();
+        t.print('1' as u32).unwrap();
+
+        // We should have 3 cells taken up, each narrow. Note that this is
+        // **incorrect** grapheme break behavior, since a Prepend code point should
+        // not break with the one following it per UAX #29 GB9b. However, as an
+        // optimization we assume a grapheme break when c <= 255, and note that
+        // this deviation only affects these very uncommon scenarios (e.g. the
+        // Arabic number sign should precede Arabic-script digits).
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(3, t.screens.active.cursor.x);
+        // This is what we'd expect if we did break correctly:
+        //assert_eq!(2, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x0600, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            // This is what we'd expect if we did break correctly:
+            //assert!(cell.has_grapheme());
+            //assert_eq!(&['1' as u32][..], nd(list_cell.node).page().lookup_grapheme(cell).unwrap());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('1' as u32, cell.content_codepoint());
+            // This is what we'd expect if we did break correctly:
+            //assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_writes_to_bottom_if_scrolled() {
+        let mut t = init(5, 2);
+
+        // Basic grid writing
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(0, 0);
+
+        // Make newlines so we create scrollback
+        // 3 pushes hello off the screen
+        t.index().unwrap();
+        t.index().unwrap();
+        t.index().unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+
+        // Scroll to the top
+        t.screens.active.scroll(screen::Scroll::Top);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hello", str);
+        }
+
+        // Type
+        t.print('A' as u32).unwrap();
+        t.screens.active.scroll(screen::Scroll::Active);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nA", str);
+        }
+
+        assert!(t.is_dirty(act(t.screens.active.cursor.x, t.screens.active.cursor.y)));
+    }
+
+    #[test]
+    fn terminal_print_charset() {
+        let mut t = init(80, 80);
+
+        // G1 should have no effect
+        t.configure_charset(charsets::Slots::G1, charsets::Charset::DecSpecial);
+        t.configure_charset(charsets::Slots::G2, charsets::Charset::DecSpecial);
+        t.configure_charset(charsets::Slots::G3, charsets::Charset::DecSpecial);
+
+        // No dirty to configure charset
+        assert!(!t.is_dirty(scr(0, 0)));
+
+        // Basic grid writing
+        t.print('`' as u32).unwrap();
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::Utf8);
+        t.print('`' as u32).unwrap();
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::Ascii);
+        t.print('`' as u32).unwrap();
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::DecSpecial);
+        t.print('`' as u32).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("```◆", str);
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_charset_outside_of_ascii() {
+        let mut t = init(80, 80);
+
+        // G1 should have no effect
+        t.configure_charset(charsets::Slots::G1, charsets::Charset::DecSpecial);
+        t.configure_charset(charsets::Slots::G2, charsets::Charset::DecSpecial);
+        t.configure_charset(charsets::Slots::G3, charsets::Charset::DecSpecial);
+
+        // No dirty to configure charset
+        assert!(!t.is_dirty(scr(0, 0)));
+
+        // Basic grid writing
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::DecSpecial);
+        t.print('`' as u32).unwrap();
+        t.print(0x1F600).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("◆😀", str);
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_wide_codepoint_in_a_charset_prints_it_unmapped() {
+        let mut t = init(10, 2);
+
+        // The charset has no such codepoint, so it prints as it is, two
+        // columns wide, and the characters after it are mapped again.
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::DecSpecial);
+        t.print('`' as u32).unwrap();
+        t.print(0x1F600).unwrap();
+        t.print('a' as u32).unwrap();
+        assert_eq!(4, t.screens.active.cursor.x);
+        let cell = cl(t.screens.active.pages.get_cell(scr(1, 0)).unwrap().cell);
+        assert_eq!(0x1F600, cell.codepoint());
+        assert_eq!(Wide::Wide, cell.wide());
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("◆😀▒", str);
+        }
+    }
+
+    #[test]
+    fn terminal_print_single_shift_is_used_up_by_a_combining_character() {
+        // As in xterm, the single shift applies to the combining mark, the next
+        // character printed, whether or not it clusters with the one before.
+        for cluster in [false, true] {
+            let mut t = init(10, 2);
+            t.modes.set(Mode::GraphemeCluster, cluster);
+
+            t.configure_charset(charsets::Slots::G2, charsets::Charset::British);
+            t.print('#' as u32).unwrap();
+            t.invoke_charset(charsets::ActiveSlot::GL, charsets::Slots::G2, true);
+            t.print(0x0301).unwrap();
+            assert_eq!(None, t.screens.active.charset.single_shift);
+            t.print('#' as u32).unwrap();
+
+            assert_eq!(2, t.screens.active.cursor.x);
+            let cell = cl(t.screens.active.pages.get_cell(scr(1, 0)).unwrap().cell);
+            assert_eq!('#' as u32, cell.codepoint());
+        }
+    }
+
+    #[test]
+    fn terminal_vs16_moving_a_character_to_the_next_line_keeps_it_unmapped() {
+        let mut t = init(3, 5);
+
+        // The '#' is printed with ASCII in the last column. VS16 widens it after
+        // the British set (which maps '#' to '£') is selected, which moves it to
+        // the next line: it is the same character, not one to map again.
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.cursor_right(2);
+        t.print('#' as u32).unwrap();
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::British);
+        t.print(0xFE0F).unwrap();
+
+        let cell = cl(t.screens.active.pages.get_cell(scr(0, 1)).unwrap().cell);
+        assert_eq!('#' as u32, cell.codepoint());
+        assert_eq!(Wide::Wide, cell.wide());
+    }
+
+    #[test]
+    fn terminal_print_invoke_charset() {
+        let mut t = init(80, 80);
+
+        t.configure_charset(charsets::Slots::G1, charsets::Charset::DecSpecial);
+
+        t.print('`' as u32).unwrap();
+
+        // Invokecharset but should not mark dirty on its own
+        t.clear_dirty();
+        t.invoke_charset(charsets::ActiveSlot::GL, charsets::Slots::G1, false);
+        assert!(!t.is_dirty(scr(0, 0)));
+        t.print('`' as u32).unwrap();
+        assert!(t.is_dirty(scr(0, 0)));
+        t.print('`' as u32).unwrap();
+        t.invoke_charset(charsets::ActiveSlot::GL, charsets::Slots::G0, false);
+        t.print('`' as u32).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("`◆◆`", str);
+        }
+    }
+
+    #[test]
+    fn terminal_print_invoke_charset_single() {
+        let mut t = init(80, 80);
+
+        t.configure_charset(charsets::Slots::G1, charsets::Charset::DecSpecial);
+
+        // Basic grid writing
+        t.print('`' as u32).unwrap();
+        t.invoke_charset(charsets::ActiveSlot::GL, charsets::Slots::G1, true);
+        t.print('`' as u32).unwrap();
+        t.print('`' as u32).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("`◆`", str);
+        }
+    }
+
 }
