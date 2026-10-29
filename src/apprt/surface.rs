@@ -13,7 +13,8 @@
 //! Stand-ins for the core `App` (App.zig) live in [`standin`]
 //! (TODO(port-dedupe)).
 
-use crate::apprt::action::standin::{CoreSurface, Scrollbar};
+use crate::apprt::action::standin::CoreSurface;
+use crate::terminal::page_list::Scrollbar;
 use crate::config::config::WorkingDirectory;
 use crate::config::Config;
 use crate::apprt::structs::{Clipboard, KittyRead, KittyWrite};

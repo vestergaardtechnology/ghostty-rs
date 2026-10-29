@@ -128,7 +128,7 @@ _themes() {
         for action in ACTIONS {
             writer.push_str(PADDING);
             writer.push_str("'+");
-            writer.push_str(action.name);
+            writer.push_str(action.name());
             writer.push_str("'\n");
         }
     }
@@ -155,7 +155,7 @@ _themes() {
                 continue;
             }
 
-            writer.push_str(&format!("{PADDING}(+{})\n", action.name));
+            writer.push_str(&format!("{PADDING}(+{})\n", action.name()));
             writer.push_str(&format!("{PADDING}  _arguments \\\n"));
             for opt in action.options {
                 if opt.name.starts_with('_') {
