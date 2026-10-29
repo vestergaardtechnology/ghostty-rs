@@ -11,3 +11,4 @@ if ! git diff --quiet; then git commit -qam "scaffold: refresh generated mod blo
 cargo build --all-targets 2>&1 | grep -E '^(error|warning: unused)' | head -20 || true
 cargo build --all-targets -q 2>&1 | tail -3
 cargo test -q --lib 2>&1 | grep -E '^test result|FAILED|panicked' | tail -15
+git push -q origin main 2>&1 | tail -2; python3 tools/status.py | head -3
