@@ -1,6 +1,6 @@
 //! Port of `src/font/main.zig`.
 //!
-//! STATUS: partial — re-exports of ported modules, `OPTIONS`, `Style`, `Presentation`; `sprite_index`, `default_fallback_adjustment` and remaining re-exports missing.
+//! STATUS: partial — `sprite_index`, `default_fallback_adjustment` and the `CodepointResolver`, `Collection`, `Shaper`, `ShaperCache`, `SharedGrid`, `SharedGridSet` re-exports are missing (their modules are not ported yet).
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "atlas.rs"]
@@ -52,11 +52,20 @@ pub mod sprite;
 pub use self::atlas::Atlas;
 pub use self::backend::Backend;
 pub use self::codepoint_map::CodepointMap;
+pub use self::deferred_face::DeferredFace;
+pub use self::discovery::Descriptor;
+pub use self::discovery::Discover;
+pub use self::face::Face;
 pub use self::glyph::Glyph;
 pub use self::library::Library;
 pub use self::metrics::Metrics;
 pub use self::sprite::Face as SpriteFace;
 pub use self::sprite::Sprite;
+
+// If we're targeting wasm then we export some wasm APIs: in Rust the
+// `#[no_mangle]` exports of `deferred_face::wasm` and `face::web_canvas::wasm`
+// are compiled on wasm32 automatically (Zig references them in a comptime
+// block).
 
 /// Build options (Zig `options`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
