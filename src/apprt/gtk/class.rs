@@ -299,6 +299,19 @@ mod gtk_impl {
     /// class loads its template from it. In Zig the bundle is linked into
     /// the binary and registered by a constructor before any class exists.
     pub fn ensure_resources() {
+        ensure_resources_impl();
+    }
+
+    /// `i18n._(msgid)` as a `&str` for the gtk-rs setters (translations are
+    /// UTF-8; an invalid one falls back to the untranslated message).
+    pub fn i18n_(msgid: &'static std::ffi::CStr) -> &'static str {
+        let translated = crate::os::i18n::gettext(msgid);
+        translated
+            .to_str()
+            .unwrap_or_else(|_| msgid.to_str().unwrap_or_default())
+    }
+
+    fn ensure_resources_impl() {
         #[cfg(ghostty_gresource)]
         crate::apprt::gtk::build::gresource::register();
     }
