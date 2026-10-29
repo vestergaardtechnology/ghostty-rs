@@ -1,6 +1,6 @@
 //! Port of `src/macos/text.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "text/c.rs"]
@@ -28,3 +28,23 @@ pub mod stylized_strings;
 #[path = "text/typesetter.rs"]
 pub mod typesetter;
 // @generated-mods-end
+
+pub use font::{Font, FontOrientation, FontTableTag};
+pub use font_collection::FontCollection;
+pub use font_descriptor::{
+    attr, FontAttribute, FontAttributeType, FontDescriptor, FontSymbolicTraits, FontTraitKey,
+    FontVariationAxisKey,
+};
+pub use font_manager::{
+    create_font_descriptor_from_data, create_font_descriptors_from_data,
+    create_font_descriptors_from_url,
+};
+pub use frame::Frame;
+pub use framesetter::Framesetter;
+pub use line::{Line, LineBoundsOptions};
+pub use paragraph_style::{
+    ParagraphStyle, ParagraphStyleSetting, ParagraphStyleSpecifier, WritingDirection,
+};
+pub use run::{Run, Status as RunStatus};
+pub use stylized_strings::StringAttribute;
+pub use typesetter::Typesetter;

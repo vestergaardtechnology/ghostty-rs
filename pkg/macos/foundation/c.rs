@@ -1,4 +1,5 @@
 //! Port of `src/macos/foundation/c.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
+pub use super::super::c::*;

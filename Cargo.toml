@@ -26,6 +26,8 @@ gtk = ["dep:gio", "dep:glib"]
 
 [dependencies]
 base64 = "0.22"
+crossterm = "0.29"
+flate2 = "1"
 getrandom = "0.3"
 gio = { version = "0.21", optional = true }
 glib = { version = "0.21", optional = true }
@@ -34,9 +36,14 @@ indexmap = "2"
 libc = "0.2"
 log = "0.4"
 memchr = "2"
+miniz_oxide = "0.8"
+naga = { version = "30", features = ["glsl-in", "glsl-out", "msl-out", "spv-in", "spv-out"] }
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
+zune-jpeg = "0.5"
 
 [dev-dependencies]
 png = "0.18"
@@ -47,6 +54,7 @@ pkg-config = "0.3"
 
 [profile.dev]
 opt-level = 1
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 2
