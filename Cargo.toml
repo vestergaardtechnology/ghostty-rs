@@ -23,6 +23,7 @@ inspector = []
 # Crash reporting via the Sentry native SDK (links the system `sentry` C library).
 sentry = []
 gtk = [
+    "dep:bitflags",
     "dep:gdk4-wayland",
     "dep:gdk4-x11",
     "dep:gio",
@@ -42,6 +43,8 @@ gtk-layer-shell = ["gtk", "dep:gtk4-layer-shell"]
 
 [dependencies]
 base64 = "0.22"
+# Used by the wayland-scanner generated vicinae-hotkey protocol code.
+bitflags = { version = "2", optional = true }
 gdk4-wayland = { version = "0.10", optional = true, features = ["v4_12", "wayland_crate"] }
 gdk4-x11 = { version = "0.10", optional = true, features = ["v4_4", "xlib"] }
 getrandom = "0.3"
