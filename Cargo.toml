@@ -18,8 +18,11 @@ path = "src/main.rs"
 default = []
 
 [dependencies]
+getrandom = "0.3"
+libc = "0.2"
 log = "0.4"
 memchr = "2"
+png = "0.18"
 
 [dev-dependencies]
 
