@@ -2,17 +2,21 @@
 //!
 //! STATUS: ported
 //!
-//! Dispatches to the backend implementations. Only `exec` exists; its type
-//! is the `crate::termio::Exec` stand-in until termio/Exec.zig is ported
-//! (TODO(port-dedupe)). Deviations: allocator parameters are dropped and
-//! `getProcessInfo`'s comptime return type is [`ProcessInfoValue`].
+//! Dispatches to the backend implementations. Only `exec` exists.
+//! Deviations: allocator parameters are dropped, `getProcessInfo`'s
+//! comptime return type is [`ProcessInfoValue`], the termio is passed as a
+//! raw pointer to `threadEnter` (it is shared with the backend's read
+//! thread, like in Zig), and `childExitedAbnormally` is not ported: it is
+//! dead code in Zig (lazily never analyzed) because `Exec` has no such
+//! method at this revision (abnormal exits are handled by `Surface`).
 
 use crate::pty::{ProcessInfo, ProcessInfoValue};
 use crate::renderer::state::standin::Terminal;
 use crate::renderer::{GridSize, ScreenSize};
-use crate::termio::standin::{
-    Error, ExecConfig, ExecThreadData, Termio, TermioDerivedConfig, TermioThreadData,
+use crate::termio::exec::{
+    Config as ExecConfig, Error, ThreadData as ExecThreadData,
 };
+use crate::termio::standin::{Termio, TermioDerivedConfig, TermioThreadData};
 use crate::termio::Exec;
 
 /// The preallocation size for the write request pool. This should be big
@@ -59,7 +63,11 @@ impl Backend {
         }
     }
 
-    pub fn thread_enter(&mut self, io: &mut Termio, td: &mut TermioThreadData) -> Result<(), Error> {
+    pub fn thread_enter(
+        &mut self,
+        io: *mut Termio,
+        td: &mut TermioThreadData,
+    ) -> Result<(), Error> {
         match self {
             Backend::Exec(exec) => exec.thread_enter(io, td),
         }
@@ -91,17 +99,6 @@ impl Backend {
     ) -> Result<(), Error> {
         match self {
             Backend::Exec(exec) => exec.queue_write(td, data, linefeed),
-        }
-    }
-
-    pub fn child_exited_abnormally(
-        &mut self,
-        t: &mut Terminal,
-        exit_code: u32,
-        runtime_ms: u64,
-    ) -> Result<(), Error> {
-        match self {
-            Backend::Exec(exec) => exec.child_exited_abnormally(t, exit_code, runtime_ms),
         }
     }
 
@@ -140,8 +137,16 @@ mod tests {
 
     #[test]
     fn dispatch() {
-        let mut b = Backend::Exec(Exec::default());
+        let exec = Exec::init(ExecConfig {
+            env: Default::default(),
+            resources_dir: None,
+            term: "xterm-ghostty".into(),
+            ..ExecConfig::default()
+        })
+        .unwrap();
+        let mut b = Backend::Exec(exec);
         assert_eq!(Kind::Exec, b.kind());
+        // Not started: there is no pty to query.
         assert!(b.get_process_info(ProcessInfo::ForegroundPid).is_none());
         b.deinit();
         assert!(WRITE_REQ_PREALLOC.is_power_of_two());
