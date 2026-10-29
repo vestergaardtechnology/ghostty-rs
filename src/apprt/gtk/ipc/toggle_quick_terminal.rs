@@ -29,8 +29,8 @@ mod tests {
     #[test]
     fn invalid_target_fails() {
         assert_eq!(
-            toggle_quick_terminal(Target::Class("bad name".into())),
-            Err(Errors::IPCFailed)
+            toggle_quick_terminal(Target::Class(c"bad name")),
+            Err(Errors::IpcFailed)
         );
     }
 }

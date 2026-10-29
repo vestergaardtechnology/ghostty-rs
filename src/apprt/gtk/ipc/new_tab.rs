@@ -4,7 +4,7 @@
 
 use glib::prelude::*;
 
-use super::d_bus::{DBus, Errors, NewTab, Target};
+use super::d_bus::{arguments_strings, DBus, Errors, NewTab, Target};
 
 // Use a D-Bus method call to open a new tab on GTK.
 // See: https://wiki.gnome.org/Projects/GLib/GApplication/DBusAPI
@@ -34,7 +34,7 @@ pub fn new_tab(target: Target, value: &NewTab) -> Result<bool, Errors> {
 /// arguments (if any) that will be sent to the main Ghostty instance and
 /// interpreted as CLI arguments.
 fn parameter(value: &NewTab) -> glib::Variant {
-    let command: Vec<String> = value.arguments.clone().unwrap_or_default();
+    let command: Vec<String> = value.arguments.map(arguments_strings).unwrap_or_default();
     (value.surface_id, command).to_variant()
 }
 
@@ -46,7 +46,7 @@ mod tests {
     fn parameter_shape() {
         let p = parameter(&NewTab {
             surface_id: 0,
-            arguments: Some(vec!["-e".into(), "echo".into(), "hello".into()]),
+            arguments: Some(&[c"-e", c"echo", c"hello"]),
         });
         assert_eq!(p.print(true).as_str(), "(uint64 0, ['-e', 'echo', 'hello'])");
         assert_eq!(parameter(&NewTab::default()).print(true).as_str(), "(uint64 0, @as [])");

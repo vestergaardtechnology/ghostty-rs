@@ -21,21 +21,7 @@ use gtk4::gdk::prelude::*;
 use indexmap::IndexMap;
 
 use super as portal;
-// TODO(port-dedupe): replace with crate::apprt::action::OpenUrlKind
-// (`apprt.action.OpenUrl.Kind`); `os::open` carries the same enum.
-pub use crate::os::open::OpenUrlKind;
-
-/// `apprt.action.OpenUrl`.
-// TODO(port-dedupe): replace with crate::apprt::action::OpenUrl
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OpenUrl<'a> {
-    /// Where the URL came from and what it likely points to.
-    pub kind: OpenUrlKind,
-
-    /// The URL to open. Depending on `kind`, this may be a plain file
-    /// path or arbitrary text rather than a well-formed URL.
-    pub url: &'a str,
-}
+pub use crate::apprt::action::{OpenUrl, OpenUrlKind};
 
 /// `self.app.app.openUrlFallback(kind, url)`: the GTK `Application`'s
 /// fallback URL opener.
@@ -173,10 +159,13 @@ impl OpenUri {
         let request_path =
             portal::get_request_path(&dbus, token).map_err(|_| Errors::NoDBusUniqueName)?;
 
+        // The URL is passed to D-Bus as a string (`s`), which must be UTF-8.
+        let url = String::from_utf8_lossy(value.url).into_owned();
+
         let request = RequestData {
             token,
             kind: value.kind,
-            uri: value.url.to_owned(),
+            uri: url.clone(),
             request_path: request_path.clone(),
         };
 
@@ -191,7 +180,7 @@ impl OpenUri {
             start: Instant::now(),
             token,
             kind: value.kind,
-            uri: value.url.to_owned(),
+            uri: url,
             activation_token,
             subscription: None,
         };
@@ -545,7 +534,7 @@ mod tests {
         assert_eq!(
             open_uri.start(OpenUrl {
                 kind: OpenUrlKind::Text,
-                url: "https://ghostty.org",
+                url: b"https://ghostty.org",
             }),
             Err(Errors::DBusConnectionRequired)
         );

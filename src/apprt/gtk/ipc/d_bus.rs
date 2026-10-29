@@ -10,69 +10,20 @@
 
 use crate::apprt::gtk::build::info as build_info;
 
-/// `apprt.ipc.Target`
-// TODO(port-dedupe): replace with crate::apprt::ipc::Target
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
-    /// Open up a new window in a custom instance of Ghostty.
-    Class(String),
+pub use crate::apprt::ipc::{Errors, NewTab, NewWindow, Target};
 
-    /// Detect which instance to open a new window in.
-    Detect,
+/// The arguments of an IPC action as D-Bus strings (`[:0]const u8` sent
+/// with `glib.Variant.newFromBytes`; D-Bus strings must be UTF-8).
+pub(crate) fn arguments_strings(arguments: &[&std::ffi::CStr]) -> Vec<String> {
+    arguments
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
-/// `apprt.ipc.Errors`
-// TODO(port-dedupe): replace with crate::apprt::ipc::Errors
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Errors {
-    /// The IPC failed. If a function returns this error, it's expected that
-    /// an a more specific error message will have been written to stderr (or
-    /// otherwise shown to the user in an appropriate way).
-    IPCFailed,
-}
-
-impl std::fmt::Display for Errors {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("IPCFailed")
-    }
-}
-
-impl std::error::Error for Errors {}
-
-/// `apprt.ipc.Action.NewTab`
-// TODO(port-dedupe): replace with crate::apprt::ipc::action::NewTab
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NewTab {
-    /// The unique ID of a surface. If the ID is zero the currently focused
-    /// surface is assumed. This will be used to identify the window to add
-    /// the tab to.
-    pub surface_id: u64,
-
-    /// A list of configuration entries that will override the configuration
-    /// of the first surface of the new tab. If this is `null` there
-    /// are no overrides. Note that not all configuration entries may be
-    /// overridden.
-    ///
-    /// It is an error for this to be non-`null`, but zero length.
-    pub arguments: Option<Vec<String>>,
-}
-
-/// `apprt.ipc.Action.NewWindow`
-// TODO(port-dedupe): replace with crate::apprt::ipc::action::NewWindow
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NewWindow {
-    /// A list of configuration entries that will override the configuration
-    /// of the first surface of the new window. If this is `null` there
-    /// are no overrides. Note that not all configuration entries may be
-    /// overridden.
-    ///
-    /// It is an error for this to be non-`null`, but zero length.
-    pub arguments: Option<Vec<String>>,
-}
-
-pub struct DBus {
+pub struct DBus<'a> {
     /// The target for this IPC.
-    pub target: Target,
+    pub target: Target<'a>,
 
     /// Connection to the DBus session bus.
     pub dbus: gio::DBusConnection,
@@ -97,10 +48,11 @@ pub type InitError = Errors;
 fn bus_name_and_object_path(target: &Target) -> (String, String) {
     match target {
         Target::Class(class) => {
+            let class = class.to_string_lossy().into_owned();
             // Force the usage of the class specified on the CLI to determine the
             // bus name and object path.
             let object_path = format!("/{class}").replace('.', "/").replace('-', "_");
-            (class.clone(), object_path)
+            (class, object_path)
         }
         Target::Detect => (
             build_info::APPLICATION_ID.to_owned(),
@@ -113,19 +65,19 @@ fn bus_name_and_object_path(target: &Target) -> (String, String) {
 fn validate(bus_name: &str, object_path: &str) -> Result<(), Errors> {
     if !gio::Application::id_is_valid(bus_name) {
         eprintln!("D-Bus bus name is not valid: {bus_name}");
-        return Err(Errors::IPCFailed);
+        return Err(Errors::IpcFailed);
     }
 
     if !glib::Variant::is_object_path(object_path) {
         eprintln!("D-Bus object path is not valid: {object_path}");
-        return Err(Errors::IPCFailed);
+        return Err(Errors::IpcFailed);
     }
     Ok(())
 }
 
-impl DBus {
+impl<'a> DBus<'a> {
     /// Initialize the helper.
-    pub fn init(target: Target, action: &str) -> Result<DBus, InitError> {
+    pub fn init(target: Target<'a>, action: &str) -> Result<DBus<'a>, InitError> {
         // Get the appropriate bus name and object path for contacting the
         // Ghostty instance we're interested in.
         let (bus_name, object_path) = bus_name_and_object_path(&target);
@@ -140,7 +92,7 @@ impl DBus {
                     "Unable to establish connection to D-Bus session bus: {}",
                     err.message()
                 );
-                return Err(Errors::IPCFailed);
+                return Err(Errors::IpcFailed);
             }
         };
 
@@ -183,7 +135,7 @@ impl DBus {
 
         if let Err(err) = result {
             eprintln!("D-Bus method call returned an error err={}", err.message());
-            return Err(Errors::IPCFailed);
+            return Err(Errors::IpcFailed);
         }
         Ok(())
     }
@@ -215,7 +167,7 @@ mod tests {
 
     #[test]
     fn class_target_paths() {
-        let (bus, path) = bus_name_and_object_path(&Target::Class("com.example.my-app".into()));
+        let (bus, path) = bus_name_and_object_path(&Target::Class(c"com.example.my-app"));
         assert_eq!(bus, "com.example.my-app");
         assert_eq!(path, "/com/example/my_app");
         assert!(validate(&bus, &path).is_ok());
@@ -228,7 +180,7 @@ mod tests {
 
     #[test]
     fn invalid_class_fails_before_connecting() {
-        assert_eq!(DBus::init(Target::Class("not a bus name".into()), "new-window").err(), Some(Errors::IPCFailed));
+        assert_eq!(DBus::init(Target::Class(c"not a bus name"), "new-window").err(), Some(Errors::IpcFailed));
     }
 
     #[test]

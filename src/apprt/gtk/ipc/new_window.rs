@@ -4,7 +4,7 @@
 
 use glib::prelude::*;
 
-use super::d_bus::{DBus, Errors, NewWindow, Target};
+use super::d_bus::{arguments_strings, DBus, Errors, NewWindow, Target};
 
 // Use a D-Bus method call to open a new window on GTK.
 // See: https://wiki.gnome.org/Projects/GLib/GApplication/DBusAPI
@@ -23,12 +23,12 @@ use super::d_bus::{DBus, Errors, NewWindow, Target};
 pub fn new_window(target: Target, value: &NewWindow) -> Result<bool, Errors> {
     let mut dbus = DBus::init(target, action_name(value))?;
 
-    if let Some(arguments) = &value.arguments {
+    if let Some(arguments) = value.arguments {
         // If any arguments were specified on the command line, the first
         // parameter is an array of strings that contain the arguments. They
         // will be sent to the main Ghostty instance and interpreted as CLI
         // arguments.
-        dbus.add_parameter(arguments.to_variant());
+        dbus.add_parameter(arguments_strings(arguments).to_variant());
     }
 
     dbus.send()?;
@@ -53,7 +53,7 @@ mod tests {
         assert_eq!(action_name(&NewWindow { arguments: None }), "new-window");
         assert_eq!(
             action_name(&NewWindow {
-                arguments: Some(vec!["-e".into()])
+                arguments: Some(&[c"-e"])
             }),
             "new-window-command"
         );
