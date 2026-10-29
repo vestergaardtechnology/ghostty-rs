@@ -168,8 +168,105 @@ pub fn parse_int_bits_unsigned(value: &[u8], base: u8, bits: u32) -> Result<u128
     Ok(accumulate)
 }
 
+/// Zig: `std.fmt.parseInt`, i.e. Zig integer literal syntax, for the
+/// places where Ghostty deliberately uses it instead of [`parse_int`]
+/// (config values, tmux output, cache files): an optional leading `+` or
+/// `-` for every type (a negative non-zero value overflows an unsigned
+/// type), `_` digit separators between digits, and with `base == 0` a
+/// `0b`/`0o`/`0x` prefix selects the base (default 10).
+///
+/// Rust-only addition (the Zig code calls the standard library directly);
+/// supports integer types of up to 64 bits.
+pub fn std_parse_int<T: ParseIntTarget>(buf: &[u8], base: u8) -> Result<T, ParseIntError> {
+    assert!(T::BITS <= 64);
+    let (min, max): (i128, i128) = if T::SIGNED {
+        (-(1i128 << (T::BITS - 1)), (1i128 << (T::BITS - 1)) - 1)
+    } else {
+        (0, (1i128 << T::BITS) - 1)
+    };
+
+    if buf.is_empty() {
+        return Err(ParseIntError::InvalidCharacter);
+    }
+    let (buf, neg) = match buf[0] {
+        b'+' => (&buf[1..], false),
+        b'-' => (&buf[1..], true),
+        _ => (buf, false),
+    };
+    if buf.is_empty() {
+        return Err(ParseIntError::InvalidCharacter);
+    }
+
+    let mut buf_base = base;
+    let mut buf_start = buf;
+    if base == 0 {
+        buf_base = 10;
+        if buf.len() > 2 && buf[0] == b'0' {
+            match buf[1].to_ascii_lowercase() {
+                b'b' => {
+                    buf_base = 2;
+                    buf_start = &buf[2..];
+                }
+                b'o' => {
+                    buf_base = 8;
+                    buf_start = &buf[2..];
+                }
+                b'x' => {
+                    buf_base = 16;
+                    buf_start = &buf[2..];
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if buf_start[0] == b'_' || buf_start[buf_start.len() - 1] == b'_' {
+        return Err(ParseIntError::InvalidCharacter);
+    }
+
+    // Like Zig, accumulate in an integer of at least 8 bits and report
+    // overflow as soon as the accumulator overflows.
+    let (acc_min, acc_max): (i128, i128) = if T::SIGNED {
+        let bits = T::BITS.max(8);
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << T::BITS.max(8)) - 1)
+    };
+    let check = |v: i128| -> Result<i128, ParseIntError> {
+        if v < acc_min || v > acc_max {
+            return Err(ParseIntError::Overflow);
+        }
+        Ok(v)
+    };
+
+    let mut accumulate: i128 = 0;
+    for &c in buf_start {
+        if c == b'_' {
+            continue;
+        }
+        let digit = i128::from(char_to_digit(c, buf_base)?);
+        if accumulate != 0 {
+            accumulate = check(accumulate * i128::from(buf_base))?;
+        } else if neg {
+            // The first digit of a negative number.
+            accumulate = check(-digit)?;
+            continue;
+        }
+        accumulate = check(if neg {
+            accumulate - digit
+        } else {
+            accumulate + digit
+        })?;
+    }
+
+    if accumulate < min || accumulate > max {
+        return Err(ParseIntError::Overflow);
+    }
+    Ok(T::from_i128(accumulate))
+}
+
 /// Zig: `std.fmt.charToDigit`.
-fn char_to_digit(c: u8, base: u8) -> Result<u8, ParseIntError> {
+pub fn char_to_digit(c: u8, base: u8) -> Result<u8, ParseIntError> {
     let value = match c {
         b'0'..=b'9' => c - b'0',
         b'A'..=b'Z' => c - b'A' + 10,
@@ -227,5 +324,37 @@ mod tests {
         // Overflow is reported as soon as the accumulator overflows, before
         // later invalid characters, like Zig.
         assert_eq!(Err(Overflow), parse_int::<u8>(b"1000x", 10));
+    }
+
+    // Port-specific: `std_parse_int` follows Zig's `std.fmt.parseInt`.
+    #[test]
+    fn std_parse_int_zig_literal_syntax() {
+        assert_eq!(Ok(42u8), std_parse_int::<u8>(b"42", 10));
+        assert_eq!(Ok(42u8), std_parse_int::<u8>(b"+42", 10));
+        assert_eq!(Ok(42u8), std_parse_int::<u8>(b"4_2", 10));
+        assert_eq!(Ok(0u8), std_parse_int::<u8>(b"-0", 10));
+        assert_eq!(Err(Overflow), std_parse_int::<u8>(b"-1", 10));
+        assert_eq!(Err(Overflow), std_parse_int::<u8>(b"256", 10));
+        assert_eq!(Ok(-128i8), std_parse_int::<i8>(b"-128", 10));
+        assert_eq!(Err(Overflow), std_parse_int::<i8>(b"128", 10));
+        assert_eq!(
+            Ok(i64::MIN),
+            std_parse_int::<i64>(b"-9223372036854775808", 10)
+        );
+        assert_eq!(
+            Ok(u64::MAX),
+            std_parse_int::<u64>(b"18446744073709551615", 10)
+        );
+        assert_eq!(
+            Err(Overflow),
+            std_parse_int::<u64>(b"18446744073709551616", 10)
+        );
+        assert_eq!(Ok(255u8), std_parse_int::<u8>(b"0xff", 0));
+        assert_eq!(Ok(5u8), std_parse_int::<u8>(b"0b101", 0));
+        assert_eq!(Ok(8u8), std_parse_int::<u8>(b"0o10", 0));
+        assert_eq!(Ok(10u8), std_parse_int::<u8>(b"010", 0));
+        for value in [&b""[..], b"+", b"-", b"_1", b"1_", b"0x_1", b" 1", b"1x"] {
+            assert_eq!(Err(InvalidCharacter), std_parse_int::<u8>(value, 0));
+        }
     }
 }

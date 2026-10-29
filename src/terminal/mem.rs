@@ -43,6 +43,8 @@
 //! Deviation: Zig's comptime `mode` parameter is a runtime argument here;
 //! every branch on it is trivially predictable.
 
+#[cfg(windows)]
+use crate::os::windows;
 
 const LOG_TARGET: &str = "terminal_mem";
 
@@ -270,7 +272,9 @@ pub fn decommit(mode: DecommitMode, memory: &mut [u8], dirty_len: usize) -> bool
         }
 
         // SAFETY: see the Linux branch.
-        let rc = unsafe { windows::DiscardVirtualMemory(memory.as_mut_ptr().cast(), memory.len()) };
+        let rc = unsafe {
+            windows::exp::kernel32::DiscardVirtualMemory(memory.as_mut_ptr().cast(), memory.len())
+        };
         if rc == windows::ERROR_SUCCESS {
             return true;
         }
@@ -301,19 +305,6 @@ pub fn decommit(mode: DecommitMode, memory: &mut [u8], dirty_len: usize) -> bool
             memory[..dirty_len].fill(0);
         }
         false
-    }
-}
-
-/// TODO(port-dedupe): replace with crate::os::windows (kernel32 externs).
-#[cfg(windows)]
-mod windows {
-    use std::ffi::c_void;
-
-    pub const ERROR_SUCCESS: u32 = 0;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn DiscardVirtualMemory(virtual_address: *mut c_void, size: usize) -> u32;
     }
 }
 

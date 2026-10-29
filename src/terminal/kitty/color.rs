@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::terminal::color::parse_int::parse_int;
+use crate::lib::parse_int;
 use crate::terminal::color::Rgb;
 use crate::terminal::osc::Terminator;
 

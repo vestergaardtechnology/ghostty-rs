@@ -10,7 +10,8 @@
 //! [`options`] implementing [`OptionType`], e.g.
 //! `cmd.read_option::<options::Aid>()`.
 
-use crate::terminal::color::parse_int::parse_int;
+use crate::lib::parse_int;
+use crate::os::string_encoding;
 use crate::terminal::osc::{Command as OscCommand, Parser, State};
 
 /// A single semantic prompt command.
@@ -55,6 +56,15 @@ impl From<std::io::Error> for WriteCommandLineError {
     }
 }
 
+impl From<string_encoding::DecodeError> for WriteCommandLineError {
+    fn from(err: string_encoding::DecodeError) -> Self {
+        match err {
+            string_encoding::DecodeError::DecodeError => WriteCommandLineError::DecodeError,
+            string_encoding::DecodeError::Write(err) => WriteCommandLineError::WriteFailed(err),
+        }
+    }
+}
+
 impl std::fmt::Display for WriteCommandLineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -92,106 +102,6 @@ impl<'a> Command<'a> {
         if let Some(command_line) = self.read_option::<options::CmdlineUrl>() {
             string_encoding::url_percent_decode(writer, command_line)?;
             return Ok(());
-        }
-        Ok(())
-    }
-}
-
-/// Stand-in for `src/os/string_encoding.zig` (owned by another porting
-/// agent).
-///
-/// TODO(port-dedupe): replace with crate::os::string_encoding
-mod string_encoding {
-    use super::WriteCommandLineError;
-    use std::io::Write;
-
-    /// Decode date from the buffer that has been encoded in the same way that
-    /// `bash`'s `printf %q` encodes a string and write it to the writer. If an
-    /// error is returned garbage may have been written to the buffer.
-    pub fn printf_q_decode<W: Write + ?Sized>(
-        writer: &mut W,
-        buf: &[u8],
-    ) -> Result<(), WriteCommandLineError> {
-        let data: &[u8] = if buf.starts_with(b"$'") {
-            // Strip off `$''` quoting.
-            if buf.len() < 3 || !buf.ends_with(b"'") {
-                return Err(WriteCommandLineError::DecodeError);
-            }
-            &buf[2..buf.len() - 1]
-        } else if buf.starts_with(b"'") {
-            // Strip off `''` quoting.
-            if buf.len() < 2 || !buf.ends_with(b"'") {
-                return Err(WriteCommandLineError::DecodeError);
-            }
-            &buf[1..buf.len() - 1]
-        } else {
-            buf
-        };
-
-        let mut src: usize = 0;
-        while src < data.len() {
-            match data[src] {
-                b'\\' => {
-                    if src + 1 >= data.len() {
-                        return Err(WriteCommandLineError::DecodeError);
-                    }
-                    let out = match data[src + 1] {
-                        c @ (b' ' | b'\\' | b'"' | b'\'' | b'$') => c,
-                        b'e' => 0x1b,
-                        b'n' => b'\n',
-                        b'r' => b'\r',
-                        b't' => b'\t',
-                        b'v' => 0x0b,
-                        _ => return Err(WriteCommandLineError::DecodeError),
-                    };
-                    writer.write_all(&[out])?;
-                    src += 2;
-                }
-                c => {
-                    writer.write_all(&[c])?;
-                    src += 1;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn hex(c: u8) -> u8 {
-        match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Decode data from the buffer that has been URL percent encoded and write
-    /// it to the given buffer. If an error is returned the garbage may have been
-    /// written to the writer.
-    pub fn url_percent_decode<W: Write + ?Sized>(
-        writer: &mut W,
-        buf: &[u8],
-    ) -> Result<(), WriteCommandLineError> {
-        let mut src: usize = 0;
-        while src < buf.len() {
-            match buf[src] {
-                b'%' => {
-                    if src + 2 >= buf.len() {
-                        return Err(WriteCommandLineError::DecodeError);
-                    }
-                    let a = buf[src + 1];
-                    let b = buf[src + 2];
-                    if !a.is_ascii_hexdigit() || !b.is_ascii_hexdigit() {
-                        return Err(WriteCommandLineError::DecodeError);
-                    }
-                    writer.write_all(&[(hex(a) << 4) | hex(b)])?;
-                    src += 3;
-                }
-                c => {
-                    writer.write_all(&[c])?;
-                    src += 1;
-                }
-            }
         }
         Ok(())
     }

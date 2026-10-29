@@ -11,7 +11,7 @@
 //! [`options`] implementing [`OptionType`], e.g.
 //! `osc.read_option::<options::U>()`.
 
-use crate::terminal::color::parse_int::parse_int;
+use crate::lib::parse_int;
 use crate::terminal::color::trim;
 use crate::terminal::osc::encoding;
 use crate::terminal::osc::kitty_metadata::{ValueIterator, ASCII_WHITESPACE};
