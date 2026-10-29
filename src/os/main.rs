@@ -1,6 +1,10 @@
 //! Port of `src/os/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
+//!
+//! The "os" package contains utilities for interfacing with the operating
+//! system. These aren't restricted to syscalls or low-level operations, but
+//! also OS-specific features and conventions.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "cf_release_thread.rs"]
@@ -64,3 +68,38 @@ pub mod windows;
 #[path = "xdg.rs"]
 pub mod xdg;
 // @generated-mods-end
+
+/// An environment variable map (Zig: `std.process.Environ.Map`).
+///
+/// The Rust port uses UTF-8 `String`s; variables whose name or value is
+/// not valid UTF-8 are skipped by [`environ_map`].
+pub type EnvironMap = std::collections::HashMap<String, String>;
+
+/// A snapshot of the current process environment (Zig:
+/// `global.environMap()` / `testing.environ.createMap`).
+pub fn environ_map() -> EnvironMap {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
+// Functions and types
+#[cfg(target_os = "macos")]
+pub use self::cf_release_thread::Thread as CFReleaseThread;
+pub use self::dbus::launched_by_dbus_activation;
+pub use self::desktop::{desktop_environment, launched_from_desktop, DesktopEnvironment};
+pub use self::edit::get_config_edit_command;
+pub use self::file::{fix_max_files, random_tmp_path, restore_max_files, Rlimit as rlimit};
+pub use self::flatpak::is_flatpak;
+#[cfg(all(target_os = "linux", feature = "gtk"))]
+pub use self::flatpak::FlatpakHostCommand;
+pub use self::homedir::{expand_home, home};
+pub use self::kernel_info::get_kernel_info;
+pub use self::locale::ensure_locale;
+pub use self::mouse::click_interval;
+pub use self::open::{open, OpenUrlKind as OpenType};
+pub use self::pipe::pipe;
+pub use self::resourcesdir::{resources_dir, ResourcesDir};
+pub use self::shell::ShellEscapeWriter;
+pub use self::systemd::launched_by_systemd;
+pub use self::temp_dir::TempDir;
