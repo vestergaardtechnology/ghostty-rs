@@ -1,6 +1,6 @@
 //! Port of `src/terminal/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: partial — re-exports of unported modules (render, SelectionGesture, stream_terminal, paste) pending.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "ansi.rs"]
@@ -116,3 +116,63 @@ pub mod x11_color;
 #[path = "xt_checksum.rs"]
 pub mod xt_checksum;
 // @generated-mods-end
+
+// Re-exports (Zig: the `pub const` declarations of `terminal/main.zig`).
+// Modules (`apc`, `dcs`, `osc`, `point`, `color`, ...) are the generated
+// `pub mod`s above.
+
+pub use self::charsets::table as charset_table;
+pub use self::charsets::ActiveSlot as CharsetActiveSlot;
+pub use self::charsets::Charset;
+pub use self::charsets::Slots as CharsetSlot;
+pub use self::mouse::Event as MouseEvent;
+pub use self::mouse::Format as MouseFormat;
+pub use self::mouse::Shape as MouseShape;
+pub use self::page::Cell;
+pub use self::page::Page;
+pub use self::page_list::PageList;
+pub use self::page_list::Pin;
+pub use self::page_list::Scrollbar;
+pub use self::parser::Csi as CSI;
+pub use self::parser::Dcs as DCS;
+pub use self::parser::Parser;
+pub use self::point::Coordinate;
+pub use self::point::Point;
+pub use self::screen::Screen;
+pub use self::screen_set::ScreenSet;
+pub use self::selection::Selection;
+pub use self::string_map::StringMap;
+pub use self::style::Style;
+pub use self::terminal::Terminal;
+pub use self::stream::Stream;
+pub use self::stream::Action as StreamAction;
+pub use self::stream::Boundary as StreamBoundary;
+pub use self::clipboard::MimeReader;
+pub use self::screen::Cursor;
+pub use self::cursor::Style as CursorStyle;
+pub use self::ansi::CursorStyle as CursorStyleReq;
+pub use self::device_attributes::Req as DeviceAttributeReq;
+pub use self::modes::Mode;
+pub use self::modes::ModePacked;
+pub use self::ansi::ModifyKeyFormat;
+pub use self::ansi::ProtectedMode;
+pub use self::ansi::StatusLineType;
+pub use self::ansi::StatusDisplay;
+pub use self::csi::EraseDisplay;
+pub use self::csi::EraseLine;
+pub use self::csi::SizeReportStyle;
+pub use self::csi::TabClear;
+pub use self::sgr::Attribute;
+
+pub use self::build_options::Options;
+/// (Zig: `options`, the `terminal_options` build module.)
+pub use self::build_options as options;
+
+// TODO(port-dedupe): the following re-exports are pending the ports of
+// their modules: `RenderState` (render.zig), `SelectionGesture`
+// (SelectionGesture.zig), `TerminalStream`, `SemanticPrompt`,
+// `UnknownSequence`, `PasteError` (stream_terminal.zig), `Paste`,
+// `PasteContents`, `PasteSource` (paste.zig). `c_api` is the `c` module.
+
+/// Whether this target supports terminal page compression.
+pub const COMPRESSION_ENABLED: bool = self::mem::can_reclaim(self::mem::DecommitMode::Strict);
