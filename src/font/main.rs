@@ -69,7 +69,8 @@ pub use self::sprite::Face as SpriteFace;
 pub use self::sprite::Sprite;
 
 // If we're targeting wasm then we export some wasm APIs: in Rust the
-// `#[no_mangle]` exports of `deferred_face::wasm` and `face::web_canvas::wasm`
+// `#[no_mangle]` exports of `deferred_face::wasm`, `face::web_canvas::wasm`
+// and `shaper::web_canvas::wasm`
 // are compiled on wasm32 automatically (Zig references them in a comptime
 // block).
 
