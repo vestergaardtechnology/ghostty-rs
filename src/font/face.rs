@@ -45,47 +45,13 @@ pub const DEFAULT_DPI: u16 = if cfg!(target_os = "macos") { 72 } else { 96 };
 /// only non-void if the freetype backend is enabled.
 ///
 /// NOTE: in Zig this is `void` when the backend has no FreeType; the
-/// (tiny) struct is always available here so that options can be built
-/// uniformly. Only the FreeType face reads it.
-pub type FreetypeLoadFlags = config::FreetypeLoadFlags;
+/// (tiny) config struct is always available here so that options can be
+/// built uniformly. Only the FreeType face reads it.
+pub type FreetypeLoadFlags = crate::config::FreetypeLoadFlags;
 
-pub const FREETYPE_LOAD_FLAGS_DEFAULT: FreetypeLoadFlags = FreetypeLoadFlags::DEFAULT;
-
-/// Minimal stand-in for the parts of `src/config/Config.zig` used here.
-// TODO(port-dedupe): replace with crate::config::FreetypeLoadFlags once
-// src/config/config.rs is ported.
-pub mod config {
-    /// See freetype-load-flag
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub struct FreetypeLoadFlags {
-        // The defaults here at the time of writing this match the defaults
-        // for Freetype itself. Ghostty hasn't made any opinionated changes
-        // to these defaults. (Strictly speaking, `light` isn't FreeType's
-        // own default, but appears to be the effective default with most
-        // Fontconfig-aware software using FreeType, so until Ghostty
-        // implements Fontconfig support we default to `light`.)
-        pub hinting: bool,
-        pub force_autohint: bool,
-        pub monochrome: bool,
-        pub autohint: bool,
-        pub light: bool,
-    }
-
-    impl FreetypeLoadFlags {
-        pub const DEFAULT: FreetypeLoadFlags = FreetypeLoadFlags {
-            hinting: true,
-            force_autohint: false,
-            monochrome: false,
-            autohint: true,
-            light: true,
-        };
-    }
-
-    impl Default for FreetypeLoadFlags {
-        fn default() -> Self {
-            Self::DEFAULT
-        }
-    }
+/// Zig `freetype_load_flags_default` (the config defaults, `.{}`).
+pub fn freetype_load_flags_default() -> FreetypeLoadFlags {
+    FreetypeLoadFlags::default()
 }
 
 /// Error returned by the faces' `name` functions (Zig `Allocator.Error`):
@@ -113,10 +79,10 @@ pub struct Options {
 impl Options {
     /// Options with the given size and default values for everything
     /// else (Zig `.{ .size = size }`).
-    pub const fn new(size: DesiredSize) -> Options {
+    pub fn new(size: DesiredSize) -> Options {
         Options {
             size,
-            freetype_load_flags: FREETYPE_LOAD_FLAGS_DEFAULT,
+            freetype_load_flags: freetype_load_flags_default(),
         }
     }
 }
