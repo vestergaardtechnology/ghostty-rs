@@ -20,6 +20,7 @@
 //! The wasm-only `Wasm` export API is not ported (no wasm target here).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::tripwire;
 
 #[derive(Debug)]
 pub struct Atlas {
@@ -135,41 +136,6 @@ pub struct Region {
 /// TODO: figure out optimal prealloc based on real world usage
 const NODE_PREALLOC: usize = 64;
 
-/// Minimal stand-in for `tripwire.module`: per-thread failure injection
-/// for the fail points of one function.
-// TODO(port-dedupe): replace with crate::tripwire once tripwire.zig is ported.
-pub mod tripwire {
-    use std::cell::Cell;
-
-    pub struct Module<P: Copy + PartialEq + 'static> {
-        key: &'static std::thread::LocalKey<Cell<Option<P>>>,
-    }
-
-    impl<P: Copy + PartialEq + 'static> Module<P> {
-        pub const fn new(key: &'static std::thread::LocalKey<Cell<Option<P>>>) -> Self {
-            Module { key }
-        }
-
-        /// Returns an error if a failure was configured for `point`.
-        pub fn check(&self, point: P) -> Result<(), super::AllocError> {
-            if self.key.with(|c| c.get()) == Some(point) {
-                return Err(super::AllocError::OutOfMemory);
-            }
-            Ok(())
-        }
-
-        /// Always fail at `point` (Zig `errorAlways(point, error.OutOfMemory)`).
-        pub fn error_always(&self, point: P) {
-            self.key.with(|c| c.set(Some(point)));
-        }
-
-        /// Reset the module (Zig `end(.reset)`).
-        pub fn end_reset(&self) {
-            self.key.with(|c| c.set(None));
-        }
-    }
-}
-
 /// Fail points of [`Atlas::init`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitFailPoint {
@@ -190,16 +156,9 @@ pub enum GrowFailPoint {
     AllocData,
 }
 
-thread_local! {
-    static INIT_TW_STATE: std::cell::Cell<Option<InitFailPoint>> = const { std::cell::Cell::new(None) };
-    static RESERVE_TW_STATE: std::cell::Cell<Option<ReserveFailPoint>> = const { std::cell::Cell::new(None) };
-    static GROW_TW_STATE: std::cell::Cell<Option<GrowFailPoint>> = const { std::cell::Cell::new(None) };
-}
-
-pub static INIT_TW: tripwire::Module<InitFailPoint> = tripwire::Module::new(&INIT_TW_STATE);
-pub static RESERVE_TW: tripwire::Module<ReserveFailPoint> =
-    tripwire::Module::new(&RESERVE_TW_STATE);
-pub static GROW_TW: tripwire::Module<GrowFailPoint> = tripwire::Module::new(&GROW_TW_STATE);
+pub static INIT_TW: tripwire::Module<InitFailPoint, AllocError> = tripwire::Module::new();
+pub static RESERVE_TW: tripwire::Module<ReserveFailPoint, AllocError> = tripwire::Module::new();
+pub static GROW_TW: tripwire::Module<GrowFailPoint, AllocError> = tripwire::Module::new();
 
 #[cfg(test)]
 thread_local! {
@@ -800,12 +759,12 @@ mod tests {
         // Test every failure point in `init` and ensure that we exit early.
         for tag in [InitFailPoint::AllocData, InitFailPoint::AllocNodes] {
             let tw = &INIT_TW;
-            tw.error_always(tag);
+            tw.error_always(tag, AllocError::OutOfMemory);
             assert_eq!(
                 AllocError::OutOfMemory,
                 Atlas::init(32, Format::Grayscale).unwrap_err()
             );
-            tw.end_reset();
+            tw.end(tripwire::ResetMode::Reset).unwrap();
         }
     }
 
@@ -817,9 +776,9 @@ mod tests {
 
             let mut atlas = Atlas::init(32, Format::Grayscale).unwrap();
 
-            tw.error_always(tag);
+            tw.error_always(tag, AllocError::OutOfMemory);
             assert_eq!(Err(Error::OutOfMemory), atlas.reserve(2, 2));
-            tw.end_reset();
+            tw.end(tripwire::ResetMode::Reset).unwrap();
         }
     }
 
@@ -838,9 +797,9 @@ mod tests {
             let old_modified = load(&atlas.modified);
             let old_resized = load(&atlas.resized);
 
-            tw.error_always(tag);
+            tw.error_always(tag, AllocError::OutOfMemory);
             assert_eq!(Err(AllocError::OutOfMemory), atlas.grow(atlas.size + 1));
-            tw.end_reset();
+            tw.end(tripwire::ResetMode::Reset).unwrap();
 
             // Verify atlas state is unchanged after failed grow
             assert_eq!(old_modified, load(&atlas.modified));

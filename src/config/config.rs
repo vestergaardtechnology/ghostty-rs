@@ -5386,27 +5386,10 @@ impl ParseCli for MetricModifier {
     }
 }
 
-/// Adapter from the font package's formatter trait to the config
-/// [`EntryFormatter`].
-struct MetricModifierFormatter<'a, 'b>(&'a mut EntryFormatter<'b>, Option<formatterpkg::Error>);
-
-impl crate::font::metrics::EntryFormatter for MetricModifierFormatter<'_, '_> {
-    fn format_entry_str(&mut self, value: &str) -> fmt::Result {
-        self.0.format_entry(value).map_err(|err| {
-            self.1 = Some(err);
-            fmt::Error
-        })
-    }
-}
-
 impl FormatEntry for MetricModifier {
     /// Used by config formatter
     fn format_entry(&self, f: &mut EntryFormatter<'_>) -> Result<(), formatterpkg::Error> {
-        let mut adapter = MetricModifierFormatter(f, None);
-        match MetricModifier::format_entry(self, &mut adapter) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(adapter.1.unwrap_or(formatterpkg::Error::WriteFailed)),
-        }
+        MetricModifier::format_entry(self, f)
     }
 }
 
