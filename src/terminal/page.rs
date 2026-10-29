@@ -1548,7 +1548,9 @@ impl Page {
     #[inline]
     pub fn clear_cells(&mut self, row: &mut Row, left: usize, end: usize) {
         let mem = self.memory;
-        debug_assert!(left <= end && end <= self.size.cols as usize);
+        // Zig slices the row cells with a many-pointer, so `end` may exceed
+        // `size.cols` (but never the row capacity) on mixed-width page lists.
+        debug_assert!(left <= end && end <= self.capacity.cols as usize);
         // SAFETY: the range is within the row.
         let cells: *mut Cell = unsafe { row.cells().ptr(mem).add(left) };
         let len = end - left;

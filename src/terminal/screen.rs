@@ -6873,8 +6873,7 @@ mod tests {
             && a.style_id == b.style_id
             && a.hyperlink_id == b.hyperlink_id
             && a.hyperlink_implicit_id == b.hyperlink_implicit_id
-            && a.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
-                == b.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
+            && a.hyperlink == b.hyperlink
             && a.semantic_content == b.semantic_content
             && a.semantic_content_clear_eol == b.semantic_content_clear_eol
             && a.page_pin == b.page_pin
@@ -6910,6 +6909,7 @@ mod tests {
             // covered as well.
             assert_eq!(s.pages.pages.first, s.pages.pages.last);
             let before_cursor = s.cursor.clone();
+            let before_hyperlink_ptr = s.cursor.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>);
             let before_saved_cursor = s.saved_cursor;
             let before_selection = s.selection.map(|v| (v.bounds, v.rectangle));
             let before_charset = s.charset;
@@ -6940,6 +6940,10 @@ mod tests {
             );
 
             assert!(cursor_eql(&before_cursor, &s.cursor));
+            assert_eq!(
+                before_hyperlink_ptr,
+                s.cursor.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
+            );
             assert_eq!(before_saved_cursor, s.saved_cursor);
             assert_eq!(before_selection, s.selection.map(|v| (v.bounds, v.rectangle)));
             assert_eq!(before_charset, s.charset);
@@ -8168,6 +8172,251 @@ mod tests {
                 assert_eq!(c.expected, contents);
             }
         }
+    }
+
+    /// Default boundary codepoints for word selection.
+    const WORD_BOUNDARIES: &[u32] = &[
+        0, ' ' as u32, '\t' as u32, '\'' as u32, '"' as u32, '│' as u32, '`' as u32, '|' as u32, ':' as u32,
+        ';' as u32, ',' as u32, '(' as u32, ')' as u32, '[' as u32, ']' as u32, '{' as u32, '}' as u32,
+        '<' as u32, '>' as u32, '$' as u32,
+    ];
+
+    #[test]
+    fn screen_select_word_across_soft_wrap() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string(" 1234012\n 123").unwrap();
+
+        assert_eq!(" 1234\n012\n 123", dump(&s, Tag::Screen));
+
+        // Going forward
+        let sel = s.select_word(pin(&s, act(1, 0)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+
+        // Going backward
+        let sel = s.select_word(pin(&s, act(1, 1)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+
+        // Going forward and backward
+        let sel = s.select_word(pin(&s, act(3, 0)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+    }
+
+    #[test]
+    fn screen_select_word_whitespace_across_soft_wrap() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string("1       1\n 123").unwrap();
+
+        // Going forward
+        let sel = s.select_word(pin(&s, act(1, 0)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+
+        // Going backward
+        let sel = s.select_word(pin(&s, act(1, 1)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+
+        // Going forward and backward
+        let sel = s.select_word(pin(&s, act(3, 0)), WORD_BOUNDARIES).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (2, 1));
+    }
+
+    #[test]
+    fn screen_select_word_with_character_boundary() {
+        let cases = [
+            " 'abc' \n123",
+            " \"abc\" \n123",
+            " │abc│ \n123",
+            " `abc` \n123",
+            " |abc| \n123",
+            " :abc: \n123",
+            " ;abc; \n123",
+            " ,abc, \n123",
+            " (abc( \n123",
+            " )abc) \n123",
+            " [abc[ \n123",
+            " ]abc] \n123",
+            " {abc{ \n123",
+            " }abc} \n123",
+            " <abc< \n123",
+            " >abc> \n123",
+            " $abc$ \n123",
+        ];
+
+        for case in cases {
+            let mut s = init(20, 10, Some(0));
+            s.test_write_string(case).unwrap();
+
+            // Inside character forward
+            let sel = s.select_word(pin(&s, act(2, 0)), WORD_BOUNDARIES).unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (2, 0), (4, 0));
+
+            // Inside character backward
+            let sel = s.select_word(pin(&s, act(4, 0)), WORD_BOUNDARIES).unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (2, 0), (4, 0));
+
+            // Inside character bidirectional
+            let sel = s.select_word(pin(&s, act(3, 0)), WORD_BOUNDARIES).unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (2, 0), (4, 0));
+
+            // On quote
+            // NOTE: this behavior is not ideal, so we can change this one day,
+            // but I think its also not that important compared to the above.
+            let sel = s.select_word(pin(&s, act(1, 0)), WORD_BOUNDARIES).unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (0, 0), (1, 0));
+        }
+    }
+
+    #[test]
+    fn screen_select_output() {
+        let mut s = init(10, 15, Some(0));
+
+        // Build content with cell-level semantic content:
+        // Row 0-1: output1 (output)
+        // Row 2: prompt2 (prompt)
+        // Row 3: input2 (input)
+        // Row 4-7: output2 (output, with overflow causing wrap)
+        // Row 8: "$ " (prompt) + "input3" (input)
+        // Row 9-11: output3 (output)
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("output1\n").unwrap();
+        s.test_write_string("output1\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("prompt2\n").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("input2\n").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("output2output2output2output2\n").unwrap();
+        s.test_write_string("output2\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("$ ").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("input3\n").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("output3\n").unwrap();
+        s.test_write_string("output3\n").unwrap();
+        s.test_write_string("output3").unwrap();
+
+        // First output block (rows 0-1), should select those rows
+        {
+            let sel = s.select_output(pin(&s, act(1, 1))).unwrap();
+            assert_eq!("output1\noutput1", sel_str(&s, sel));
+        }
+        // Second output block (rows 4-7)
+        {
+            let sel = s.select_output(pin(&s, act(3, 7))).unwrap();
+            assert_eq!("output2output2output2output2\noutput2", sel_str(&s, sel));
+        }
+        // Third output block (rows 9-11)
+        {
+            let sel = s.select_output(pin(&s, act(2, 10))).unwrap();
+            assert_sel(&s, &sel, Tag::Active, (0, 9), (6, 11));
+        }
+        // Click on prompt should return null
+        assert!(s.select_output(pin(&s, act(1, 8))).is_none());
+        // Click on input should return null
+        assert!(s.select_output(pin(&s, act(5, 8))).is_none());
+    }
+
+    fn sel_string(s: &Screen, a: Point, b: Point, trim: bool) -> String {
+        let sel = Selection::init(pin(s, a), pin(s, b), false);
+        s.selection_string(SelectionString { sel, trim })
+    }
+
+    #[test]
+    fn screen_selection_string_basic() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("2EFGH\n3IJ", sel_string(&s, scr(0, 1), scr(2, 2), true));
+    }
+
+    #[test]
+    fn screen_selection_string_start_outside_of_written_area() {
+        let mut s = init(5, 10, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("", sel_string(&s, scr(0, 5), scr(2, 6), true));
+    }
+
+    #[test]
+    fn screen_selection_string_end_outside_of_written_area() {
+        let mut s = init(5, 10, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("3IJKL", sel_string(&s, scr(0, 2), scr(2, 6), true));
+    }
+
+    #[test]
+    fn screen_selection_string_trim_space() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1AB  \n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("1AB\n2EF", sel_string(&s, scr(0, 0), scr(2, 1), true));
+
+        // No trim
+        assert_eq!("1AB  \n2EF", sel_string(&s, scr(0, 0), scr(2, 1), false));
+    }
+
+    #[test]
+    fn screen_selection_string_trim_empty_line() {
+        let mut s = init(5, 5, Some(0));
+        let str_ = "1AB  \n\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("1AB\n\n2EF", sel_string(&s, scr(0, 0), scr(2, 2), true));
+
+        // No trim
+        assert_eq!("1AB  \n\n2EF", sel_string(&s, scr(0, 0), scr(2, 2), false));
+    }
+
+    #[test]
+    fn screen_selection_string_soft_wrap() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD2EFGH3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("2EFGH3IJ", sel_string(&s, scr(0, 1), scr(2, 2), true));
+    }
+
+    #[test]
+    fn screen_selection_string_wide_char() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1A⚡";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!(str_, sel_string(&s, scr(0, 0), scr(3, 0), true));
+        assert_eq!(str_, sel_string(&s, scr(0, 0), scr(2, 0), true));
+        assert_eq!("⚡", sel_string(&s, scr(3, 0), scr(3, 0), true));
+    }
+
+    #[test]
+    fn screen_selection_string_wide_char_with_header() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABC⚡";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!(str_, sel_string(&s, scr(0, 0), scr(4, 0), true));
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/289
+    #[test]
+    fn screen_selection_string_empty_with_soft_wrap() {
+        let mut s = init(5, 2, Some(0));
+
+        // Let me describe the situation that caused this because this
+        // test is not obvious. By writing an emoji below, we introduce
+        // one cell with the emoji and one cell as a "wide char spacer".
+        // We then soft wrap the line by writing spaces.
+        //
+        // By selecting only the tail, we'd select nothing and we had
+        // a logic error that would cause a crash.
+        s.test_write_string("👨").unwrap();
+        s.test_write_string("      ").unwrap();
+
+        assert_eq!("👨", sel_string(&s, scr(1, 0), scr(2, 0), true));
     }
 
     // @tests-end
