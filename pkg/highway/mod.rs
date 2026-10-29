@@ -4,3 +4,6 @@
 #[path = "src/main.rs"]
 pub mod src;
 // @generated-mods-end
+
+// Re-export the package root (`@import("highway")`).
+pub use self::src::*;

@@ -149,13 +149,20 @@ impl<T, const CAPACITY: usize> BlockingQueue<T, CAPACITY> {
     /// queue (unread items) after the push. A return value of zero
     /// means that the push failed.
     pub fn push(&self, value: T, timeout: Timeout) -> Size {
+        self.push_or_return(value, timeout).unwrap_or(0)
+    }
+
+    /// Like [`push`](Self::push), but a failed push hands the value back
+    /// instead of dropping it (Zig callers keep their copy of the value and
+    /// retry or free it).
+    pub fn push_or_return(&self, value: T, timeout: Timeout) -> Result<Size, T> {
         let mut state = self.lock();
 
         // The
         if state.full() {
             match timeout {
                 // If we're not waiting, then we failed to write.
-                Timeout::Instant => return 0,
+                Timeout::Instant => return Err(value),
 
                 Timeout::Forever => {
                     state.not_full_waiters += 1;
@@ -175,7 +182,7 @@ impl<T, const CAPACITY: usize> BlockingQueue<T, CAPACITY> {
                     state = s;
                     state.not_full_waiters -= 1;
                     if result.timed_out() {
-                        return 0;
+                        return Err(value);
                     }
                 }
             }
@@ -183,7 +190,7 @@ impl<T, const CAPACITY: usize> BlockingQueue<T, CAPACITY> {
             // If we're still full, then we failed to write. This can
             // happen in situations where we are interrupted.
             if state.full() {
-                return 0;
+                return Err(value);
             }
         }
 
@@ -196,7 +203,7 @@ impl<T, const CAPACITY: usize> BlockingQueue<T, CAPACITY> {
         }
         state.len += 1;
 
-        state.len
+        Ok(state.len)
     }
 
     /// Pop a value from the queue without blocking.

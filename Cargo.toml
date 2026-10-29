@@ -45,6 +45,8 @@ gtk-layer-shell = ["gtk", "dep:gtk4-layer-shell"]
 base64 = "0.22"
 # Used by the wayland-scanner generated vicinae-hotkey protocol code.
 bitflags = { version = "2", optional = true }
+crossterm = "0.29"
+flate2 = "1"
 gdk4-wayland = { version = "0.10", optional = true, features = ["v4_12", "wayland_crate"] }
 gdk4-x11 = { version = "0.10", optional = true, features = ["v4_4", "xlib"] }
 getrandom = "0.3"
@@ -58,16 +60,20 @@ libadwaita = { version = "0.8", optional = true, features = ["v1_5"] }
 libc = "0.2"
 log = "0.4"
 memchr = "2"
+miniz_oxide = "0.8"
+naga = { version = "30", features = ["glsl-in", "glsl-out", "msl-out", "spv-in", "spv-out"] }
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
-
+unicode-segmentation = "1"
+unicode-width = "0.2"
 wayland-backend = { version = "0.3", optional = true, features = ["client_system"] }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
 wayland-protocols-plasma = { version = "0.3", optional = true, features = ["client"] }
 wayland-scanner = { version = "0.31", optional = true }
 x11 = { version = "2", optional = true, features = ["xlib"] }
+zune-jpeg = "0.5"
 
 [dev-dependencies]
 png = "0.18"

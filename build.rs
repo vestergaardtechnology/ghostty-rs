@@ -15,6 +15,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(ghostty_gresource)");
     pkg_c_libraries();
     stb();
+    dcimgui();
     if std::env::var_os("CARGO_FEATURE_GTK").is_some() {
         gtk_resources();
     }
@@ -88,6 +89,9 @@ fn gtk_resources() {
 /// The vendored nothings/stb headers (`src/stb`), compiled from
 /// `src/stb/stb.c` as `src/build/SharedDeps.zig` does.
 fn stb() {
+    if cross_checking_macos() {
+        return;
+    }
     println!("cargo:rerun-if-changed=src/stb");
     cc::Build::new()
         .include("src/stb")
@@ -102,6 +106,13 @@ fn stb() {
 /// from `vendor/glad`, as `src/build/SharedDeps.zig` does.
 fn pkg_c_libraries() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Cross-checking the macOS target from another host (e.g.
+    // `cargo check --target x86_64-apple-darwin` on Linux) can't compile or
+    // link C code without an Apple SDK, and a check doesn't need it.
+    if target_os == "macos" && !cfg!(target_os = "macos") {
+        return;
+    }
 
     for lib in ["freetype2", "harfbuzz", "fontconfig", "oniguruma"] {
         if let Err(err) = pkg_config::Config::new().probe(lib) {
@@ -123,8 +134,99 @@ fn pkg_c_libraries() {
         }
     }
     glad.compile("glad");
+
+    // pkg/macos: the os_log_with_type macro wrapper.
+    if target_os == "macos" {
+        println!("cargo:rerun-if-changed=pkg/macos/os/zig_macos.c");
+        cc::Build::new()
+            .file("pkg/macos/os/zig_macos.c")
+            .flag("-std=c99")
+            .compile("ghostty_macos");
+    }
     if target_os == "linux" {
         // glad's loader uses dlopen.
         println!("cargo:rustc-link-lib=dylib=dl");
     }
+}
+
+/// Dear ImGui + the Dear Bindings C API (`pkg/dcimgui/build.zig`), only with
+/// the `inspector` feature. Sources are vendored in `vendor/dcimgui`.
+fn dcimgui() {
+    if std::env::var_os("CARGO_FEATURE_INSPECTOR").is_none() {
+        return;
+    }
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_vendor = std::env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+    if target_os == "macos" && !cfg!(target_os = "macos") {
+        // Cross-checking from another host; see pkg_c_libraries.
+        return;
+    }
+    let apple = target_vendor == "apple";
+
+    println!("cargo:rerun-if-changed=vendor/dcimgui");
+    println!("cargo:rerun-if-changed=pkg/dcimgui/ext.cpp");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .warnings(false)
+        .include("vendor/dcimgui/imgui")
+        .include("vendor/dcimgui/bindings")
+        .define("IMGUI_HAS_DOCK", "1")
+        .define("IMGUI_USE_WCHAR32", "1")
+        .define("IMGUI_DISABLE_OBSOLETE_FUNCTIONS", "1")
+        .define("IMGUI_ENABLE_FREETYPE", "1")
+        .define("IMGUI_IMPL_API", "extern \"C\"");
+
+    // Freetype is linked by pkg_c_libraries; only the headers are needed.
+    let freetype = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("freetype2")
+        .expect("pkg-config could not find freetype2");
+    for path in &freetype.include_paths {
+        build.include(path);
+    }
+
+    for file in [
+        "imgui_demo.cpp",
+        "imgui_draw.cpp",
+        "imgui_tables.cpp",
+        "imgui_widgets.cpp",
+        "imgui.cpp",
+        "misc/freetype/imgui_freetype.cpp",
+    ] {
+        build.file(format!("vendor/dcimgui/imgui/{file}"));
+    }
+    build
+        .file("vendor/dcimgui/bindings/dcimgui.cpp")
+        .file("vendor/dcimgui/bindings/dcimgui_internal.cpp")
+        .file("pkg/dcimgui/ext.cpp");
+
+    if apple {
+        // Metal (and on macOS, OSX) backends.
+        build
+            .file("vendor/dcimgui/imgui/backends/imgui_impl_metal.mm")
+            .flag("-fobjc-arc");
+        if target_os == "macos" {
+            build.file("vendor/dcimgui/imgui/backends/imgui_impl_osx.mm");
+            println!("cargo:rustc-link-lib=framework=GameController");
+        }
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+    } else {
+        // OpenGL3 backend should only be built on non-Apple targets.
+        build
+            .define("ZIGPKG_IMGUI_ENABLE_OPENGL3", "1")
+            .file("vendor/dcimgui/imgui/backends/imgui_impl_opengl3.cpp");
+    }
+
+    build.compile("dcimgui");
+}
+
+/// True when type-checking for macOS from a non-macOS host: C sources can't
+/// be compiled for that target here, and nothing is linked anyway.
+fn cross_checking_macos() -> bool {
+    std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" && !cfg!(target_os = "macos")
 }
