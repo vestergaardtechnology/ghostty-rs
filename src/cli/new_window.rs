@@ -2,9 +2,9 @@
 //!
 //! STATUS: ported
 //!
-//! The apprt IPC (`apprt.App.performIpc`) is not ported yet; [`apprt_ipc`]
-//! is a stand-in (TODO(port-dedupe)) shared with `+new-tab` and
-//! `+toggle-quick-terminal`.
+//! The GTK apprt's `App.performIpc` is not ported yet; [`apprt_ipc`]
+//! provides a stand-in `App` (TODO(port-dedupe)) shared with `+new-tab`
+//! and `+toggle-quick-terminal`.
 
 use std::ffi::CStr;
 use std::io::{self, BufWriter, Write};
@@ -223,58 +223,17 @@ fn run_args<I: ArgIterator + ?Sized, W: Write + ?Sized>(args_iter: &mut I, stder
 /// Stand-in for `apprt.ipc` and the GTK apprt's `App.performIpc`
 /// (`apprt/gtk/ipc/*.zig`).
 ///
-/// TODO(port-dedupe): replace with `crate::apprt::ipc` and
-/// `crate::apprt::App::perform_ipc` once the apprt is ported. The GTK IPC
+/// TODO(port-dedupe): replace with `crate::apprt::App::perform_ipc` once
+/// the GTK apprt is ported (the IPC types are `crate::apprt::ipc`). The GTK IPC
 /// is a D-Bus `org.gtk.Actions.Activate` call; without linking GIO, this
 /// stand-in performs the same call through the `gdbus` command line tool
 /// (the exact commands are documented in the Zig sources).
 pub mod apprt_ipc {
     use std::ffi::CStr;
-    use std::fmt;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Errors {
-        /// The IPC failed. If a function returns this error, it's expected
-        /// that an a more specific error message will have been written to
-        /// stderr.
-        IpcFailed,
-    }
-
-    impl fmt::Display for Errors {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("IPCFailed")
-        }
-    }
-
-    impl std::error::Error for Errors {}
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Target<'a> {
-        /// Open up a new window in a custom instance of Ghostty.
-        Class(&'a CStr),
-        /// Detect which instance to open a new window in.
-        Detect,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct NewWindow<'a> {
-        pub arguments: Option<&'a [&'a CStr]>,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct NewTab<'a> {
-        pub surface_id: u64,
-        pub arguments: Option<&'a [&'a CStr]>,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Action<'a> {
-        NewWindow(NewWindow<'a>),
-        NewTab(NewTab<'a>),
-        ToggleQuickTerminal,
-    }
+    pub use crate::apprt::ipc::{Action, Errors, NewTab, NewWindow, Target};
 
     /// GTK `App.application_id` / `App.object_path`.
     const APPLICATION_ID: &str = if cfg!(debug_assertions) {

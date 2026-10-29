@@ -116,7 +116,7 @@ fn run_args<I: ArgIterator + ?Sized, O: Write + ?Sized, E: Write + ?Sized>(
     stderr: &mut E,
 ) -> RunResult {
     // Its possible to build Ghostty without font discovery!
-    if !super::list_fonts::discover::AVAILABLE {
+    if !super::list_fonts::DISCOVERY_AVAILABLE {
         write!(
             stderr,
             "Ghostty was built without a font discovery mechanism. This is a compile-time
@@ -187,7 +187,13 @@ maintainer to enable a font discovery mechanism, and try again."
         }
     }
 
-    let font_grid = grid::SharedGrid::init(&config);
+    let font_grid = match grid::SharedGrid::init(&config) {
+        Ok(grid) => grid,
+        Err(err) => {
+            write!(stderr, "Unable to initialize font grid set: {}", err)?;
+            return Ok(1);
+        }
+    };
 
     let style: font::Style = opts.style.into();
     let presentation: Option<font::Presentation> = opts.presentation.map(Into::into);
@@ -252,9 +258,8 @@ fn lookup<O: Write + ?Sized, E: Write + ?Sized>(
 /// TODO(port-dedupe): replace with `crate::font::SharedGridSet` /
 /// `SharedGrid.resolver.getIndex` / `collection.getFace` once ported.
 mod grid {
-    use crate::cli::list_fonts::discover::{Descriptor, Discover};
     use crate::config::Config;
-    use crate::font::{self, Presentation, Style};
+    use crate::font::{self, DeferredFace, Descriptor, Discover, Presentation, Style};
 
     /// The result of a lookup (Zig `Collection.Index` resolved to a face
     /// name, or `error.SpecialHasNoFace` for sprites).
@@ -265,20 +270,34 @@ mod grid {
     }
 
     pub struct SharedGrid {
-        discover: Discover,
+        lib: font::Library,
         /// The configured families per style (Zig: the families loaded
         /// into the collection by `SharedGridSet.DerivedConfig`).
         families: [Vec<String>; 4],
         sprite: font::SpriteFace,
     }
 
+    impl Drop for SharedGrid {
+        fn drop(&mut self) {
+            self.lib.deinit();
+        }
+    }
+
+    fn face_index(face: &DeferredFace) -> Index {
+        let mut buf = [0u8; 1024];
+        match face.name(&mut buf) {
+            Ok(name) => Index::Face(String::from_utf8_lossy(name).into_owned()),
+            Err(err) => Index::Error(err.to_string()),
+        }
+    }
+
     impl SharedGrid {
-        pub fn init(config: &Config) -> SharedGrid {
+        pub fn init(config: &Config) -> Result<SharedGrid, String> {
             let list = |v: &crate::config::RepeatableString| -> Vec<String> {
                 v.list.iter().map(|s| s.as_str().to_owned()).collect()
             };
-            SharedGrid {
-                discover: Discover::init(),
+            Ok(SharedGrid {
+                lib: font::Library::init().map_err(|e| format!("{:?}", e))?,
                 families: [
                     list(&config.font_family),
                     list(&config.font_family_bold),
@@ -297,7 +316,7 @@ mod grid {
                         ..Default::default()
                     }),
                 },
-            }
+            })
         }
 
         fn style_index(style: Style) -> usize {
@@ -310,11 +329,12 @@ mod grid {
         }
 
         /// Search the configured families of a style.
-        fn collection_get(&self, cp: u32, style: Style) -> Option<Index> {
+        fn collection_get(&self, cp: u32, style: Style, p: Option<Presentation>) -> Option<Index> {
+            let disco = Discover::init(&self.lib);
             let families = &self.families[Self::style_index(style)];
             for family in families {
-                let Ok(mut it) = self.discover.discover(&Descriptor {
-                    family: Some(family),
+                let Ok(mut it) = disco.discover(&Descriptor {
+                    family: Some(family.clone()),
                     bold: matches!(style, Style::Bold | Style::BoldItalic),
                     italic: matches!(style, Style::Italic | Style::BoldItalic),
                     ..Default::default()
@@ -322,12 +342,9 @@ mod grid {
                     continue;
                 };
                 // The collection holds the best match of each family.
-                if let Some(face) = it.next() {
-                    if face.has_codepoint(cp) {
-                        return Some(match face.name() {
-                            Ok(name) => Index::Face(name),
-                            Err(err) => Index::Error(err.to_string()),
-                        });
+                if let Ok(Some(face)) = it.next() {
+                    if face.has_codepoint(cp, p) {
+                        return Some(face_index(&face));
                     }
                 }
             }
@@ -348,7 +365,7 @@ mod grid {
                 return Some(Index::Sprite);
             }
 
-            if let Some(idx) = self.collection_get(cp, style) {
+            if let Some(idx) = self.collection_get(cp, style, p) {
                 return Some(idx);
             }
 
@@ -362,18 +379,16 @@ mod grid {
 
             // If we are regular, try looking for a fallback using discovery.
             if style == Style::Regular {
-                if let Ok(mut it) = self.discover.discover(&Descriptor {
+                let disco = Discover::init(&self.lib);
+                if let Ok(mut it) = disco.discover(&Descriptor {
                     codepoint: cp,
                     ..Default::default()
                 }) {
-                    while let Some(face) = it.next() {
-                        if !face.has_codepoint(cp) {
+                    while let Ok(Some(face)) = it.next() {
+                        if !face.has_codepoint(cp, p) {
                             continue;
                         }
-                        return Some(match face.name() {
-                            Ok(name) => Index::Face(name),
-                            Err(err) => Index::Error(err.to_string()),
-                        });
+                        return Some(face_index(&face));
                     }
                 }
             }
@@ -411,7 +426,7 @@ mod tests {
 
     #[test]
     fn sprite_codepoints() {
-        let grid = grid::SharedGrid::init(&Config::default());
+        let grid = grid::SharedGrid::init(&Config::default()).unwrap();
         // Box drawing is handled by the sprite face.
         assert!(matches!(
             grid.get_index(0x2500, font::Style::Regular, None),
