@@ -15212,4 +15212,1273 @@ mod tests {
         assert_eq!(screen::SemanticClick::ClickEvents(osc_sp::ClickEvents::Absolute), t.screens.active.semantic_prompt.click);
     }
 
+    #[test]
+    fn terminal_osc133a_click_events_0_falls_back_to_cl() {
+        let mut t = init(10, 5);
+
+        // OSC 133;A with click_events=0 and cl=v
+        t.semantic_prompt(&osc::SemanticPrompt { action: osc_sp::Action::FreshLineNewPrompt, options_unvalidated: b"click_events=0;cl=v" }).unwrap();
+
+        // Should fall back to cl since click_events is disabled
+        assert_eq!(screen::SemanticClick::Cl(osc_sp::Click::ConservativeVertical), t.screens.active.semantic_prompt.click);
+    }
+
+    #[test]
+    fn terminal_osc133a_no_click_options_leaves_click_as_none() {
+        let mut t = init(10, 5);
+
+        // OSC 133;A with no click-related options
+        t.semantic_prompt(&osc::SemanticPrompt { action: osc_sp::Action::FreshLineNewPrompt, options_unvalidated: b"aid=123" }).unwrap();
+
+        assert_eq!(screen::SemanticClick::None, t.screens.active.semantic_prompt.click);
+    }
+
+    #[test]
+    fn terminal_cursorisatprompt() {
+        let mut t = init(10, 3);
+
+        assert!(!t.cursor_is_at_prompt());
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::PromptStart)).unwrap();
+        assert!(t.cursor_is_at_prompt());
+        for c in "$ ".chars() { t.print(c as u32).unwrap(); }
+
+        // Input is also a prompt
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::EndPromptStartInput)).unwrap();
+        assert!(t.cursor_is_at_prompt());
+        for c in "ls".chars() { t.print(c as u32).unwrap(); }
+
+        // But once we say we're starting output, we're not a prompt
+        // (cursor is not at x=0, so the Fish heuristic doesn't trigger)
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::EndInputStartOutput)).unwrap();
+        // Still a prompt because this line has a prompt
+        assert!(t.cursor_is_at_prompt());
+        t.linefeed().unwrap();
+        assert!(!t.cursor_is_at_prompt());
+
+        // Until we know we're at a prompt again
+        t.linefeed().unwrap();
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::PromptStart)).unwrap();
+        assert!(t.cursor_is_at_prompt());
+    }
+
+    #[test]
+    fn terminal_cursorisatprompt_alternate_screen() {
+        let mut t = init(3, 2);
+
+        assert!(!t.cursor_is_at_prompt());
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::PromptStart)).unwrap();
+        assert!(t.cursor_is_at_prompt());
+
+        // Secondary screen is never a prompt
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        assert!(!t.cursor_is_at_prompt());
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::PromptStart)).unwrap();
+        assert!(!t.cursor_is_at_prompt());
+    }
+
+    #[test]
+    fn terminal_cursor_defaults_update_current_default_cursor() {
+        let mut t = Terminal::init(Options {
+            cols: 10,
+            rows: 10,
+            default_cursor_style: CursorStyle::Bar,
+            default_cursor_blink: Some(true),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Initialization applies the configured defaults.
+        assert!(t.cursor.is_default);
+        assert_eq!(CursorStyle::Bar, t.screens.active.cursor.cursor_style);
+        assert!(t.modes.get(Mode::CursorBlinking));
+
+        // Configuration changes are immediately visible while the cursor still
+        // follows its defaults.
+        t.set_default_cursor_style(CursorStyle::Underline);
+        t.set_default_cursor_blink(Some(false));
+        assert!(t.cursor.is_default);
+        assert_eq!(CursorStyle::Underline, t.screens.active.cursor.cursor_style);
+        assert!(!t.modes.get(Mode::CursorBlinking));
+
+        // Null restores the terminal emulator's blinking default.
+        t.set_default_cursor_blink(None);
+        assert!(t.modes.get(Mode::CursorBlinking));
+    }
+
+    #[test]
+    fn terminal_cursor_defaults_do_not_override_explicit_cursor() {
+        let mut t = init(10, 10);
+
+        t.set_cursor_style(ansi::CursorStyle::BlinkingBar);
+        assert!(!t.cursor.is_default);
+        assert_eq!(CursorStyle::Bar, t.screens.active.cursor.cursor_style);
+        assert!(t.modes.get(Mode::CursorBlinking));
+
+        // New defaults are retained without replacing the explicit appearance.
+        t.set_default_cursor_style(CursorStyle::Underline);
+        t.set_default_cursor_blink(Some(false));
+        assert_eq!(CursorStyle::Underline, t.cursor.default_style);
+        assert_eq!(Some(false), t.cursor.default_blink);
+        assert_eq!(CursorStyle::Bar, t.screens.active.cursor.cursor_style);
+        assert!(t.modes.get(Mode::CursorBlinking));
+
+        // Selecting the default applies the values that changed above.
+        t.set_cursor_style(ansi::CursorStyle::Default);
+        assert!(t.cursor.is_default);
+        assert_eq!(CursorStyle::Underline, t.screens.active.cursor.cursor_style);
+        assert!(!t.modes.get(Mode::CursorBlinking));
+
+        // A full reset also leaves the cursor on the configured defaults.
+        t.set_cursor_style(ansi::CursorStyle::SteadyBlock);
+        t.full_reset();
+        assert!(t.cursor.is_default);
+        assert_eq!(CursorStyle::Underline, t.screens.active.cursor.cursor_style);
+        assert!(!t.modes.get(Mode::CursorBlinking));
+    }
+
+    #[test]
+    fn terminal_fullreset_with_a_non_empty_pen() {
+        let mut t = init(80, 80);
+
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+        t.screens.active.cursor.semantic_content = SemanticContent::Input;
+        t.full_reset();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(t.screens.active.cursor.x, t.screens.active.cursor.y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert!(cell.style_id() == 0);
+        }
+
+        assert_eq!(0, t.screens.active.cursor.style_id);
+        assert_eq!(SemanticContent::Output, t.screens.active.cursor.semantic_content);
+    }
+
+    #[test]
+    fn terminal_fullreset_hyperlink() {
+        let mut t = init(80, 80);
+
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.full_reset();
+        assert_eq!(0, t.screens.active.cursor.hyperlink_id);
+    }
+
+    #[test]
+    fn terminal_fullreset_with_a_non_empty_saved_cursor() {
+        let mut t = init(80, 80);
+
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+        t.save_cursor();
+        t.full_reset();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(t.screens.active.cursor.x, t.screens.active.cursor.y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert!(cell.style_id() == 0);
+        }
+
+        assert_eq!(0, t.screens.active.cursor.style_id);
+    }
+
+    #[test]
+    fn terminal_fullreset_origin_mode() {
+        let mut t = init(10, 10);
+
+        t.set_cursor_pos(3, 5);
+        t.modes.set(Mode::Origin, true);
+        t.full_reset();
+
+        // Origin mode should be reset and the cursor should be moved
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert!(!t.modes.get(Mode::Origin));
+    }
+
+    #[test]
+    fn terminal_fullreset_status_display() {
+        let mut t = init(10, 10);
+
+        t.status_display = ansi::StatusDisplay::StatusLine;
+        t.full_reset();
+        assert!(t.status_display == ansi::StatusDisplay::Main);
+    }
+
+    #[test]
+    fn terminal_fullreset_preserves_kitty_graphics_limits() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let temp_dir = "/tmp/ghostty-kitty-images";
+
+        let mut t = init(10, 10);
+
+        t.set_kitty_graphics_loading_limits(LoadingImageLimits::all_with_temp_dir(temp_dir.as_bytes()));
+        for total_limit in [1234usize, 0] {
+            t.set_kitty_graphics_size_limit(total_limit);
+            t.full_reset();
+
+            let storage = &t.screens.active.kitty_images;
+            assert_eq!(total_limit, storage.total_limit);
+            assert!(storage.image_limits.file);
+            assert!(storage.image_limits.shared_memory);
+            match &storage.image_limits.temporary_file {
+                kitty::graphics_image::TemporaryFile::Enabled { directory } => {
+                    assert_eq!(temp_dir.as_bytes(), &directory[..]);
+                }
+                kitty::graphics_image::TemporaryFile::Disabled => panic!("TestUnexpectedResult"),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_kitty_dirty_changes_on_scrollback_erase_and_limits() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut t = init(10, 10);
+
+        let storage = t.screens.get(ScreenKey::Primary).unwrap();
+
+        let mut dirty = storage.kitty_images.dirty;
+        t.erase_display(csi::EraseDisplay::Scrollback, false);
+        assert!(storage.kitty_images.dirty != dirty);
+
+        dirty = storage.kitty_images.dirty;
+        t.set_scrollback_max_lines(Some(100));
+        assert!(storage.kitty_images.dirty != dirty);
+
+        dirty = storage.kitty_images.dirty;
+        t.set_scrollback_max_bytes(Some(0));
+        assert!(storage.kitty_images.dirty != dirty);
+    }
+
+    #[test]
+    fn terminal_kitty_dirty_differs_across_screen_switch() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut t = init(10, 10);
+
+        // Advance the primary counter past the fresh alternate screen's
+        // value so a naive bump on switch would collide with it.
+        let mut primary = t.screens.get(ScreenKey::Primary).unwrap();
+        primary.kitty_images.mark_dirty();
+        primary.kitty_images.mark_dirty();
+        let primary_dirty = primary.kitty_images.dirty;
+
+        t.switch_screen(ScreenKey::Alternate).unwrap();
+        let alt = &t.screens.active.kitty_images;
+        assert!(alt.dirty != primary_dirty);
+        let alt_dirty = alt.dirty;
+
+        t.switch_screen(ScreenKey::Primary).unwrap();
+        assert!(primary.kitty_images.dirty != primary_dirty);
+        assert!(primary.kitty_images.dirty != alt_dirty);
+    }
+
+    #[test]
+    fn terminal_fullreset_changes_kitty_dirty() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut t = init(10, 10);
+
+        let dirty = t.screens.active.kitty_images.dirty;
+        t.full_reset();
+        assert!(t.screens.active.kitty_images.dirty != dirty);
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1607
+    #[test]
+    fn terminal_fullreset_clears_alt_screen_kitty_keyboard_state() {
+        let mut t = init(10, 10);
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        t.screens.active.kitty_keyboard.push(kitty::key::Flags {
+            disambiguate: true,
+            report_events: false,
+            report_alternates: true,
+            report_all: true,
+            report_associated: true,
+        });
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, false).unwrap();
+
+        t.full_reset();
+        assert!(t.screens.get(ScreenKey::Alternate).is_none());
+    }
+
+    #[test]
+    fn terminal_fullreset_default_modes() {
+        let mut t = Terminal::init(Options {
+            cols: 10,
+            rows: 10,
+            default_modes: {
+                let mut m = ModePacked::default();
+                m.set(Mode::GraphemeCluster, true);
+                m
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(t.modes.get(Mode::GraphemeCluster));
+        t.full_reset();
+        assert!(t.modes.get(Mode::GraphemeCluster));
+    }
+
+    #[test]
+    fn terminal_fullreset_tracked_pins() {
+        let mut t = init(80, 80);
+
+        // Create a tracked pin
+        let pin = *tp(t.screens.active.cursor.page_pin);
+        let p = t.screens.active.pages.track_pin(pin).unwrap();
+        t.full_reset();
+        assert!(t.screens.active.pages.pin_is_valid(*tp(p)));
+    }
+
+    #[test]
+    fn terminal_default_xt_checksum_survives_resets() {
+        let mut t = Terminal::init(Options {
+            cols: 10,
+            rows: 10,
+            default_xt_checksum: xt_checksum::Flags {
+                positive: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(xt_checksum::Flags { positive: true, ..Default::default() }, t.flags.xt_checksum);
+
+        t.flags.xt_checksum = xt_checksum::Flags { full: true, ..Default::default() };
+        t.full_reset();
+        assert_eq!(xt_checksum::Flags { positive: true, ..Default::default() }, t.flags.xt_checksum);
+
+        t.set_default_xt_checksum(xt_checksum::Flags { no_trim: true, ..Default::default() });
+        assert_eq!(xt_checksum::Flags { no_trim: true, ..Default::default() }, t.flags.xt_checksum);
+        t.full_reset();
+        assert_eq!(xt_checksum::Flags { no_trim: true, ..Default::default() }, t.flags.xt_checksum);
+
+        t.flags.xt_checksum = xt_checksum::Flags { full: true, ..Default::default() };
+        t.soft_reset();
+        assert_eq!(xt_checksum::Flags { no_trim: true, ..Default::default() }, t.flags.xt_checksum);
+    }
+
+    #[test]
+    fn terminal_softreset_modes() {
+        let mut t = init(10, 10);
+
+        t.modes.set(Mode::Insert, true);
+        t.modes.set(Mode::Origin, true);
+        t.modes.set(Mode::Wraparound, false);
+        t.modes.set(Mode::ReverseWrap, true);
+        t.modes.set(Mode::CursorVisible, false);
+        t.modes.set(Mode::CursorKeys, true);
+        t.modes.set(Mode::KeypadKeys, true);
+        t.modes.set(Mode::BracketedPaste, true);
+        t.soft_reset();
+
+        assert!(!t.modes.get(Mode::Insert));
+        assert!(!t.modes.get(Mode::Origin));
+        assert!(t.modes.get(Mode::Wraparound));
+        assert!(!t.modes.get(Mode::ReverseWrap));
+        assert!(t.modes.get(Mode::CursorVisible));
+        assert!(!t.modes.get(Mode::CursorKeys));
+        assert!(!t.modes.get(Mode::KeypadKeys));
+
+        // Modes DECSTR doesn't cover are left alone.
+        assert!(t.modes.get(Mode::BracketedPaste));
+    }
+
+    #[test]
+    fn terminal_softreset_margins() {
+        let mut t = init(10, 10);
+
+        t.set_top_and_bottom_margin(3, 4);
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(5, 6);
+        t.soft_reset();
+
+        assert!(!t.modes.get(Mode::EnableLeftAndRightMargin));
+        assert_eq!(ScrollingRegion{
+            top: 0,
+            bottom: 9,
+            left: 0,
+            right: 9,
+        }, t.scrolling_region);
+    }
+
+    #[test]
+    fn terminal_softreset_keeps_the_cursor_and_screen() {
+        let mut t = init(10, 10);
+
+        t.print_string("hello").unwrap();
+        t.set_cursor_pos(6, 5);
+        t.soft_reset();
+
+        assert_eq!(4, t.screens.active.cursor.x);
+        assert_eq!(5, t.screens.active.cursor.y);
+
+        let str = t.plain_string().unwrap();
+        assert_eq!("hello", str);
+    }
+
+    #[test]
+    fn terminal_softreset_saved_cursor() {
+        let mut t = init(10, 10);
+
+        t.set_cursor_pos(6, 5);
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.save_cursor();
+        t.soft_reset();
+        t.restore_cursor();
+
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert!(!t.screens.active.cursor.style.flags.bold);
+    }
+
+    #[test]
+    fn terminal_softreset_pen_protection_and_charsets() {
+        let mut t = init(10, 10);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.set_protected_mode(ansi::ProtectedMode::Dec);
+        t.configure_charset(charsets::Slots::G0, charsets::Charset::DecSpecial);
+        t.soft_reset();
+
+        assert_eq!(0, t.screens.active.cursor.style_id);
+        assert!(!t.screens.active.cursor.protected);
+        assert_eq!(charsets::Charset::Utf8, t.screens.active.charset.charsets.get(charsets::Slots::G0));
+    }
+
+    #[test]
+    fn terminal_softreset_ends_iso_protection_for_erase() {
+        let mut t = init(10, 10);
+
+        t.set_protected_mode(ansi::ProtectedMode::Iso);
+        t.print('A' as u32).unwrap();
+        t.set_protected_mode(ansi::ProtectedMode::Off);
+        t.soft_reset();
+        t.erase_display(csi::EraseDisplay::Complete, false);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+    }
+
+    #[test]
+    fn terminal_softreset_status_display_and_checksum() {
+        let mut t = init(10, 10);
+
+        t.status_display = ansi::StatusDisplay::StatusLine;
+        t.flags.xt_checksum = xt_checksum::Flags { positive: true, ..Default::default() };
+        t.soft_reset();
+
+        assert_eq!(ansi::StatusDisplay::Main, t.status_display);
+        assert_eq!(xt_checksum::Flags::default(), t.flags.xt_checksum);
+    }
+
+    #[test]
+    fn terminal_softreset_palette() {
+        let mut t = init(10, 10);
+
+        // Nothing changed, so nothing is redrawn.
+        t.soft_reset();
+        assert!(!t.flags.dirty.palette);
+
+        let red = color::Rgb { r: 0xff, g: 0, b: 0 };
+        t.colors.palette.set(1, red);
+        t.colors.palette.set(200, red);
+        t.soft_reset();
+
+        assert!(t.flags.dirty.palette);
+        assert_eq!(0, t.colors.palette.mask.count());
+        assert_eq!(color::DEFAULT[1], t.colors.palette.current[1]);
+        assert_eq!(color::DEFAULT[200], t.colors.palette.current[200]);
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/272
+    // This is also tested in depth in screen resize tests but I want to keep
+    // this test around to ensure we don't regress at multiple layers.
+    #[test]
+    fn terminal_resize_less_cols_with_wide_char_then_print() {
+        let mut t = init(3, 3);
+
+        t.print('x' as u32).unwrap();
+        t.print('😀' as u32).unwrap(); // 0x1F600
+        t.resize(Resize::new(2, 3)).unwrap();
+        t.set_cursor_pos(1, 2);
+        t.print('😀' as u32).unwrap(); // 0x1F600
+    }
+
+    #[test]
+    fn terminal_resize_less_cols_without_reflow_cutting_wide_char_tail() {
+        let mut t = init(3, 1);
+
+        t.print('a' as u32).unwrap();
+        t.print('一' as u32).unwrap();
+        t.modes.set(Mode::Wraparound, false);
+        t.resize(Resize::new(2, 1)).unwrap();
+
+        assert!(cl(t.screens.active.pages.get_cell(act(1, 0)).unwrap().cell).is_empty());
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/723
+    // This was found via fuzzing so its highly specific.
+    #[test]
+    fn terminal_resize_with_left_and_right_margin_set() {
+        let cols = 70;
+        let rows = 23;
+        let mut t = init(cols, rows);
+
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.print('0' as u32).unwrap();
+        t.modes.set(Mode::EnableMode3, true);
+        t.resize(Resize::new(cols, rows)).unwrap();
+        t.set_left_and_right_margin(2, 0);
+        t.print_repeat(1850).unwrap();
+        let _ = t.modes.restore(Mode::EnableMode3);
+        t.resize(Resize::new(cols, rows)).unwrap();
+    }
+
+    #[test]
+    fn terminal_resize_without_scrollback_pull() {
+        let mut t = init(5, 3);
+        t.flags.resize_pull_scrollback = false;
+
+        // This is configuration so it should survive a reset.
+        t.full_reset();
+        assert!(!t.flags.resize_pull_scrollback);
+
+        t.print_string("1\n2\n3\n4\n5").unwrap();
+        t.resize(Resize::new(5, 5)).unwrap();
+        assert_eq!(2, t.screens.active.cursor.y);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("3\n4\n5", str);
+        }
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1343
+    #[test]
+    fn terminal_resize_with_wraparound_off() {
+        let cols = 4;
+        let rows = 2;
+        let mut t = init(cols, rows);
+
+        t.modes.set(Mode::Wraparound, false);
+        t.print('0' as u32).unwrap();
+        t.print('1' as u32).unwrap();
+        t.print('2' as u32).unwrap();
+        t.print('3' as u32).unwrap();
+        let new_cols = 2;
+        t.resize(Resize::new(new_cols, rows)).unwrap();
+
+        let str = t.plain_string().unwrap();
+        assert_eq!("01", str);
+    }
+
+    #[test]
+    fn terminal_resize_with_wraparound_on() {
+        let cols = 4;
+        let rows = 2;
+        let mut t = init(cols, rows);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.print('0' as u32).unwrap();
+        t.print('1' as u32).unwrap();
+        t.print('2' as u32).unwrap();
+        t.print('3' as u32).unwrap();
+        let new_cols = 2;
+        t.resize(Resize::new(new_cols, rows)).unwrap();
+
+        let str = t.plain_string().unwrap();
+        assert_eq!("01\n23", str);
+    }
+
+    #[test]
+    fn terminal_resize_with_high_unique_style_per_cell() {
+        let mut t = init(30, 30);
+
+        for y in 0..t.rows {
+            for x in 0..t.cols {
+                t.set_cursor_pos(y as usize, x as usize);
+                t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+                    r: x as _,
+                    g: y as _,
+                    b: 0,
+                })).unwrap();
+                t.print('x' as u32).unwrap();
+            }
+        }
+
+        t.resize(Resize::new(60, 30)).unwrap();
+    }
+
+    #[test]
+    fn terminal_resize_with_high_unique_style_per_cell_with_wrapping() {
+        let mut t = init(30, 30);
+
+        let cell_count: u16 = t.rows * t.cols;
+        for i in 0..cell_count {
+            let r: u8 = (i >> 8) as u8;
+            let g: u8 = (i & 0xFF) as u8;
+
+            t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+                r: r,
+                g: g,
+                b: 0,
+            })).unwrap();
+            t.print('x' as u32).unwrap();
+        }
+
+        t.resize(Resize::new(60, 30)).unwrap();
+    }
+
+    #[test]
+    fn terminal_resize_with_reflow_and_saved_cursor() {
+        let mut t = init(2, 3);
+        t.print_string("1A2B").unwrap();
+        t.set_cursor_pos(2, 2);
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(t.screens.active.cursor.x, t.screens.active.cursor.y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('B' as u32, cell.content_codepoint());
+        }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A\n2B", str);
+        }
+
+        t.save_cursor();
+        t.resize(Resize::new(5, 3)).unwrap();
+        t.restore_cursor();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A2B", str);
+        }
+
+        // Verify our cursor is still in the same place
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(t.screens.active.cursor.x, t.screens.active.cursor.y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('B' as u32, cell.content_codepoint());
+        }
+    }
+
+    #[test]
+    fn terminal_resize_with_reflow_and_saved_cursor_pending_wrap() {
+        let mut t = init(2, 3);
+        t.print_string("1A2B").unwrap();
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(t.screens.active.cursor.x, t.screens.active.cursor.y)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('B' as u32, cell.content_codepoint());
+        }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A\n2B", str);
+        }
+
+        t.save_cursor();
+        t.resize(Resize::new(5, 3)).unwrap();
+        t.restore_cursor();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A2B", str);
+        }
+
+        // Pending wrap should be reset
+        t.print('X' as u32).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A2BX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_saved_cursor_survives_repeated_widening() {
+        let mut t = init(4, 5);
+
+        t.print_string("abc\nAAA|").unwrap();
+        t.save_cursor();
+        t.resize(Resize::new(5, 5)).unwrap();
+        t.resize(Resize::new(6, 5)).unwrap();
+        t.restore_cursor();
+        t.print('X' as u32).unwrap();
+
+        let str = t.plain_string().unwrap();
+        assert_eq!("abc\nAAA|X", str);
+    }
+
+    #[test]
+    fn terminal_resize_pending_wrap_live_and_saved_cursors() {
+        struct Case {
+            text: &'static str,
+            cols: CellCountInt,
+            pending_wrap: bool,
+            expected: &'static str,
+        }
+        let cases = [
+            // Widening leaves room after the formerly full line.
+            Case { text: "ABCD", cols: 6, pending_wrap: false, expected: "ABCDX" },
+            // Narrowing can move the last character into the middle of a row.
+            Case { text: "ABCD", cols: 3, pending_wrap: false, expected: "ABC\nDX" },
+            // Keep pending wrap when the last character still fills a row.
+            Case { text: "ABCD", cols: 2, pending_wrap: true, expected: "AB\nCD\nX" },
+            // A height-only resize also preserves pending wrap.
+            Case { text: "ABCD", cols: 4, pending_wrap: true, expected: "ABCD\nX" },
+            // Reflow can merge previously wrapped rows.
+            Case { text: "ABCDEFGH", cols: 6, pending_wrap: false, expected: "ABCDEF\nGHX" },
+            // A wide character at the old right edge must not be overwritten.
+            Case { text: "AB界", cols: 6, pending_wrap: false, expected: "AB界X" },
+            // A cursor without pending wrap must not advance an extra cell.
+            Case { text: "ABC", cols: 6, pending_wrap: false, expected: "ABCX" },
+        ];
+
+        for case in cases {
+            for restore in [false, true] {
+                let mut t = init(4, 5);
+                t.print_string(case.text).unwrap();
+                if restore { t.save_cursor(); }
+
+                t.resize(Resize::new(case.cols, 6)).unwrap();
+                if restore { t.restore_cursor(); }
+                assert_eq!(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+                t.print('X' as u32).unwrap();
+                let str = t.plain_string().unwrap();
+                assert_eq!(case.expected, str);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_deccolm_without_dec_mode_40() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Column132, true);
+        t.deccolm(DeccolmMode::Cols132).unwrap();
+        assert_eq!(5, t.cols);
+        assert_eq!(5, t.rows);
+        assert!(!t.modes.get(Mode::Column132));
+    }
+
+    #[test]
+    fn terminal_deccolm_unset() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::EnableMode3, true);
+        t.deccolm(DeccolmMode::Cols80).unwrap();
+        assert_eq!(80, t.cols);
+        assert_eq!(5, t.rows);
+    }
+
+    #[test]
+    fn terminal_deccolm_resets_pending_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        t.modes.set(Mode::EnableMode3, true);
+        t.deccolm(DeccolmMode::Cols80).unwrap();
+        assert_eq!(80, t.cols);
+        assert_eq!(5, t.rows);
+        assert!(!t.screens.active.cursor.pending_wrap);
+    }
+
+    #[test]
+    fn terminal_deccolm_preserves_sgr_bg() {
+        let mut t = init(5, 5);
+
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.modes.set(Mode::EnableMode3, true);
+        t.deccolm(DeccolmMode::Cols80).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_deccolm_resets_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_left_and_right_margin(3, 5);
+
+        t.modes.set(Mode::EnableMode3, true);
+        t.deccolm(DeccolmMode::Cols80).unwrap();
+
+        assert!(t.modes.get(Mode::EnableLeftAndRightMargin));
+        assert_eq!(0, t.scrolling_region.top);
+        assert_eq!(4, t.scrolling_region.bottom);
+        assert_eq!(0, t.scrolling_region.left);
+        assert_eq!(79, t.scrolling_region.right);
+    }
+
+    #[test]
+    fn terminal_mode_47_alt_screen_plain() {
+        let mut t = init(5, 5);
+
+        // Print on primary screen
+        t.print_string("1A").unwrap();
+
+        // Go to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode47, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should be empty
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+
+        // Print on alt screen. This should be off center because
+        // we copy the cursor over from the primary screen
+        t.print_string("2B").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  2B", str);
+        }
+
+        // Go back to primary
+        t.switch_screen_mode(SwitchScreenMode::Mode47, false).unwrap();
+        assert_eq!(ScreenKey::Primary, t.screens.active_key);
+
+        // Primary screen should still have the original content
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A", str);
+        }
+
+        // Go back to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode47, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should retain content
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  2B", str);
+        }
+    }
+
+    #[test]
+    fn terminal_mode_47_copies_cursor_both_directions() {
+        let mut t = init(5, 5);
+
+        // Color our cursor red
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+
+        // Go to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode47, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Verify that our style is set
+        {
+            assert!(t.screens.active.cursor.style_id != style::DEFAULT_ID);
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+            assert!(unsafe { page.styles.ref_count(page.memory, t.screens.active.cursor.style_id) } > 0);
+        }
+
+        // Set a new style
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0, g: 0xFF, b: 0 })).unwrap();
+
+        // Go back to primary
+        t.switch_screen_mode(SwitchScreenMode::Mode47, false).unwrap();
+        assert_eq!(ScreenKey::Primary, t.screens.active_key);
+
+        // Verify that our style is still set
+        {
+            assert!(t.screens.active.cursor.style_id != style::DEFAULT_ID);
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+            assert!(unsafe { page.styles.ref_count(page.memory, t.screens.active.cursor.style_id) } > 0);
+        }
+    }
+
+    #[test]
+    fn terminal_mode_1047_alt_screen_plain() {
+        let mut t = init(5, 5);
+
+        // Print on primary screen
+        t.print_string("1A").unwrap();
+
+        // Go to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode1047, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should be empty
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+
+        // Print on alt screen. This should be off center because
+        // we copy the cursor over from the primary screen
+        t.print_string("2B").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  2B", str);
+        }
+
+        // Go back to primary
+        t.switch_screen_mode(SwitchScreenMode::Mode1047, false).unwrap();
+        assert_eq!(ScreenKey::Primary, t.screens.active_key);
+
+        // Primary screen should still have the original content
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A", str);
+        }
+
+        // Go back to alt screen with mode 1047
+        t.switch_screen_mode(SwitchScreenMode::Mode1047, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should be empty
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+    }
+
+    #[test]
+    fn terminal_mode_1047_copies_cursor_both_directions() {
+        let mut t = init(5, 5);
+
+        // Color our cursor red
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0xFF, g: 0, b: 0x7F })).unwrap();
+
+        // Go to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode1047, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Verify that our style is set
+        {
+            assert!(t.screens.active.cursor.style_id != style::DEFAULT_ID);
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+            assert!(unsafe { page.styles.ref_count(page.memory, t.screens.active.cursor.style_id) } > 0);
+        }
+
+        // Set a new style
+        t.set_attribute(sgr::Attribute::DirectColorFg(color::Rgb { r: 0, g: 0xFF, b: 0 })).unwrap();
+
+        // Go back to primary
+        t.switch_screen_mode(SwitchScreenMode::Mode1047, false).unwrap();
+        assert_eq!(ScreenKey::Primary, t.screens.active_key);
+
+        // Verify that our style is still set
+        {
+            assert!(t.screens.active.cursor.style_id != style::DEFAULT_ID);
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+            assert!(unsafe { page.styles.ref_count(page.memory, t.screens.active.cursor.style_id) } > 0);
+        }
+    }
+
+    #[test]
+    fn terminal_mode_1049_alt_screen_plain() {
+        let mut t = init(5, 5);
+
+        // Print on primary screen
+        t.print_string("1A").unwrap();
+
+        // Go to alt screen with mode 47
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should be empty
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+
+        // Print on alt screen. This should be off center because
+        // we copy the cursor over from the primary screen
+        t.print_string("2B").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  2B", str);
+        }
+
+        // Go back to primary
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, false).unwrap();
+        assert_eq!(ScreenKey::Primary, t.screens.active_key);
+
+        // Primary screen should still have the original content
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1A", str);
+        }
+
+        // Write, our cursor should be restored back.
+        t.print_string("C").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1AC", str);
+        }
+
+        // Go back to alt screen with mode 1049
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        assert_eq!(ScreenKey::Alternate, t.screens.active_key);
+
+        // Screen should be empty
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+    }
+
+    // Reproduces a crash found by AFL++ fuzzer (afl-out/stream/default/crashes/
+    // id:000007,sig:06,src:004522). The crash is a page integrity violation
+    // "spacer tail not following wide" triggered during scrollUp -> deleteLines
+    // -> clearCells. When deleteLines count >= scroll region height, all rows
+    // are cleared (no shifting), so rowWillBeShifted is never called and wide
+    // characters straddling the right margin boundary leave orphaned spacer_tails.
+    #[test]
+    fn terminal_deletelines_wide_char_at_right_margin_with_full_clear() {
+        let mut t = init(80, 24);
+
+        // Place a wide character at col 39 (1-indexed) on several rows.
+        // The wide cell lands at col 38 (0-indexed) with spacer_tail at col 39.
+        t.set_cursor_pos(10, 39);
+        t.print(0x4E2D).unwrap(); // '中'
+
+        // Set left/right scroll margins so scrolling_region.right = 38.
+        // clearCells will clear cells[4..39], which includes the wide cell
+        // at col 38 but NOT the spacer_tail at col 39.
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(5, 39);
+
+        // scrollUp with count >= region height causes deleteLines to clear
+        // ALL rows without any shifting, so rowWillBeShifted is never called
+        // and the orphaned spacer_tail at col 39 triggers a page integrity
+        // violation in clearCells.
+        t.scroll_up(t.rows as usize).unwrap();
+    }
+
+    #[test]
+    fn terminal_glyph_apc_stores_session_glossary_entries() {
+        if !build_options::GLYPH_PROTOCOL {
+            return;
+        }
+
+        let mut t = init(80, 24);
+
+        let mut register_parser = glyph::CommandParser::init(1024 * 1024);
+        for byte in "r;cp=e0a0;AAAAAAAAAAAAAA==".bytes() {
+            register_parser.feed(byte).unwrap();
+        }
+        let register_req = register_parser.complete().unwrap();
+
+        assert_eq!(
+            glyph::Response::Register(crate::terminal::apc::glyph::response::Register::ok(0xE0A0)),
+            t.glyph_protocol(&register_req).unwrap()
+        );
+        assert!(t.glyph_glossary.contains(0xE0A0));
+        assert!(t.flags.dirty.glyph_glossary);
+
+        let mut query_parser = glyph::CommandParser::init(1024 * 1024);
+        for byte in "q;cp=e0a0".bytes() {
+            query_parser.feed(byte).unwrap();
+        }
+        let query_req = query_parser.complete().unwrap();
+
+        assert_eq!(
+            glyph::Response::Query(crate::terminal::apc::glyph::response::Query {
+                cp: 0xE0A0,
+                status: crate::terminal::apc::glyph::response::Coverage {
+                    glossary: true,
+                    ..Default::default()
+                },
+            }),
+            t.glyph_protocol(&query_req).unwrap()
+        );
+
+        t.full_reset();
+        assert!(!t.glyph_glossary.contains(0xE0A0));
+    }
+
+    #[test]
+    fn terminal_scroll_region_linefeed_recycled_row_has_default_metadata() {
+        let mut t = init(5, 5);
+
+        // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+        // flags set. Mark row 1 as a prompt as well (OSC 133 A would).
+        for _ in 0..12 { t.print('A' as u32).unwrap(); }
+        rw(t.screens.active.pages.get_cell(act(0, 1)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+
+        // DECSTBM rows 2-4, cursor to the region bottom, and linefeed:
+        // row 1 is discarded and its Row storage recycled as the new
+        // blank region-bottom row.
+        t.set_top_and_bottom_margin(2, 4);
+        t.set_cursor_pos(4, 1);
+        t.linefeed().unwrap();
+
+        {
+            let rac = t.screens.active.pages.get_cell(act(0, 3)).unwrap();
+            assert!(!rw(rac.row).wrap());
+            assert!(!rw(rac.row).wrap_continuation());
+            assert_eq!(RowSemanticPrompt::None, rw(rac.row).semantic_prompt());
+        }
+    }
+
+    #[test]
+    fn terminal_alt_screen_scroll_up_recycled_row_has_default_metadata() {
+        let mut t = init(5, 3);
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+
+        // A soft-wrapped line across rows 0-1 and a prompt mark on row 0.
+        for _ in 0..7 { t.print('A' as u32).unwrap(); }
+        rw(t.screens.active.pages.get_cell(act(0, 0)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+
+        // Scroll up: with no scrollback, row 0 is discarded and its Row
+        // storage recycled as the new blank bottom row.
+        t.scroll_up(1).unwrap();
+
+        {
+            let rac = t.screens.active.pages.get_cell(act(0, 2)).unwrap();
+            assert!(!rw(rac.row).wrap());
+            assert!(!rw(rac.row).wrap_continuation());
+            assert_eq!(RowSemanticPrompt::None, rw(rac.row).semantic_prompt());
+        }
+    }
+
+    #[test]
+    fn terminal_insertlines_count_over_region_blanks_row_metadata() {
+        let mut t = init(5, 5);
+
+        // A soft-wrapped line across rows 0-2 so that row 1 has both wrap
+        // flags set, plus a prompt mark on row 1.
+        for _ in 0..12 { t.print('A' as u32).unwrap(); }
+        rw(t.screens.active.pages.get_cell(act(0, 1)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+
+        // Insert more lines than remain in the region: every row from the
+        // cursor to the region bottom is blanked in place, with no shifts.
+        t.set_cursor_pos(2, 1);
+        t.insert_lines(10);
+
+        for y in 1..5 {
+            let rac = t.screens.active.pages.get_cell(
+                act(0, y),
+            ).unwrap();
+            assert!(!rw(rac.row).wrap());
+            assert!(!rw(rac.row).wrap_continuation());
+            assert_eq!(RowSemanticPrompt::None, rw(rac.row).semantic_prompt());
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_count_over_region_blanks_row_metadata() {
+        let mut t = init(5, 5);
+
+        for _ in 0..12 { t.print('A' as u32).unwrap(); }
+        rw(t.screens.active.pages.get_cell(act(0, 1)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+
+        t.set_cursor_pos(2, 1);
+        t.delete_lines(10);
+
+        for y in 1..5 {
+            let rac = t.screens.active.pages.get_cell(
+                act(0, y),
+            ).unwrap();
+            assert!(!rw(rac.row).wrap());
+            assert!(!rw(rac.row).wrap_continuation());
+            assert_eq!(RowSemanticPrompt::None, rw(rac.row).semantic_prompt());
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_blank_row_does_not_retain_semantic_prompt() {
+        let mut t = init(5, 3);
+
+        // Mark row 0 as a prompt row, then delete it. The blank row that
+        // appears at the region bottom reuses the deleted row's storage
+        // and must not read as a prompt (e.g. for prompt navigation).
+        t.print('$' as u32).unwrap();
+        rw(t.screens.active.pages.get_cell(act(0, 0)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(1);
+
+        {
+            let rac = t.screens.active.pages.get_cell(act(0, 2)).unwrap();
+            assert!(!rw(rac.row).wrap());
+            assert!(!rw(rac.row).wrap_continuation());
+            assert_eq!(RowSemanticPrompt::None, rw(rac.row).semantic_prompt());
+        }
+    }
+
+    #[test]
+    fn terminal_erasedisplay_complete_ignores_stale_prompt_on_recycled_row() {
+        let mut t = init(10, 3);
+
+        // Screen content that must NOT enter the scrollback on a clear.
+        t.print_string("hello").unwrap();
+
+        // Mark row 1 as a prompt row and then discard it with a region
+        // scroll, recycling its storage as the blank bottom row.
+        rw(t.screens.active.pages.get_cell(act(0, 1)).unwrap().row).set_semantic_prompt(RowSemanticPrompt::Prompt);
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(3, 1);
+        t.linefeed().unwrap();
+        t.set_top_and_bottom_margin(0, 0);
+
+        // ED2: since no prompt is on screen, this must NOT take the
+        // scroll-and-clear path that pushes content into scrollback. A
+        // stale prompt flag on the recycled blank bottom row would.
+        t.erase_display(csi::EraseDisplay::Complete, false);
+
+        assert_eq!(t.screens.active.pages.rows as usize, t.screens.active.pages.total_rows);
+    }
+
+    #[test]
+    fn terminal_erasedisplay_complete_at_prompt_not_on_last_row_scrolls() {
+        let mut t = init(10, 15);
+
+        // Command output, then a prompt in the middle of the screen with
+        // blank rows below it, like `seq 1 10` in a fresh tall window.
+        for _ in 0..10 {
+            t.print_string("x").unwrap();
+            t.carriage_return();
+            t.linefeed().unwrap();
+        }
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::PromptStart)).unwrap();
+        t.print_string("$ ").unwrap();
+        t.semantic_prompt(&osc::SemanticPrompt::init(osc_sp::Action::EndPromptStartInput)).unwrap();
+
+        // What bash/zsh send for clear-screen
+        t.set_cursor_pos(1, 1);
+        t.erase_display(csi::EraseDisplay::Complete, false);
+
+        assert!(t.screens.active.pages.total_rows > t.screens.active.pages.rows as usize);
+    }
 }
