@@ -128,6 +128,13 @@ impl Default for Style {
     }
 }
 
+crate::cli::args::impl_cli_enum!(Style {
+    Regular => "regular",
+    Bold => "bold",
+    Italic => "italic",
+    BoldItalic => "bold_italic",
+});
+
 /// The presentation for an emoji.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -135,6 +142,11 @@ pub enum Presentation {
     Text = 0,  // U+FE0E
     Emoji = 1, // U+FEOF
 }
+
+crate::cli::args::impl_cli_enum!(Presentation {
+    Text => "text",
+    Emoji => "emoji",
+});
 
 /// A FontIndex that can be used to use the sprite font directly.
 pub const SPRITE_INDEX: collection::Index = collection::Index::init_special(collection::Special::Sprite);
