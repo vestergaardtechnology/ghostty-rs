@@ -2626,3 +2626,2049 @@ fn div_ceil(numerator: u32, denominator: u32) -> u32 {
     }
     numerator.div_ceil(denominator)
 }
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    //! A minimal stand-in for `Terminal` in the storage tests: the same
+    //! field paths (`t.screens.active.pages`, `t.width_px`, ...) the Zig
+    //! tests use, backed by a single screen.
+    //!
+    //! TODO(port-terminal): replace with `crate::terminal::Terminal`.
+
+    use super::*;
+    use crate::terminal::screen::{self, Screen};
+
+    pub struct TestScreens {
+        pub active: Screen,
+    }
+
+    pub struct TestTerminal {
+        pub screens: TestScreens,
+        pub cols: CellCountInt,
+        pub rows: CellCountInt,
+        pub width_px: u32,
+        pub height_px: u32,
+        pub scrolling_region: ScrollingRegion,
+    }
+
+    /// `Terminal.init(io, alloc, .{ .cols = cols, .rows = rows })`
+    pub fn init(cols: CellCountInt, rows: CellCountInt) -> TestTerminal {
+        init_scrollback(cols, rows, Some(10_000))
+    }
+
+    /// `Terminal.init` with `.max_scrollback_bytes`.
+    pub fn init_scrollback(
+        cols: CellCountInt,
+        rows: CellCountInt,
+        max_scrollback_bytes: Option<usize>,
+    ) -> TestTerminal {
+        let active = Screen::init(screen::Options {
+            cols,
+            rows,
+            max_scrollback_bytes,
+            max_scrollback_lines: None,
+            kitty_image_storage_limit: 320 * 1000 * 1000,
+            kitty_image_loading_limits: LoadingImageLimits::DIRECT,
+        })
+        .unwrap();
+        TestTerminal {
+            screens: TestScreens { active },
+            cols,
+            rows,
+            width_px: 0,
+            height_px: 0,
+            scrolling_region: TerminalInfo::new(cols, rows).scrolling_region,
+        }
+    }
+
+    /// The [`TerminalInfo`] of the terminal.
+    pub fn info(t: &TestTerminal) -> TerminalInfo {
+        TerminalInfo {
+            cols: t.cols,
+            rows: t.rows,
+            width_px: t.width_px,
+            height_px: t.height_px,
+            scrolling_region: t.scrolling_region,
+            cursor_x: t.screens.active.cursor.x,
+            cursor_y: t.screens.active.cursor.y,
+        }
+    }
+
+    /// Our pin for the placement (Zig: `trackPin`).
+    pub fn track_pin(t: &mut TestTerminal, x: CellCountInt, y: u32) -> PinPtr {
+        let pages = &mut t.screens.active.pages;
+        let p = pages
+            .pin(point::Point::Active(point::Coordinate { x, y }))
+            .unwrap();
+        pages.track_pin(p).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{info, init, track_pin, TestTerminal};
+    use super::*;
+    use crate::terminal::kitty::graphics_command::{
+        DeleteAction, DeleteColumn, DeleteId, DeleteIntersectCell, DeleteRange, DeleteRow, Format,
+    };
+    use crate::terminal::kitty::graphics_image::Metadata;
+
+    /// A bunch of stars for a bunch of tests
+    fn stars() -> Vec<u8> {
+        vec![b'*'; 64]
+    }
+
+    fn img(id: u32) -> Image {
+        Image {
+            id,
+            ..Default::default()
+        }
+    }
+
+    fn img_wh(id: u32, width: u32, height: u32) -> Image {
+        Image {
+            id,
+            width,
+            height,
+            ..Default::default()
+        }
+    }
+
+    fn pin_placement(t: &mut TestTerminal, x: CellCountInt, y: u32) -> Placement {
+        Placement::new(Location::Pin(track_pin(t, x, y)))
+    }
+
+    fn external(image_id: u32, id: u32) -> PlacementKey {
+        PlacementKey {
+            image_id,
+            placement_id: PlacementId {
+                tag: PlacementTag::External,
+                id,
+            },
+        }
+    }
+
+    fn internal(image_id: u32, id: u32) -> PlacementKey {
+        PlacementKey {
+            image_id,
+            placement_id: PlacementId {
+                tag: PlacementTag::Internal,
+                id,
+            },
+        }
+    }
+
+    fn pin_of(p: &Placement) -> PinPtr {
+        match p.location {
+            Location::Pin(pin) => pin,
+            _ => panic!("not a pin placement"),
+        }
+    }
+
+    fn add(s: &mut ImageStorage, t: &mut TestTerminal, image: Image) {
+        s.add_image(&mut t.screens.active.pages, image).unwrap();
+    }
+
+    fn place(s: &mut ImageStorage, t: &mut TestTerminal, image_id: u32, placement_id: u32, p: Placement) {
+        s.add_placement(&mut t.screens.active.pages, image_id, placement_id, p)
+            .unwrap();
+    }
+
+    fn delete(s: &mut ImageStorage, t: &mut TestTerminal, cmd: DeleteAction) {
+        let ti = info(t);
+        s.delete(&mut t.screens.active.pages, &ti, cmd);
+    }
+
+    fn delete_id(image_id: u32, placement_id: u32, delete: bool) -> DeleteAction {
+        DeleteAction::Id(DeleteId {
+            delete,
+            image_id,
+            placement_id,
+        })
+    }
+
+    fn range(first: u32, last: u32, delete: bool) -> DeleteAction {
+        DeleteAction::Range(DeleteRange { delete, first, last })
+    }
+
+    fn tracked(t: &TestTerminal) -> usize {
+        t.screens.active.pages.count_tracked_pins()
+    }
+
+    #[test]
+    fn storage_add_placement_with_zero_placement_id() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 50, 50));
+        add(&mut s, &mut t, img_wh(2, 25, 25));
+        let p = pin_placement(&mut t, 25, 25);
+        place(&mut s, &mut t, 1, 0, p);
+        let p = pin_placement(&mut t, 25, 25);
+        place(&mut s, &mut t, 1, 0, p);
+
+        assert_eq!(2, s.placements.len());
+        assert_eq!(2, s.images.len());
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&internal(1, 0)));
+        assert!(s.placements.contains_key(&internal(1, 1)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_replacing_placement_releases_tracked_pin() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+
+        let before = tracked(&t);
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        assert_eq!(before + 1, tracked(&t));
+
+        let replacement_pin = track_pin(&mut t, 2, 2);
+        place(&mut s, &mut t, 1, 1, Placement::new(Location::Pin(replacement_pin)));
+        assert_eq!(1, s.placements.len());
+        assert_eq!(before + 1, tracked(&t));
+        assert_eq!(replacement_pin, pin_of(&s.placements[&external(1, 1)]));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_adding_placement_reclaims_garbage_placements() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+
+        let before = tracked(&t);
+        let old_pin = track_pin(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 0, Placement::new(Location::Pin(old_pin)));
+        // SAFETY: the pin is tracked.
+        unsafe { (*old_pin.as_ptr()).garbage = true };
+
+        let new_pin = track_pin(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 0, Placement::new(Location::Pin(new_pin)));
+
+        assert_eq!(1, s.placements.len());
+        assert_eq!(before + 1, tracked(&t));
+        assert_eq!(new_pin, pin_of(&s.placements[&internal(1, 1)]));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_placement_count_limit_permits_replacement() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        place(&mut s, &mut t, 1, 1, Placement::new(Location::Virtual));
+
+        s.images.get_mut(&1).unwrap().metadata.placement_count = Metadata::MAX_PLACEMENT_COUNT;
+        place(&mut s, &mut t, 1, 1, Placement::new(Location::Virtual));
+        assert_eq!(
+            Err(AllocError::OutOfMemory),
+            s.add_placement(&mut t.screens.active.pages, 1, 2, Placement::new(Location::Virtual))
+        );
+        assert_eq!(1, s.placements.len());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn three_images_two_placed(s: &mut ImageStorage, t: &mut TestTerminal) {
+        add(s, t, img(1));
+        add(s, t, img(2));
+        add(s, t, img(3));
+        let p = pin_placement(t, 1, 1);
+        place(s, t, 1, 1, p);
+        let p = pin_placement(t, 1, 1);
+        place(s, t, 2, 1, p);
+    }
+
+    #[test]
+    fn storage_delete_all_visible_placements_and_matching_images() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.images.len());
+        assert!(s.images.contains_key(&3));
+        assert_eq!(0, s.placements.len());
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_all_placements_and_images_preserves_limit() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        s.total_limit = 5000;
+        three_images_two_placed(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.images.len());
+        assert!(s.images.contains_key(&3));
+        assert_eq!(0, s.placements.len());
+        assert_eq!(5000, s.total_limit);
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_all_placements() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::All(false));
+        assert!(s.dirty != dirty);
+        assert_eq!(0, s.placements.len());
+        assert_eq!(3, s.images.len());
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_all_placements_by_image_id() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(2, 0, false));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(3, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_all_placements_by_image_id_and_unused_images() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(2, 0, true));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(2, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_placement_by_specific_id() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        add(&mut s, &mut t, img(2));
+        add(&mut s, &mut t, img(3));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 2, p);
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 2, 1, p);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(1, 2, true));
+        assert!(s.dirty != dirty);
+        assert_eq!(2, s.placements.len());
+        assert_eq!(3, s.images.len());
+        assert_eq!(before + 2, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_uppercase_id_delete_preserves_image_when_placement_does_not_match() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+
+        let dirty = s.dirty;
+        let generation = s.generation;
+        delete(&mut s, &mut t, delete_id(1, 7, true));
+
+        assert!(s.image_by_id(1).is_some());
+        assert_eq!(dirty, s.dirty);
+        assert_eq!(generation, s.generation);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_uppercase_id_delete_frees_image_after_placement_matches() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 9, p);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(1, 9, true));
+
+        assert_eq!(0, s.placements.len());
+        assert_eq!(0, s.images.len());
+        assert!(s.dirty != dirty);
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_uppercase_id_delete_without_placement_frees_unplaced_image() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(1, 0, true));
+
+        assert_eq!(0, s.images.len());
+        assert!(s.dirty != dirty);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn two_images_two_placements_100(s: &mut ImageStorage, t: &mut TestTerminal) {
+        add(s, t, img_wh(1, 50, 50));
+        add(s, t, img_wh(2, 25, 25));
+        let p = pin_placement(t, 0, 0);
+        place(s, t, 1, 1, p);
+        let p = pin_placement(t, 25, 25);
+        place(s, t, 1, 2, p);
+    }
+
+    #[test]
+    fn storage_delete_intersecting_cursor() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        two_images_two_placements_100(&mut s, &mut t);
+
+        t.screens.active.cursor_absolute(12, 12);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::IntersectCursor(false));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(2, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 2)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_intersecting_cursor_checks_interior_row_column() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 20, 0);
+        place(&mut s, &mut t, 1, 2, p);
+
+        // This is inside the right placement and on an interior row shared by
+        // both placements, but it is outside the left placement's columns.
+        t.screens.active.cursor_absolute(21, 5);
+        delete(&mut s, &mut t, DeleteAction::IntersectCursor(false));
+
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&external(1, 1)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_intersecting_cell_checks_interior_row_column() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 20, 0);
+        place(&mut s, &mut t, 1, 2, p);
+
+        // Protocol coordinates are one-based, so this targets grid cell (21, 5).
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::IntersectCell(DeleteIntersectCell {
+                x: 22,
+                y: 6,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&external(1, 1)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_intersecting_cursor_plus_unused() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        two_images_two_placements_100(&mut s, &mut t);
+
+        t.screens.active.cursor_absolute(12, 12);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::IntersectCursor(true));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(2, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 2)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_intersecting_cursor_hits_multiple() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        two_images_two_placements_100(&mut s, &mut t);
+
+        t.screens.active.cursor_absolute(26, 26);
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, DeleteAction::IntersectCursor(true));
+        assert!(s.dirty != dirty);
+        assert_eq!(0, s.placements.len());
+        assert_eq!(1, s.images.len());
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_by_column() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        two_images_two_placements_100(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::Column(DeleteColumn {
+                delete: false,
+                x: 60,
+            }),
+        );
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(2, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 1)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_by_column_1x1() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 1, 0);
+        place(&mut s, &mut t, 1, 2, p);
+        let p = pin_placement(&mut t, 2, 0);
+        place(&mut s, &mut t, 1, 3, p);
+
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::Column(DeleteColumn {
+                delete: false,
+                x: 2,
+            }),
+        );
+        assert_eq!(2, s.placements.len());
+        assert_eq!(1, s.images.len());
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 1)));
+        assert!(s.placements.contains_key(&external(1, 3)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_by_row() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        two_images_two_placements_100(&mut s, &mut t);
+
+        let dirty = s.dirty;
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::Row(DeleteRow {
+                delete: false,
+                y: 60,
+            }),
+        );
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.placements.len());
+        assert_eq!(2, s.images.len());
+        assert_eq!(before + 1, tracked(&t));
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 1)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_by_row_1x1() {
+        let mut t = init(100, 100);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 0, 1);
+        place(&mut s, &mut t, 1, 2, p);
+        let p = pin_placement(&mut t, 0, 2);
+        place(&mut s, &mut t, 1, 3, p);
+
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::Row(DeleteRow {
+                delete: false,
+                y: 2,
+            }),
+        );
+        assert_eq!(2, s.placements.len());
+        assert_eq!(1, s.images.len());
+
+        // verify the placement is what we expect
+        assert!(s.placements.contains_key(&external(1, 1)));
+        assert!(s.placements.contains_key(&external(1, 3)));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_images_by_range_1() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+        assert_eq!(3, s.images.len());
+        assert_eq!(2, s.placements.len());
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, range(1, 2, false));
+        assert!(s.dirty != dirty);
+        assert_eq!(3, s.images.len());
+        assert_eq!(0, s.placements.len());
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_images_by_range_2() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_two_placed(&mut s, &mut t);
+        assert_eq!(3, s.images.len());
+        assert_eq!(2, s.placements.len());
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, range(1, 2, true));
+        assert!(s.dirty != dirty);
+        assert_eq!(1, s.images.len());
+        assert_eq!(0, s.placements.len());
+        assert_eq!(before, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn three_images_three_placed(s: &mut ImageStorage, t: &mut TestTerminal) {
+        three_images_two_placed(s, t);
+        let p = pin_placement(t, 1, 1);
+        place(s, t, 3, 1, p);
+    }
+
+    #[test]
+    fn storage_delete_images_by_range_3() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_three_placed(&mut s, &mut t);
+        assert_eq!(3, s.images.len());
+        assert_eq!(3, s.placements.len());
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, range(2, 2, false));
+        assert!(s.dirty != dirty);
+        assert_eq!(3, s.images.len());
+        assert_eq!(2, s.placements.len());
+        assert!(s.placements.contains_key(&external(1, 1)));
+        assert!(s.placements.contains_key(&external(3, 1)));
+        assert_eq!(before + 2, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_images_by_range_4() {
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        three_images_three_placed(&mut s, &mut t);
+        assert_eq!(3, s.images.len());
+        assert_eq!(3, s.placements.len());
+
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, range(2, 2, true));
+        assert!(s.dirty != dirty);
+        assert_eq!(2, s.images.len());
+        assert_eq!(2, s.placements.len());
+        assert!(s.placements.contains_key(&external(1, 1)));
+        assert!(s.placements.contains_key(&external(3, 1)));
+        assert_eq!(before + 2, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_uppercase_range_deletes_unplaced_image_data() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        add(&mut s, &mut t, img(2));
+        add(&mut s, &mut t, img(3));
+
+        // Zero is the default lower bound when x is omitted.
+        delete(&mut s, &mut t, range(0, 2, true));
+        assert_eq!(1, s.images.len());
+        assert!(s.images.contains_key(&3));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_images_by_empty_range() {
+        // Ranges that select nothing are a silent no-op, matching kitty, which
+        // performs no validation and filters with `x <= image_id <= y`.
+        let mut t = init(3, 3);
+        let before = tracked(&t);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        add(&mut s, &mut t, img(2));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 2, 1, p);
+
+        // Inverted range.
+        delete(&mut s, &mut t, range(5, 4, true));
+        assert_eq!(2, s.images.len());
+        assert_eq!(2, s.placements.len());
+
+        // Upper bound omitted, so it defaults to zero.
+        delete(&mut s, &mut t, range(5, 0, true));
+        assert_eq!(2, s.images.len());
+        assert_eq!(2, s.placements.len());
+
+        // Both bounds omitted. Image IDs are never zero so this matches nothing.
+        delete(&mut s, &mut t, range(0, 0, true));
+        assert_eq!(2, s.images.len());
+        assert_eq!(2, s.placements.len());
+
+        // Both placements survive, so both of their pins are still tracked.
+        assert_eq!(before + 2, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_cell_offsets_stay_within_explicit_destination_rectangle() {
+        let mut t = init(5, 5);
+        t.width_px = 50; // 10 px per col
+        t.height_px = 100; // 20 px per row
+        let ti = info(&t);
+
+        // Explicit columns and rows describe the far cell boundaries. Offsets
+        // move the near edge inward without moving those far edges.
+        let placement = Placement {
+            x_offset: 3,
+            y_offset: 4,
+            columns: 2,
+            rows: 1,
+            ..Placement::new(Location::Virtual)
+        };
+        let image = img_wh(0, 4, 3);
+        let actual = placement.pixel_size(&image, &ti);
+        assert_eq!(17u32, actual.width);
+        assert_eq!(16u32, actual.height);
+        assert_eq!(2u32, placement.grid_size(&image, &ti).cols);
+        assert_eq!(1u32, placement.grid_size(&image, &ti).rows);
+    }
+
+    #[test]
+    fn storage_cell_offsets_clamp_to_cell_bounds() {
+        let mut t = init(5, 5);
+        t.width_px = 50; // 10 px per col
+        t.height_px = 100; // 20 px per row
+        let ti = info(&t);
+
+        let placement = Placement {
+            x_offset: u32::MAX,
+            y_offset: u32::MAX,
+            columns: 1,
+            rows: 1,
+            ..Placement::new(Location::Virtual)
+        };
+        let offset = placement.cell_offset(&ti);
+        assert_eq!(9u32, offset.x);
+        assert_eq!(19u32, offset.y);
+
+        // Even hostile offsets leave one pixel inside the requested cell.
+        let actual = placement.pixel_size(&img_wh(0, 1, 1), &ti);
+        assert_eq!(1u32, actual.width);
+        assert_eq!(1u32, actual.height);
+    }
+
+    #[test]
+    fn storage_aspect_ratio_calculation_when_only_columns_or_rows_specified() {
+        let mut t = init(100, 100);
+        t.width_px = 1000; // 10 px per col
+        t.height_px = 2000; // 20 px per row
+        let ti = info(&t);
+
+        // Case 1: Only columns specified
+        {
+            let image = img_wh(1, 16, 9);
+            let placement = Placement {
+                columns: 10,
+                rows: 0,
+                ..Placement::new(Location::Virtual)
+            };
+
+            // Image is 16x9, set to a width of 10 columns, at 10px per column
+            // that's 100px width. 100px * (9 / 16) = 56.25, which should round
+            // to a height of 56px.
+
+            let calc_size = placement.pixel_size(&image, &ti);
+            assert_eq!(100u32, calc_size.width);
+            assert_eq!(56u32, calc_size.height);
+        }
+
+        // Case 2: Only rows specified
+        {
+            let image = img_wh(2, 16, 9);
+            let placement = Placement {
+                columns: 0,
+                rows: 5,
+                ..Placement::new(Location::Virtual)
+            };
+
+            // Image is 16x9, set to a height of 5 rows, at 20px per row that's
+            // 100px height. 100px * (16 / 9) = 177.77..., which should round to
+            // a width of 178px.
+
+            let calc_size = placement.pixel_size(&image, &ti);
+            assert_eq!(178u32, calc_size.width);
+            assert_eq!(100u32, calc_size.height);
+        }
+    }
+
+    #[test]
+    fn storage_default_source_rectangle_is_intersected_before_sizing() {
+        let t = init(5, 5);
+        let ti = info(&t);
+
+        let placement = Placement {
+            source_x: 3,
+            source_y: 1,
+            ..Placement::new(Location::Virtual)
+        };
+        let actual = placement.pixel_size(&img_wh(0, 4, 3), &ti);
+        assert_eq!(1u32, actual.width);
+        assert_eq!(2u32, actual.height);
+    }
+
+    #[test]
+    fn storage_explicit_source_rectangle_is_intersected_before_sizing() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+        let ti = info(&t);
+
+        // The requested 8x8 rectangle intersects this 10x10 image as 2x3.
+        // With a two-column destination, the clipped 2:3 aspect ratio produces
+        // a 20x30 pixel destination.
+        let placement = Placement {
+            source_x: 8,
+            source_y: 7,
+            source_width: 8,
+            source_height: 8,
+            columns: 2,
+            ..Placement::new(Location::Virtual)
+        };
+        let actual = placement.pixel_size(&img_wh(0, 10, 10), &ti);
+        assert_eq!(20u32, actual.width);
+        assert_eq!(30u32, actual.height);
+    }
+
+    #[test]
+    fn storage_placement_geometry_handles_untrusted_dimensions() {
+        let max = u32::MAX;
+
+        let mut t = init(2, 2);
+        t.width_px = max;
+        t.height_px = max;
+        let one = img_wh(0, 1, 1);
+
+        // Cell dimensions multiplied by protocol-controlled row and column
+        // counts saturate instead of panicking or wrapping.
+        {
+            let placement = Placement {
+                columns: 3,
+                rows: 3,
+                ..Placement::new(Location::Virtual)
+            };
+            let actual = placement.pixel_size(&one, &info(&t));
+            assert_eq!(max, actual.width);
+            assert_eq!(max, actual.height);
+        }
+
+        // Aspect-ratio scaling also saturates when the derived dimension does
+        // not fit in the public u32 geometry type.
+        {
+            let placement = Placement {
+                columns: 3,
+                source_height: max,
+                ..Placement::new(Location::Virtual)
+            };
+            let actual = placement.pixel_size(&one, &info(&t));
+            assert_eq!(max, actual.width);
+            assert_eq!(max, actual.height);
+        }
+        {
+            let placement = Placement {
+                rows: 3,
+                source_width: max,
+                ..Placement::new(Location::Virtual)
+            };
+            let actual = placement.pixel_size(&one, &info(&t));
+            assert_eq!(max, actual.width);
+            assert_eq!(max, actual.height);
+        }
+
+        // Pixel offsets are protocol-controlled too. Clamp them to the cell
+        // before including them in grid geometry.
+        t.width_px = 2;
+        t.height_px = 2;
+        {
+            let placement = Placement {
+                x_offset: max,
+                y_offset: max,
+                ..Placement::new(Location::Virtual)
+            };
+            let actual = placement.grid_size(&one, &info(&t));
+            assert_eq!(1u32, actual.cols);
+            assert_eq!(1u32, actual.rows);
+        }
+
+        let pin = track_pin(&mut t, 0, 0);
+
+        // Explicit maximum dimensions must clamp the rectangle to the terminal
+        // without overflowing its horizontal extent.
+        {
+            let placement = Placement {
+                columns: max,
+                rows: 1,
+                ..Placement::new(Location::Pin(pin))
+            };
+            let rect = placement.rect(&one, &info(&t)).unwrap();
+            assert_eq!(1 as CellCountInt, rect.bottom_right.x);
+        }
+
+        // A garbage pin represents content that has been pruned from retained
+        // history. Its fallback location must not make the placement visible.
+        // SAFETY: the pin is tracked.
+        unsafe { (*pin.as_ptr()).garbage = true };
+        {
+            let placement = Placement {
+                columns: 1,
+                rows: 1,
+                ..Placement::new(Location::Pin(pin))
+            };
+            assert!(placement.rect(&one, &info(&t)).is_none());
+        }
+        // SAFETY: the pin is tracked.
+        unsafe { (*pin.as_ptr()).garbage = false };
+
+        // Terminals can temporarily have no pixel geometry. A placement whose
+        // computed grid is empty has no rectangle, so rect must not subtract one
+        // from a zero row count.
+        t.width_px = 0;
+        t.height_px = 0;
+        {
+            let placement = Placement {
+                columns: 1,
+                ..Placement::new(Location::Pin(pin))
+            };
+            let actual = placement.grid_size(&one, &info(&t));
+            assert_eq!(0u32, actual.cols);
+            assert_eq!(0u32, actual.rows);
+            assert!(placement.rect(&one, &info(&t)).is_none());
+        }
+
+        t.screens.active.pages.untrack_pin(pin);
+    }
+
+    #[test]
+    fn storage_generation_stamps_on_image_add_and_replace() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        // Fresh storage has generation zero (never mutated).
+        assert_eq!(0u64, s.generation);
+
+        add(&mut s, &mut t, img_wh(1, 1, 1));
+        let gen1 = s.generation;
+        assert!(gen1 > 0);
+
+        let img1 = s.image_by_id(1).unwrap();
+        assert_eq!(gen1, img1.generation);
+
+        // A second image gets a strictly greater stamp.
+        add(&mut s, &mut t, img_wh(2, 1, 1));
+        let gen2 = s.generation;
+        assert!(gen2 > gen1);
+        assert_eq!(gen2, s.image_by_id(2).unwrap().generation);
+
+        // Retransmitting the same image ID (identical dimensions) gets a
+        // fresh stamp: this is what makes same-sized retransmissions
+        // detectable by renderers.
+        add(&mut s, &mut t, img_wh(1, 1, 1));
+        let gen3 = s.generation;
+        assert!(gen3 > gen2);
+        assert_eq!(gen3, s.image_by_id(1).unwrap().generation);
+
+        // Image 2 kept its stamp.
+        assert_eq!(gen2, s.image_by_id(2).unwrap().generation);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_generation_bumps_on_placement_and_delete() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        let gen_add = s.generation;
+
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        let gen_place = s.generation;
+        assert!(gen_place > gen_add);
+
+        // Reads don't change the generation.
+        let _ = s.image_by_id(1);
+        let _ = s.image_by_number(1);
+        assert_eq!(gen_place, s.generation);
+
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert!(s.generation > gen_place);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_generation_bumps_when_set_limit_evicts_or_disables() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 1,
+                width: 1,
+                height: 1,
+                data: Data::Complete(b"1234".to_vec()),
+                ..Default::default()
+            },
+        );
+        let gen_add = s.generation;
+
+        // Lowering the limit evicts the image and must mark a mutation.
+        let dirty_add = s.dirty;
+        s.set_limit(&mut t.screens.active.pages, 1);
+        assert!(s.dirty != dirty_add);
+        assert!(s.generation > gen_add);
+        assert_eq!(0, s.images.len());
+        let gen_evict = s.generation;
+
+        // Disabling (limit=0) resets the storage and must mark a mutation.
+        let dirty_evict = s.dirty;
+        s.set_limit(&mut t.screens.active.pages, 0);
+        assert!(s.dirty != dirty_evict);
+        assert!(s.generation > gen_evict);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn numbered(id: u32, number: u32) -> Image {
+        Image {
+            id,
+            number,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn storage_image_by_number_returns_most_recently_transmitted() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        // Two images sharing a number: the newest transmission wins,
+        // regardless of insertion order or clock resolution.
+        add(&mut s, &mut t, numbered(1, 7));
+        add(&mut s, &mut t, numbered(2, 7));
+        assert_eq!(2u32, s.image_by_number(7).unwrap().id);
+
+        // Retransmit the first: it becomes the newest.
+        add(&mut s, &mut t, numbered(1, 7));
+        assert_eq!(1u32, s.image_by_number(7).unwrap().id);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_next_generation_is_unique_and_monotonic() {
+        let a = next_generation();
+        let b = next_generation();
+        assert!(b > a);
+        assert!(a > 0);
+    }
+
+    #[test]
+    fn storage_no_op_delete_does_not_mark_a_mutation() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        // A delete-all on an empty storage (this runs on every screen
+        // clear) must not dirty the state or bump the generation.
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert_eq!(0u64, s.dirty);
+        assert_eq!(0u64, s.generation);
+
+        // Same for a delete that matches nothing.
+        add(&mut s, &mut t, img(1));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        let gen = s.generation;
+        let dirty = s.dirty;
+        delete(&mut s, &mut t, delete_id(42, 0, false));
+        assert_eq!(dirty, s.dirty);
+        assert_eq!(gen, s.generation);
+
+        // But a delete that removes something does mark a mutation.
+        delete(&mut s, &mut t, delete_id(1, 0, false));
+        assert!(s.dirty != dirty);
+        assert!(s.generation > gen);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn stars_image(id: u32, transient: bool) -> Image {
+        Image {
+            id,
+            data: Data::Complete(stars()),
+            metadata: Metadata {
+                transient,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn storage_evicts_images_in_priority_order() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 192,
+            ..Default::default()
+        };
+
+        add(&mut s, &mut t, stars_image(1, false));
+        add(&mut s, &mut t, stars_image(2, true));
+        add(&mut s, &mut t, stars_image(3, true));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 2, 1, p);
+
+        let gen = s.generation;
+        let dirty = s.dirty;
+        let result = s.evict_image(&mut t.screens.active.pages, 96);
+        assert!(s.dirty != dirty);
+        assert!(s.generation > gen);
+        assert!(result);
+        assert_eq!(1, s.images.len());
+        assert!(!s.images.contains_key(&1));
+        assert!(s.images.contains_key(&2));
+        assert!(!s.images.contains_key(&3));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_eviction_releases_placement_pins() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 128,
+            ..Default::default()
+        };
+
+        let before = tracked(&t);
+        add(&mut s, &mut t, stars_image(1, false));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        add(&mut s, &mut t, stars_image(2, false));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 2, 1, p);
+        assert_eq!(before + 2, tracked(&t));
+
+        // Adding a third image evicts the oldest equally-ranked image and its
+        // placement. The newer image's placement and tracked pin remain intact.
+        add(&mut s, &mut t, stars_image(3, false));
+        assert!(!s.images.contains_key(&1));
+        assert!(s.images.contains_key(&2));
+        assert!(s.images.contains_key(&3));
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&external(2, 1)));
+        assert_eq!(before + 1, tracked(&t));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    fn pending_image(id: u32, len: usize) -> Image {
+        Image {
+            id,
+            data: Data::Pending(len),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn storage_pending_image_completes_once_and_preserves_age() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 16,
+            ..Default::default()
+        };
+
+        let pending = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    number: 7,
+                    width: 2,
+                    height: 2,
+                    format: Format::Rgba,
+                    ..pending_image(1, 16)
+                },
+            )
+            .unwrap();
+        assert_eq!(16usize, s.total_bytes);
+        assert_eq!(1u32, s.image_by_number(7).unwrap().id);
+        assert!(s.image_by_id(1).unwrap().data.is_pending());
+
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        assert_eq!(1, s.placements.len());
+
+        let wrong = b"short".to_vec();
+        assert!(pending.complete(&mut s, wrong).is_err());
+
+        let storage_generation = s.generation;
+        let image_generation = s.image_by_id(1).unwrap().generation;
+        let dirty = s.dirty;
+        let pixels = vec![b'*'; 16];
+        assert!(pending.complete(&mut s, pixels.clone()).is_ok());
+        assert!(s.dirty != dirty);
+        assert!(s.generation > storage_generation);
+        assert_eq!(image_generation, s.image_by_id(1).unwrap().generation);
+        assert_eq!(16usize, s.total_bytes);
+        assert_eq!(&pixels[..], s.image_by_id(1).unwrap().data.bytes().unwrap());
+
+        let duplicate = vec![b'!'; 16];
+        assert!(pending.complete(&mut s, duplicate).is_err());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_stale_pending_completion_loses_to_delete_replacement_and_eviction() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 8,
+            ..Default::default()
+        };
+
+        let deleted = s
+            .add_pending_image(&mut t.screens.active.pages, pending_image(1, 4))
+            .unwrap();
+        delete(&mut s, &mut t, delete_id(1, 0, true));
+        assert!(deleted.complete(&mut s, b"gone".to_vec()).is_err());
+
+        let replaced = s
+            .add_pending_image(&mut t.screens.active.pages, pending_image(2, 4))
+            .unwrap();
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 2,
+                data: Data::Complete(b"live".to_vec()),
+                ..Default::default()
+            },
+        );
+        assert!(replaced.complete(&mut s, b"late".to_vec()).is_err());
+        assert_eq!(b"live", s.image_by_id(2).unwrap().data.bytes().unwrap());
+
+        let evicted = s
+            .add_pending_image(&mut t.screens.active.pages, pending_image(3, 4))
+            .unwrap();
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 4,
+                data: Data::Complete(b"12345678".to_vec()),
+                ..Default::default()
+            },
+        );
+        assert!(s.image_by_id(3).is_none());
+        assert!(evicted.complete(&mut s, b"late".to_vec()).is_err());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_replacement_reuses_pending_reservation_and_removes_placements() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 12,
+            ..Default::default()
+        };
+        let before = tracked(&t);
+
+        let pending = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    width: 2,
+                    height: 1,
+                    format: Format::Rgba,
+                    ..pending_image(1, 8)
+                },
+            )
+            .unwrap();
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 2,
+                data: Data::Complete(b"keep".to_vec()),
+                ..Default::default()
+            },
+        );
+
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 1,
+                width: 2,
+                height: 1,
+                format: Format::Rgba,
+                data: Data::Complete(b"12345678".to_vec()),
+                ..Default::default()
+            },
+        );
+        assert!(s.images.contains_key(&1));
+        assert!(s.images.contains_key(&2));
+        assert_eq!(0, s.placements.len());
+        assert_eq!(before, tracked(&t));
+        assert_eq!(0u32, s.image_by_id(1).unwrap().metadata.placement_count);
+        assert_eq!(12usize, s.total_bytes);
+
+        assert!(pending.complete(&mut s, b"snapshot".to_vec()).is_err());
+
+        // Growing the replacement requires eviction, but the replacement ID is
+        // excluded. The other image supplies the needed bytes.
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 1,
+                data: Data::Complete(b"1234567890".to_vec()),
+                ..Default::default()
+            },
+        );
+        assert!(s.images.contains_key(&1));
+        assert!(!s.images.contains_key(&2));
+        assert_eq!(0, s.placements.len());
+        assert_eq!(10usize, s.total_bytes);
+
+        delete(&mut s, &mut t, delete_id(1, 0, true));
+        assert_eq!(0, s.images.len());
+        assert_eq!(0, s.placements.len());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_pending_completion_survives_a_change_of_displayed_frame() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        let pending = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    width: 1,
+                    height: 1,
+                    format: Format::Rgba,
+                    ..pending_image(1, 4)
+                },
+            )
+            .unwrap();
+
+        // Showing another frame stamps a new image generation, but the image
+        // is still the same transmission.
+        s.mark_image_content_changed(1);
+        let img = &s.images[&1];
+        assert!(img.generation != pending.transmission);
+        assert_eq!(pending.transmission, img.transmission);
+
+        assert!(pending.complete(&mut s, b"rgba".to_vec()).is_ok());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_pending_animation_frames() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        let pending = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    width: 1,
+                    height: 1,
+                    format: Format::Rgba,
+                    ..pending_image(1, 4)
+                },
+            )
+            .unwrap();
+        let mut anim = Box::new(animation::Animation {
+            state: animation::State::Running,
+            current_index: 2,
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            anim.frames.push(animation::Frame {
+                data: Vec::new(),
+                gap_ms: 10,
+                pending_len: 4,
+            });
+        }
+        s.reserve_animation_bytes(&mut t.screens.active.pages, 1, anim.frame_bytes())
+            .unwrap();
+        s.images.get_mut(&1).unwrap().animation = Some(anim);
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        assert_eq!(12usize, s.total_bytes);
+        assert_eq!(12usize, s.image_by_id(1).unwrap().storage_size());
+
+        // Nothing is displayable or playable until every frame arrives.
+        assert!(pending.complete(&mut s, b"base".to_vec()).is_ok());
+        let img = s.image_by_id(1).unwrap();
+        assert!(img.render_data().is_pending());
+        assert!(img.frame_data(3).is_none());
+        assert!(s.animation_tick(0).is_none());
+
+        // A frame with the wrong length, a missing frame, and frame 1 (the
+        // image itself, completed with `complete`) are all refused.
+        assert!(pending.complete_frame(&mut s, 2, b"short".to_vec()).is_err());
+        assert!(pending.complete_frame(&mut s, 4, b"none".to_vec()).is_err());
+        assert!(pending.complete_frame(&mut s, 1, b"none".to_vec()).is_err());
+
+        // Completing the current frame (frame 3) changes the displayed
+        // content.
+        let generation = s.image_by_id(1).unwrap().generation;
+        assert!(pending.complete_frame(&mut s, 3, b"two!".to_vec()).is_ok());
+        let img = s.image_by_id(1).unwrap();
+        assert!(img.generation != generation);
+        assert_eq!(b"two!", img.render_data().bytes().unwrap());
+        assert!(s.animation_tick(0).is_none());
+
+        // Deleting the pending frame releases its reservation.
+        delete(
+            &mut s,
+            &mut t,
+            DeleteAction::AnimationFrames(command::AnimationFrames {
+                image_id: 1,
+                frame: 2,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(8usize, s.total_bytes);
+        assert!(s.animation_tick(0).is_some());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_pending_images_share_exact_eviction_ordering() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage {
+            total_limit: 192,
+            ..Default::default()
+        };
+
+        let _ = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    data: Data::Pending(64),
+                    ..stars_image(1, false)
+                },
+            )
+            .unwrap();
+        let _ = s
+            .add_pending_image(
+                &mut t.screens.active.pages,
+                Image {
+                    data: Data::Pending(64),
+                    ..stars_image(2, true)
+                },
+            )
+            .unwrap();
+        add(&mut s, &mut t, stars_image(3, true));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 2, 1, p);
+
+        // ID 3 is transient and unused, so one exact-size eviction is enough.
+        assert!(s.evict_image(&mut t.screens.active.pages, 64));
+        assert!(s.images.contains_key(&1));
+        assert!(s.images.contains_key(&2));
+        assert!(!s.images.contains_key(&3));
+        assert_eq!(128usize, s.total_bytes);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_next_image_id_number_matches_kitty_get_free_client_id() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        // Empty storage returns 1, as does Kitty.
+        assert_eq!(1u32, s.next_image_id(NextImageIdMode::Explicit));
+
+        // Contiguous IDs from 1: the next ID after them.
+        add(&mut s, &mut t, img(1));
+        add(&mut s, &mut t, img(2));
+        add(&mut s, &mut t, img(3));
+        assert_eq!(4u32, s.next_image_id(NextImageIdMode::Explicit));
+
+        // The first gap is filled, even when higher IDs exist.
+        add(&mut s, &mut t, img(100));
+        delete(&mut s, &mut t, delete_id(2, 0, true));
+        assert_eq!(2u32, s.next_image_id(NextImageIdMode::Explicit));
+
+        // 1 is reused as soon as it is free.
+        delete(&mut s, &mut t, delete_id(1, 0, true));
+        assert_eq!(1u32, s.next_image_id(NextImageIdMode::Explicit));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_next_image_id_implicit_skips_in_use_ids_and_zero() {
+        let mut t = init(3, 3);
+
+        let mut s = ImageStorage::default();
+
+        // A client image already sits on the counter's first two values.
+        add(&mut s, &mut t, img(2147483647));
+        add(&mut s, &mut t, img(2147483648));
+        assert_eq!(2147483649u32, s.next_image_id(NextImageIdMode::Implicit));
+        assert_eq!(2147483650u32, s.next_image_id(NextImageIdMode::Implicit));
+
+        // Wrapping skips zero, which means "no ID" protocol-wide.
+        s.next_image_id = u32::MAX;
+        assert_eq!(u32::MAX, s.next_image_id(NextImageIdMode::Implicit));
+        assert_eq!(1u32, s.next_image_id(NextImageIdMode::Implicit));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_resolve_chain_accumulates_offsets_to_the_pin_root() {
+        let mut t = init(5, 5);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+        place(
+            &mut s,
+            &mut t,
+            1,
+            2,
+            Placement::new(Location::Relative(Relative {
+                parent: external(1, 1),
+                horizontal_offset: 2,
+                vertical_offset: 1,
+            })),
+        );
+        place(
+            &mut s,
+            &mut t,
+            1,
+            3,
+            Placement::new(Location::Relative(Relative {
+                parent: external(1, 2),
+                horizontal_offset: -1,
+                vertical_offset: 4,
+            })),
+        );
+
+        let grandchild = s.placements[&external(1, 3)];
+        let Location::Relative(rel) = grandchild.location else {
+            panic!("not relative")
+        };
+        let chain = s.resolve_chain(rel).unwrap();
+        assert!(chain.root_key.eql(external(1, 1)));
+        assert!(matches!(chain.root.location, Location::Pin(_)));
+        assert_eq!(1i32, chain.horizontal_offset);
+        assert_eq!(5i32, chain.vertical_offset);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_resolve_chain_finds_virtual_roots() {
+        let mut t = init(5, 5);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        place(&mut s, &mut t, 1, 1, Placement::new(Location::Virtual));
+        place(
+            &mut s,
+            &mut t,
+            1,
+            2,
+            Placement::new(Location::Relative(Relative {
+                horizontal_offset: 1,
+                ..Relative::new(external(1, 1))
+            })),
+        );
+
+        let child = s.placements[&external(1, 2)];
+        let Location::Relative(rel) = child.location else {
+            panic!("not relative")
+        };
+        let chain = s.resolve_chain(rel).unwrap();
+        assert!(chain.root.location == Location::Virtual);
+        assert!(chain.root_key.eql(external(1, 1)));
+        assert_eq!(1i32, chain.horizontal_offset);
+        assert_eq!(0i32, chain.vertical_offset);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_eviction_removes_orphaned_relative_placements() {
+        let mut t = init(5, 5);
+
+        let mut s = ImageStorage::default();
+        s.total_limit = 8;
+
+        // Image 1 holds most of the byte budget and has a pin placement.
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 1,
+                width: 2,
+                height: 1,
+                data: Data::Complete(vec![0, 0, 0, 0, 0, 0]),
+                ..Default::default()
+            },
+        );
+        let p = pin_placement(&mut t, 1, 1);
+        place(&mut s, &mut t, 1, 1, p);
+
+        // Image 2's placement is relative to image 1's placement.
+        add(&mut s, &mut t, img(2));
+        place(
+            &mut s,
+            &mut t,
+            2,
+            1,
+            Placement::new(Location::Relative(Relative::new(external(1, 1)))),
+        );
+
+        // Adding image 3 exceeds the limit and evicts image 1 (oldest),
+        // removing its placement, which orphans image 2's placement.
+        add(
+            &mut s,
+            &mut t,
+            Image {
+                id: 3,
+                width: 2,
+                height: 1,
+                data: Data::Complete(vec![0, 0, 0, 0, 0, 0]),
+                ..Default::default()
+            },
+        );
+
+        assert!(s.image_by_id(1).is_none());
+        assert_eq!(0, s.placements.len());
+        assert!(s.image_by_id(2).is_some());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_placeholder_target_lookup() {
+        let mut t = init(5, 5);
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img(1));
+        place(&mut s, &mut t, 1, 5, Placement::new(Location::Virtual));
+
+        // Exact external ID match.
+        {
+            let target = s.placeholder_target(1, 5).unwrap();
+            assert_eq!(external(1, 5), target.key);
+            assert!(target.placement.location == Location::Virtual);
+        }
+
+        // Zero placement ID falls back to the image's virtual placement.
+        {
+            let target = s.placeholder_target(1, 0).unwrap();
+            assert_eq!(external(1, 5), target.key);
+        }
+
+        assert!(s.placeholder_target(1, 9).is_none());
+        assert!(s.placeholder_target(2, 0).is_none());
+
+        // With multiple virtual placements, the zero-ID fallback picks
+        // deterministically by PlacementId.preferredOver: lowest external.
+        place(&mut s, &mut t, 1, 3, Placement::new(Location::Virtual));
+        assert_eq!(external(1, 3), s.placeholder_target(1, 0).unwrap().key);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    /// A 1x1 RGBA image (id 1) with the given animation state plus one
+    /// extra 40ms frame, optionally placed.
+    fn animated(s: &mut ImageStorage, t: &mut TestTerminal, anim: animation::Animation, place_it: bool) {
+        add(
+            s,
+            t,
+            Image {
+                id: 1,
+                width: 1,
+                height: 1,
+                format: Format::Rgba,
+                data: Data::Complete(vec![255, 0, 0, 255]),
+                ..Default::default()
+            },
+        );
+        let mut anim = Box::new(anim);
+        anim.frames.push(animation::Frame {
+            data: vec![0, 0, 255, 255],
+            gap_ms: 40,
+            pending_len: 0,
+        });
+        s.images.get_mut(&1).unwrap().animation = Some(anim);
+        if place_it {
+            let p = pin_placement(t, 0, 0);
+            place(s, t, 1, 0, p);
+        }
+    }
+
+    fn anim_of(s: &mut ImageStorage) -> &mut animation::Animation {
+        s.images.get_mut(&1).unwrap().animation.as_mut().unwrap()
+    }
+
+    #[test]
+    fn storage_animation_tick_advances_and_schedules() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A running 1x1 RGBA image whose animation has one extra frame.
+        animated(
+            &mut s,
+            &mut t,
+            animation::Animation {
+                state: animation::State::Running,
+                ..Default::default()
+            },
+            false,
+        );
+
+        // Without a placement the animation doesn't advance (our
+        // approximation of Kitty's visibility gate).
+        assert!(s.animation_tick(0).is_none());
+        assert_eq!(0u32, anim_of(&mut s).current_index);
+
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 0, p);
+        let gen1 = s.images[&1].generation;
+        let dirty = s.dirty;
+
+        // First tick: the gapless root frame is due immediately and is
+        // skipped over to frame 2, which is due again in its 40ms gap.
+        assert_eq!(Some(40u64), s.animation_tick(0));
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert!(s.images[&1].generation > gen1);
+        assert!(s.dirty != dirty);
+
+        // Nothing due yet: no advance, and the delay counts down.
+        let gen2 = s.images[&1].generation;
+        assert_eq!(Some(30u64), s.animation_tick(10));
+        assert_eq!(gen2, s.images[&1].generation);
+
+        // Wrapping is fine with an infinite loop budget: the gapless
+        // root is skipped and frame 2 is shown again.
+        assert_eq!(Some(40u64), s.animation_tick(40));
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert_eq!(1u32, anim_of(&mut s).current_loop);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_animation_tick_loading_state_parks_on_last_frame() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A placed 1x1 RGBA image in the loading state (a=a s=2) whose
+        // animation has one extra frame.
+        animated(
+            &mut s,
+            &mut t,
+            animation::Animation {
+                state: animation::State::Loading,
+                ..Default::default()
+            },
+            true,
+        );
+
+        // Reach the last frame, then park: no wakeup is scheduled while
+        // waiting for more frames and the loop counter stays untouched.
+        assert_eq!(Some(40u64), s.animation_tick(0));
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert!(s.animation_tick(100).is_none());
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert_eq!(0u32, anim_of(&mut s).current_loop);
+
+        // A new frame arriving resumes playback. The real frame command
+        // calls markMutated, so we do the same by hand.
+        anim_of(&mut s).frames.push(animation::Frame {
+            data: vec![0, 255, 0, 255],
+            gap_ms: 25,
+            pending_len: 0,
+        });
+        s.mark_mutated();
+        assert_eq!(Some(25u64), s.animation_tick(150));
+        assert_eq!(2u32, anim_of(&mut s).current_index);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_animation_tick_exhausts_loop_budget() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A placed, running 1x1 RGBA image with a gapped root frame, one
+        // extra frame, and a one-loop budget (a=a v=2).
+        animated(
+            &mut s,
+            &mut t,
+            animation::Animation {
+                state: animation::State::Running,
+                root_gap_ms: 10,
+                max_loops: 1,
+                ..Default::default()
+            },
+            true,
+        );
+
+        // Root shows for 10ms, frame 2 for 40ms, then the wrap exhausts
+        // the budget and playback freezes on the last frame for good.
+        assert_eq!(Some(10u64), s.animation_tick(0));
+        assert_eq!(0u32, anim_of(&mut s).current_index);
+        assert_eq!(Some(40u64), s.animation_tick(10));
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert!(s.animation_tick(50).is_none());
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert!(s.animation_tick(500).is_none());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_animation_tick_ignores_ineligible_animations() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A placed 1x1 RGBA image with one extra frame, in the default
+        // stopped state.
+        animated(&mut s, &mut t, animation::Animation::default(), true);
+
+        // Stopped (the default) never advances.
+        assert!(s.animation_tick(0).is_none());
+
+        // An all-gapless animation can never advance either. The real
+        // a=a command calls markMutated, so we do the same by hand.
+        anim_of(&mut s).state = animation::State::Running;
+        anim_of(&mut s).frames[0].gap_ms = 0;
+        s.mark_mutated();
+        assert!(s.animation_tick(0).is_none());
+        assert_eq!(0u32, anim_of(&mut s).current_index);
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_animation_tick_skips_the_walk_while_idle() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A placed 1x1 RGBA image with one extra frame, in the default
+        // stopped state.
+        animated(&mut s, &mut t, animation::Animation::default(), true);
+
+        // Nothing can play, so the tick records the current generation.
+        assert!(s.animation_tick(0).is_none());
+        assert_eq!(Some(s.generation), s.animation_idle_generation);
+
+        // Changing the state directly, without markMutated, leaves the
+        // generation alone. The next tick returns early and doesn't see
+        // the change, which proves it skipped the walk.
+        anim_of(&mut s).state = animation::State::Running;
+        assert!(s.animation_tick(10).is_none());
+        assert_eq!(0u32, anim_of(&mut s).current_index);
+
+        // Once the change is recorded, the tick looks again and plays.
+        s.mark_mutated();
+        assert_eq!(Some(40u64), s.animation_tick(20));
+        assert_eq!(1u32, anim_of(&mut s).current_index);
+        assert!(s.animation_idle_generation.is_none());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_animation_tick_re_anchors_a_restarted_clock() {
+        let mut t = init(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        let mut s = ImageStorage::default();
+
+        // A placed, running 1x1 RGBA image displaying its extra frame,
+        // with a shown-at timestamp far ahead of the tick clock.
+        animated(
+            &mut s,
+            &mut t,
+            animation::Animation {
+                state: animation::State::Running,
+                current_index: 1,
+                frame_shown_at_ms: Some(1000),
+                ..Default::default()
+            },
+            true,
+        );
+
+        // A timestamp in the future relative to now means the caller's
+        // clock restarted; the animation must not stall until the old
+        // timestamp comes around again.
+        assert_eq!(Some(40u64), s.animation_tick(5));
+        assert_eq!(Some(5u64), anim_of(&mut s).frame_shown_at_ms);
+        s.deinit(&mut t.screens.active.pages);
+    }
+}
