@@ -490,7 +490,7 @@ impl Allocator {
     }
 
     /// Allocate a buffer with exactly `cap` capacity.
-    fn alloc_vec(&mut self, cap: usize) -> Option<Vec<u8>> {
+    pub fn alloc_vec(&mut self, cap: usize) -> Option<Vec<u8>> {
         if self.alloc_index == self.fail_index {
             return None;
         }
@@ -502,7 +502,7 @@ impl Allocator {
 
     /// Grow `v` to exactly `new_cap` capacity (Zig `realloc`: try a
     /// resize in place, then a new allocation).
-    fn realloc(&mut self, v: &mut Vec<u8>, new_cap: usize) -> bool {
+    pub fn realloc(&mut self, v: &mut Vec<u8>, new_cap: usize) -> bool {
         if self.resize_index != self.resize_fail_index {
             self.resize_index += 1;
         } else if self.alloc_index != self.fail_index {
