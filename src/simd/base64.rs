@@ -27,7 +27,23 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 pub fn max_len(input: &[u8]) -> usize {
-    max_len_scalar(input)
+    // The Ghostty application builds with `options.simd`, which uses
+    // simdutf's `maximal_binary_length_from_base64`. Mirror that formula:
+    // it ignores trailing padding and does not account for whitespace,
+    // so it is an upper bound.
+    let mut padding = 0;
+    if input.last() == Some(&b'=') {
+        padding += 1;
+        if input.len() >= 2 && input[input.len() - 2] == b'=' {
+            padding += 1;
+        }
+    }
+    let actual = input.len() - padding;
+    if actual % 4 <= 1 {
+        actual / 4 * 3
+    } else {
+        actual / 4 * 3 + actual % 4 - 1
+    }
 }
 
 fn max_len_scalar(input: &[u8]) -> usize {
@@ -41,7 +57,18 @@ fn max_len_scalar(input: &[u8]) -> usize {
 }
 
 pub fn decode<'a>(input: &[u8], output: &'a mut [u8]) -> Result<&'a [u8], DecodeError> {
-    decode_scalar(input, output)
+    // The SIMD build uses simdutf's `base64_to_binary` (default options),
+    // which skips ASCII whitespace and accepts a partial final chunk.
+    // Emulate that on top of the scalar decoder.
+    const fn is_ws(c: u8) -> bool {
+        matches!(c, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r')
+    }
+    if !input.iter().any(|&c| is_ws(c)) {
+        return decode_scalar(input, output);
+    }
+    let filtered: Vec<u8> = input.iter().copied().filter(|&c| !is_ws(c)).collect();
+    let len = decode_scalar(&filtered, output)?.len();
+    Ok(&output[..len])
 }
 
 fn decode_scalar<'a>(input_raw: &[u8], output: &'a mut [u8]) -> Result<&'a [u8], DecodeError> {
@@ -263,6 +290,15 @@ fn valid_partial_char(pos: usize, c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_skips_whitespace_like_simdutf() {
+        let input = b"aGVs\nbG8g\r\nd29y bGQ=";
+        let mut out = vec![0u8; max_len(input)];
+        assert_eq!(decode(input, &mut out).unwrap(), b"hello world");
+        assert_eq!(max_len(b"aGVsbG8="), 5);
+        assert_eq!(max_len(b"aGVsbG8"), 5);
+    }
 
     #[test]
     fn base64_max_len() {
