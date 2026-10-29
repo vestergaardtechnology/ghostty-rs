@@ -27,6 +27,7 @@ pub mod parsers;
 
 use std::fmt;
 
+use crate::lib;
 use crate::terminal::kitty::color as kitty_color;
 
 pub use self::parsers::color;
@@ -308,28 +309,6 @@ impl Command<'_> {
     }
 }
 
-/// Stand-in for `lib.String` (`src/lib/types.zig`, owned by another
-/// porting agent).
-///
-/// TODO(port-dedupe): replace with crate::lib::types::String
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub struct LibString {
-    pub ptr: *const u8,
-    pub len: usize,
-}
-
-impl LibString {
-    pub fn init(s: &[u8]) -> LibString {
-        LibString {
-            // Borrowed strings keep a non-null pointer, but it must point
-            // to real storage.
-            ptr: if s.is_empty() { b"".as_ptr() } else { s.as_ptr() },
-            len: s.len(),
-        }
-    }
-}
-
 /// An OSC sequence whose number this parser does not implement. For
 /// the sequence `ESC ] 7400;status=busy BEL`, `content` is
 /// "7400;status=busy" and `terminator` is `.bel`.
@@ -359,7 +338,7 @@ pub struct Unknown<'a> {
 #[repr(C)]
 pub struct UnknownC {
     pub truncated: bool,
-    pub content: LibString,
+    pub content: lib::String,
     pub terminator: TerminatorC,
 }
 
@@ -367,7 +346,7 @@ impl Unknown<'_> {
     pub fn cval(&self) -> UnknownC {
         UnknownC {
             truncated: self.truncated,
-            content: LibString::init(self.content),
+            content: lib::String::init(self.content),
             terminator: self.terminator.cval(),
         }
     }

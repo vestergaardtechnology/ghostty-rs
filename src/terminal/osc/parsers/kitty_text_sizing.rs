@@ -5,7 +5,7 @@
 //! Kitty's text sizing protocol (OSC 66)
 //! Specification: https://sw.kovidgoyal.net/kitty/text-sizing-protocol/
 
-use crate::terminal::color::parse_int::parse_int_bits;
+use crate::lib::parse_int::parse_int_bits_unsigned;
 use crate::terminal::osc::encoding;
 use crate::terminal::osc::{Command, Parser, State};
 
@@ -99,7 +99,7 @@ impl<'a> Osc<'a> {
 
     fn update(&mut self, key: u8, value: &[u8]) -> Result<(), UpdateError> {
         // All values are numeric, so we can do a small hack here
-        let v = parse_int_bits(value, 10, 4, false).map_err(|_| UpdateError::InvalidValue)? as u8;
+        let v = parse_int_bits_unsigned(value, 10, 4).map_err(|_| UpdateError::InvalidValue)? as u8;
 
         match key {
             b's' => {

@@ -15,6 +15,8 @@
 
 use std::io::Write;
 
+use crate::datastruct::ComptimeIntSet;
+
 /// A struct that maintains the state of all the settable modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ModeState {
@@ -247,7 +249,7 @@ pub fn mode_from_int(v: u16, ansi: bool) -> Option<Mode> {
     // This runs for every mode that is set, reset, or queried, so we use
     // a sorted lookup instead of comparing against each entry in turn.
     let int = ModeTag::new(v, ansi).to_bits();
-    let idx = entry_set_index_of(int)?;
+    let idx = ENTRY_SET.index_of(int)?;
     if ENTRIES_ANY_DISABLED && ENTRIES[idx].disabled {
         return None;
     }
@@ -255,44 +257,17 @@ pub fn mode_from_int(v: u16, ansi: bool) -> Option<Mode> {
     Some(ENTRIES[idx].mode)
 }
 
-/// The tag of every entry, sorted, paired with the index of its entry.
-/// Looking up a tag here returns the index of its entry.
-///
-/// TODO(port-dedupe): replace with crate::datastruct::ComptimeIntSet
-static ENTRY_SET: [(ModeTagBacking, u8); ENTRY_COUNT] = {
-    let mut keys = [(0u16, 0u8); ENTRY_COUNT];
+/// The tag of every entry, in the same order as `ENTRIES`. Looking up
+/// a tag here returns the index of its entry.
+static ENTRY_SET: ComptimeIntSet<ModeTagBacking, ENTRY_COUNT> = {
+    let mut keys = [0 as ModeTagBacking; ENTRY_COUNT];
     let mut i = 0;
     while i < ENTRY_COUNT {
-        keys[i] = (ModeTag::new(ENTRIES[i].value, ENTRIES[i].ansi).to_bits(), i as u8);
+        keys[i] = ModeTag::new(ENTRIES[i].value, ENTRIES[i].ansi).to_bits();
         i += 1;
     }
-
-    // Insertion sort by key; keys must be unique.
-    let mut i = 1;
-    while i < ENTRY_COUNT {
-        let mut j = i;
-        while j > 0 && keys[j - 1].0 > keys[j].0 {
-            let tmp = keys[j - 1];
-            keys[j - 1] = keys[j];
-            keys[j] = tmp;
-            j -= 1;
-        }
-        i += 1;
-    }
-    let mut i = 1;
-    while i < ENTRY_COUNT {
-        assert!(keys[i - 1].0 != keys[i].0, "duplicate mode tag");
-        i += 1;
-    }
-    keys
+    ComptimeIntSet::<ModeTagBacking, ENTRY_COUNT>::new(&keys)
 };
-
-fn entry_set_index_of(key: ModeTagBacking) -> Option<usize> {
-    ENTRY_SET
-        .binary_search_by_key(&key, |&(k, _)| k)
-        .ok()
-        .map(|i| ENTRY_SET[i].1 as usize)
-}
 
 /// True if any entry is disabled. When false, mode_from_int skips the
 /// disabled check entirely.

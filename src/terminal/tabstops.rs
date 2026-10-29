@@ -14,6 +14,8 @@
 
 use std::fmt;
 
+use crate::tripwire;
+
 /// Unit is the type we use per tabstop unit (see file docs).
 type Unit = u8;
 const UNIT_BITS: usize = Unit::BITS as usize;
@@ -87,42 +89,13 @@ fn index(col: usize) -> usize {
     col % UNIT_BITS
 }
 
-/// Failure-injection points for `resize` (`tripwire.module(enum { dynamic_alloc }, resize)`).
-///
-/// TODO(port-dedupe): replace with crate::tripwire
-#[cfg(test)]
-mod resize_tw {
-    use std::cell::Cell;
-
-    thread_local! {
-        static DYNAMIC_ALLOC_FAIL: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Make every `dynamic_alloc` check fail with OutOfMemory.
-    pub fn error_always_dynamic_alloc() {
-        DYNAMIC_ALLOC_FAIL.with(|c| c.set(true));
-    }
-
-    /// Reset the tripwire.
-    pub fn end_reset() {
-        DYNAMIC_ALLOC_FAIL.with(|c| c.set(false));
-    }
-
-    pub fn check_dynamic_alloc() -> Result<(), super::TabstopsError> {
-        if DYNAMIC_ALLOC_FAIL.with(|c| c.get()) {
-            return Err(super::TabstopsError::OutOfMemory);
-        }
-        Ok(())
-    }
+/// Failure points for `resize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeFailPoint {
+    DynamicAlloc,
 }
 
-#[cfg(not(test))]
-mod resize_tw {
-    #[inline(always)]
-    pub fn check_dynamic_alloc() -> Result<(), super::TabstopsError> {
-        Ok(())
-    }
-}
+static RESIZE_TW: tripwire::Module<ResizeFailPoint, TabstopsError> = tripwire::Module::new();
 
 impl Tabstops {
     pub fn init(cols: usize, interval: usize) -> Result<Tabstops, TabstopsError> {
@@ -192,7 +165,8 @@ impl Tabstops {
             return Ok(());
         }
 
-        resize_tw::check_dynamic_alloc()?;
+        let tw = &RESIZE_TW;
+        tw.check(ResizeFailPoint::DynamicAlloc)?;
         let additional = dynamic_count - self.dynamic_stops.len();
         self.dynamic_stops
             .try_reserve_exact(additional)
@@ -339,10 +313,10 @@ mod tests {
         let original_cols = t.cols;
 
         // Trigger allocation failure when resizing beyond prealloc
-        resize_tw::error_always_dynamic_alloc();
+        RESIZE_TW.error_always(ResizeFailPoint::DynamicAlloc, TabstopsError::OutOfMemory);
         let result = t.resize(PREALLOC_COLUMNS * 2);
         assert_eq!(Err(TabstopsError::OutOfMemory), result);
-        resize_tw::end_reset();
+        RESIZE_TW.end(tripwire::ResetMode::Reset).unwrap();
 
         // cols should be unchanged after failed resize
         assert_eq!(original_cols, t.cols);

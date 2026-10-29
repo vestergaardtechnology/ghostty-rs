@@ -5,6 +5,7 @@
 use std::fmt;
 use std::io::Write as _;
 
+use crate::lib::parse_int;
 use crate::terminal::fraction;
 use crate::terminal::x11_color;
 
@@ -99,74 +100,14 @@ pub fn parse_palette_entry(value: &[u8]) -> Result<PaletteEntry, PaletteEntryErr
         .iter()
         .position(|&c| c == b'=')
         .ok_or(PaletteEntryError::InvalidFormat)?;
-    let index = zig_std_parse_u8_base0(trim(&value[..eql_idx], b" \t")).map_err(|err| match err {
-        parse_int::ParseIntError::Overflow => PaletteEntryError::Overflow,
-        parse_int::ParseIntError::InvalidCharacter => PaletteEntryError::InvalidFormat,
-    })?;
+    let index = parse_int::std_parse_int::<u8>(trim(&value[..eql_idx], b" \t"), 0).map_err(
+        |err| match err {
+            parse_int::ParseIntError::Overflow => PaletteEntryError::Overflow,
+            parse_int::ParseIntError::InvalidCharacter => PaletteEntryError::InvalidFormat,
+        },
+    )?;
     let rgb = Rgb::parse(&value[eql_idx + 1..])?;
     Ok(PaletteEntry { index, color: rgb })
-}
-
-/// Zig's `std.fmt.parseInt(u8, buf, 0)`: optional sign, base prefix
-/// detection (0b/0o/0x), and `_` digit separators.
-fn zig_std_parse_u8_base0(buf: &[u8]) -> Result<u8, parse_int::ParseIntError> {
-    use parse_int::ParseIntError;
-    if buf.is_empty() {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    let (buf, neg) = match buf[0] {
-        b'+' => (&buf[1..], false),
-        b'-' => (&buf[1..], true),
-        _ => (buf, false),
-    };
-    if buf.is_empty() {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    let mut base: u32 = 10;
-    let mut start = buf;
-    if buf.len() > 2 && buf[0] == b'0' {
-        match buf[1].to_ascii_lowercase() {
-            b'b' => {
-                base = 2;
-                start = &buf[2..];
-            }
-            b'o' => {
-                base = 8;
-                start = &buf[2..];
-            }
-            b'x' => {
-                base = 16;
-                start = &buf[2..];
-            }
-            _ => {}
-        }
-    }
-    if start[0] == b'_' || start[start.len() - 1] == b'_' {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    let mut acc: i32 = 0;
-    for &c in start {
-        if c == b'_' {
-            continue;
-        }
-        let digit = parse_int::char_to_digit(c, base)? as i32;
-        if acc != 0 {
-            acc *= base as i32;
-            if acc > u8::MAX as i32 {
-                return Err(ParseIntError::Overflow);
-            }
-        } else if neg {
-            if digit != 0 {
-                return Err(ParseIntError::Overflow);
-            }
-            continue;
-        }
-        acc = if neg { acc - digit } else { acc + digit };
-        if !(0..=u8::MAX as i32).contains(&acc) {
-            return Err(ParseIntError::Overflow);
-        }
-    }
-    Ok(acc as u8)
 }
 
 /// Trim bytes in `set` from both ends of `s` (Zig `std.mem.trim`).
@@ -180,118 +121,6 @@ pub(crate) fn trim<'a>(s: &'a [u8], set: &[u8]) -> &'a [u8] {
         end -= 1;
     }
     &s[start..end]
-}
-
-/// Stand-in for `src/lib/parse_int.zig` (owned by another porting agent).
-///
-/// TODO(port-dedupe): replace with crate::lib::parse_int
-pub(crate) mod parse_int {
-    /// Zig `std.fmt.ParseIntError`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ParseIntError {
-        Overflow,
-        InvalidCharacter,
-    }
-
-    /// An integer type `parse_int` can produce.
-    pub trait Int: Sized + Copy {
-        const BITS: u32;
-        const SIGNED: bool;
-        fn from_i128(v: i128) -> Self;
-    }
-
-    macro_rules! impl_int {
-        ($($t:ty => $signed:expr),*) => {$(
-            impl Int for $t {
-                const BITS: u32 = <$t>::BITS;
-                const SIGNED: bool = $signed;
-                fn from_i128(v: i128) -> Self { v as $t }
-            }
-        )*};
-    }
-    impl_int!(u8 => false, u16 => false, u32 => false, u64 => false, usize => false,
-              i8 => true, i16 => true, i32 => true, i64 => true);
-
-    /// Zig `std.fmt.charToDigit`.
-    pub fn char_to_digit(c: u8, base: u32) -> Result<u32, ParseIntError> {
-        let value = match c {
-            b'0'..=b'9' => (c - b'0') as u32,
-            b'A'..=b'Z' => (c - b'A') as u32 + 10,
-            b'a'..=b'z' => (c - b'a') as u32 + 10,
-            _ => return Err(ParseIntError::InvalidCharacter),
-        };
-        if value >= base {
-            return Err(ParseIntError::InvalidCharacter);
-        }
-        Ok(value)
-    }
-
-    /// Parse ASCII digits in the given base. Signed types allow a leading
-    /// sign; unsigned types accept digits only.
-    pub fn parse_int<T: Int>(value: &[u8], base: u32) -> Result<T, ParseIntError> {
-        parse_int_bits(value, base, T::BITS, T::SIGNED).map(T::from_i128)
-    }
-
-    /// Like `parse_int` but for an arbitrary-width Zig integer type
-    /// (`u4`, `u9`, ...), returned widened.
-    pub fn parse_int_bits(
-        value: &[u8],
-        base: u32,
-        bits: u32,
-        signed: bool,
-    ) -> Result<i128, ParseIntError> {
-        debug_assert!((2..=36).contains(&base));
-        if value.is_empty() {
-            return Err(ParseIntError::InvalidCharacter);
-        }
-        if signed {
-            if value[0] == b'+' {
-                return with_sign(&value[1..], base, bits, signed, false);
-            }
-            if value[0] == b'-' {
-                return with_sign(&value[1..], base, bits, signed, true);
-            }
-        }
-        with_sign(value, base, bits, signed, false)
-    }
-
-    fn range(bits: u32, signed: bool) -> (i128, i128) {
-        if signed {
-            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-        } else {
-            (0, (1i128 << bits) - 1)
-        }
-    }
-
-    fn with_sign(
-        value: &[u8],
-        base: u32,
-        bits: u32,
-        signed: bool,
-        neg: bool,
-    ) -> Result<i128, ParseIntError> {
-        if value.is_empty() {
-            return Err(ParseIntError::InvalidCharacter);
-        }
-        let (acc_min, acc_max) = range(bits.max(8), signed);
-        let mut acc: i128 = 0;
-        for &c in value {
-            let digit = char_to_digit(c, base)? as i128;
-            acc *= base as i128;
-            if acc < acc_min || acc > acc_max {
-                return Err(ParseIntError::Overflow);
-            }
-            acc = if neg { acc - digit } else { acc + digit };
-            if acc < acc_min || acc > acc_max {
-                return Err(ParseIntError::Overflow);
-            }
-        }
-        let (min, max) = range(bits, signed);
-        if acc < min || acc > max {
-            return Err(ParseIntError::Overflow);
-        }
-        Ok(acc)
-    }
 }
 
 /// C-compatible palette type using the extern Rgb struct.

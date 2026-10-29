@@ -2,7 +2,7 @@
 //!
 //! STATUS: ported
 
-use crate::terminal::color::parse_int::parse_int;
+use crate::lib::parse_int;
 use crate::terminal::osc::parsers::semantic_prompt;
 use crate::terminal::osc::{
     Command, ConemuChangeTabTitle, ConemuSleep, ConemuXtermEmulation, Parser, ProgressReport,
