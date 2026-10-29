@@ -135,17 +135,23 @@ impl std::error::Error for WaitError {}
 /// that this should be a trivially copyable struct and not require any
 /// allocation/deallocation.
 ///
-/// TODO(port-dedupe): replace with
-/// `crate::apprt::gtk::pre_exec::PreExecInfo` (Zig:
-/// `apprt.runtime.pre_exec.PreExecInfo`) once the GTK apprt is ported.
-/// Until then this is the empty struct Zig uses for runtimes without one.
+/// Zig: `apprt.runtime.pre_exec.PreExecInfo` if the runtime has a
+/// `pre_exec` (the GTK runtime), else an empty struct.
+#[cfg(all(feature = "gtk", not(target_os = "macos")))]
+pub use crate::apprt::gtk::pre_exec::PreExecInfo as RtPreExecInfo;
+
+/// Configuration information needed by the apprt pre exec function. Note
+/// that this should be a trivially copyable struct and not require any
+/// allocation/deallocation.
+///
+/// This runtime has no `pre_exec`, so this is the empty struct Zig uses.
+#[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtPreExecInfo {}
 
+#[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
 impl RtPreExecInfo {
-    /// Zig: `init(*const configpkg.Config)`. Generic over the config type
-    /// until `crate::config::Config` is ported.
-    pub fn init<C: ?Sized>(_config: &C) -> Self {
+    pub fn init(_config: &crate::config::Config) -> Self {
         Self {}
     }
 }
@@ -154,18 +160,82 @@ impl RtPreExecInfo {
 /// that this should be a trivially copyable struct and not require any
 /// allocation/deallocation.
 ///
-/// TODO(port-dedupe): replace with
-/// `crate::apprt::gtk::post_fork::PostForkInfo` (Zig:
-/// `apprt.runtime.post_fork.PostForkInfo`) once the GTK apprt is ported.
+/// Zig: `apprt.runtime.post_fork.PostForkInfo` if the runtime has a
+/// `post_fork` (the GTK runtime), else an empty struct.
+#[cfg(all(feature = "gtk", not(target_os = "macos")))]
+pub use crate::apprt::gtk::post_fork::PostForkInfo as RtPostForkInfo;
+
+/// Configuration information needed by the apprt post fork function. Note
+/// that this should be a trivially copyable struct and not require any
+/// allocation/deallocation.
+///
+/// This runtime has no `post_fork`, so this is the empty struct Zig uses.
+#[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtPostForkInfo {}
 
+#[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
 impl RtPostForkInfo {
-    /// Zig: `init(*const configpkg.Config)`.
-    pub fn init<C: ?Sized>(_config: &C) -> Self {
+    pub fn init(_config: &crate::config::Config) -> Self {
         Self {}
     }
 }
+
+/// A value for the `rt_pre_exec_info` field when there is no config to
+/// build it from (Zig leaves the field `undefined` in that case). With the
+/// GTK runtime this disables the cgroup handling of the hooks.
+pub fn rt_pre_exec_info_unset() -> RtPreExecInfo {
+    #[cfg(all(feature = "gtk", not(target_os = "macos")))]
+    return RtPreExecInfo {
+        gtk_single_instance: crate::config::config::GtkSingleInstance::DEFAULT,
+        linux_cgroup: crate::config::config::LinuxCgroup::Never,
+        linux_cgroup_hard_fail: false,
+    };
+    #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
+    RtPreExecInfo::default()
+}
+
+/// See [`rt_pre_exec_info_unset`].
+pub fn rt_post_fork_info_unset() -> RtPostForkInfo {
+    #[cfg(all(feature = "gtk", not(target_os = "macos")))]
+    return RtPostForkInfo {
+        gtk_single_instance: crate::config::config::GtkSingleInstance::DEFAULT,
+        linux_cgroup: crate::config::config::LinuxCgroup::Never,
+        linux_cgroup_hard_fail: false,
+        linux_cgroup_memory_limit: None,
+        linux_cgroup_processes_limit: None,
+    };
+    #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
+    RtPostForkInfo::default()
+}
+
+/// The runtime's pre exec hook (Zig `apprt.runtime.pre_exec.preExec` if
+/// the runtime has one).
+pub const RT_PRE_EXEC: Option<PreExecFn> = {
+    #[cfg(all(feature = "gtk", not(target_os = "macos")))]
+    {
+        Some(|cmd: &mut Command| crate::apprt::gtk::pre_exec::pre_exec(&cmd.rt_pre_exec_info))
+    }
+    #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
+    {
+        None
+    }
+};
+
+/// The runtime's post fork hook (Zig `apprt.runtime.post_fork.postFork` if
+/// the runtime has one).
+pub const RT_POST_FORK: Option<PostForkFn> = {
+    #[cfg(all(feature = "gtk", not(target_os = "macos")))]
+    {
+        Some(|cmd: &mut Command| {
+            crate::apprt::gtk::post_fork::post_fork(cmd.pid, &cmd.rt_post_fork_info)
+        })
+    }
+    #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
+    {
+        None
+    }
+};
 
 pub struct Command {
     /// Path to the command to run. This doesn't have to be an absolute path,
@@ -247,9 +317,9 @@ impl Default for Command {
             stderr: None,
             os_pre_exec: None,
             rt_pre_exec: None,
-            rt_pre_exec_info: RtPreExecInfo::default(),
+            rt_pre_exec_info: rt_pre_exec_info_unset(),
             rt_post_fork: None,
-            rt_post_fork_info: RtPostForkInfo::default(),
+            rt_post_fork_info: rt_post_fork_info_unset(),
             #[cfg(windows)]
             pseudo_console: None,
             data: std::ptr::null_mut(),
