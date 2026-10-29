@@ -1,6 +1,6 @@
-//! Port of `src/opengl/main.zig`.
+//! Port of `pkg/opengl/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "buffer.rs"]
