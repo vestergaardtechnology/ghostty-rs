@@ -54,16 +54,15 @@ mod tests {
             std::ptr::null_mut(),
         );
         let ir = c::spvc_context_parse_spirv(&ctx, spv).unwrap();
-        let mut compiler = c::spvc_context_create_compiler(
-            &ctx,
-            backend,
-            ir,
-            c::SPVC_CAPTURE_MODE_TAKE_OWNERSHIP,
-        )
-        .unwrap();
+        let mut compiler =
+            c::spvc_context_create_compiler(&ctx, backend, ir, c::SPVC_CAPTURE_MODE_TAKE_OWNERSHIP)
+                .unwrap();
         let mut options = c::spvc_compiler_create_compiler_options(&compiler).unwrap();
         for &(opt, value) in opts {
-            assert_eq!(c::SPVC_SUCCESS, c::spvc_compiler_options_set_uint(&mut options, opt, value));
+            assert_eq!(
+                c::SPVC_SUCCESS,
+                c::spvc_compiler_options_set_uint(&mut options, opt, value)
+            );
         }
         assert_eq!(
             c::SPVC_SUCCESS,
@@ -98,7 +97,10 @@ mod tests {
         );
         assert!(glsl.starts_with("#version 430 core"), "{glsl}");
         assert!(glsl.contains("binding = 1) uniform"), "{glsl}");
-        assert!(glsl.contains("layout(binding = 0) uniform sampler2D"), "{glsl}");
+        assert!(
+            glsl.contains("layout(binding = 0) uniform sampler2D"),
+            "{glsl}"
+        );
         assert!(glsl.contains("void main()"), "{glsl}");
     }
 
@@ -148,9 +150,13 @@ mod tests {
         let spv = spirv(include_str!("../glslang/test/simple.frag"));
         let ctx = c::spvc_context_create().unwrap();
         let ir = c::spvc_context_parse_spirv(&ctx, &spv).unwrap();
-        let compiler =
-            c::spvc_context_create_compiler(&ctx, c::SPVC_BACKEND_GLSL, ir, c::SPVC_CAPTURE_MODE_COPY)
-                .unwrap();
+        let compiler = c::spvc_context_create_compiler(
+            &ctx,
+            c::SPVC_BACKEND_GLSL,
+            ir,
+            c::SPVC_CAPTURE_MODE_COPY,
+        )
+        .unwrap();
         let mut options = c::spvc_compiler_create_compiler_options(&compiler).unwrap();
         assert_eq!(
             c::SPVC_ERROR_INVALID_ARGUMENT,
@@ -204,7 +210,10 @@ mod tests {
             ("iDate", 176),
             ("iSampleRate", 192),
         ];
-        assert_eq!(expected.len() as u32, c::spvc_type_get_num_member_types(typ));
+        assert_eq!(
+            expected.len() as u32,
+            c::spvc_type_get_num_member_types(typ)
+        );
         for (field, offset) in expected {
             let mut found = false;
             for i in 0..c::spvc_type_get_num_member_types(typ) {

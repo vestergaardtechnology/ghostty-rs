@@ -40,8 +40,9 @@ impl Envelope {
 
     pub fn write_to_file(&self, path: &[u8]) -> Result<(), WriteFailed> {
         // SAFETY: the path pointer/length pair is valid.
-        if unsafe { c::sentry_envelope_write_to_file_n(self.ptr(), path.as_ptr().cast(), path.len()) }
-            != 0
+        if unsafe {
+            c::sentry_envelope_write_to_file_n(self.ptr(), path.as_ptr().cast(), path.len())
+        } != 0
         {
             return Err(WriteFailed);
         }

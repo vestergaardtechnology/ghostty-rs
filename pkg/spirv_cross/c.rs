@@ -204,7 +204,9 @@ pub fn spvc_context_get_last_error_string(context: &spvc_context) -> String {
     context.0.last_error.borrow().clone()
 }
 
-fn validate(module: &naga::Module) -> Result<naga::valid::ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
+fn validate(
+    module: &naga::Module,
+) -> Result<naga::valid::ModuleInfo, naga::WithSpan<naga::valid::ValidationError>> {
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
@@ -327,8 +329,15 @@ pub fn spvc_compiler_compile(compiler: &mut spvc_compiler) -> Result<String, spv
 fn compile_glsl(compiler: &spvc_compiler) -> Result<String, String> {
     use naga::back::glsl;
 
-    let version_num = compiler.options.get(SPVC_COMPILER_OPTION_GLSL_VERSION).unwrap_or(450);
-    let es = compiler.options.get(SPVC_COMPILER_OPTION_GLSL_ES).unwrap_or(0) != 0;
+    let version_num = compiler
+        .options
+        .get(SPVC_COMPILER_OPTION_GLSL_VERSION)
+        .unwrap_or(450);
+    let es = compiler
+        .options
+        .get(SPVC_COMPILER_OPTION_GLSL_ES)
+        .unwrap_or(0)
+        != 0;
     let version = if es {
         glsl::Version::Embedded {
             version: version_num as u16,
@@ -339,7 +348,12 @@ fn compile_glsl(compiler: &spvc_compiler) -> Result<String, String> {
     };
 
     let mut writer_flags = glsl::WriterFlags::empty();
-    if compiler.options.get(SPVC_COMPILER_OPTION_FLIP_VERTEX_Y).unwrap_or(0) != 0 {
+    if compiler
+        .options
+        .get(SPVC_COMPILER_OPTION_FLIP_VERTEX_Y)
+        .unwrap_or(0)
+        != 0
+    {
         writer_flags |= glsl::WriterFlags::ADJUST_COORDINATE_SPACE;
     }
 
@@ -457,7 +471,10 @@ fn compile_msl(compiler: &spvc_compiler) -> Result<String, String> {
         },
     );
 
-    let version = compiler.options.get(SPVC_COMPILER_OPTION_MSL_VERSION).unwrap_or(10200);
+    let version = compiler
+        .options
+        .get(SPVC_COMPILER_OPTION_MSL_VERSION)
+        .unwrap_or(10200);
     let options = msl::Options {
         lang_version: ((version / 10000) as u8, ((version / 100) % 100) as u8),
         per_entry_point_map,
@@ -492,7 +509,8 @@ fn word_positions<'a>(s: &'a str, word: &'a str) -> impl Iterator<Item = usize> 
     let bytes = s.as_bytes();
     s.match_indices(word).map(|(i, _)| i).filter(move |&i| {
         let end = i + word.len();
-        (i == 0 || !is_ident_byte(bytes[i - 1])) && (end == bytes.len() || !is_ident_byte(bytes[end]))
+        (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (end == bytes.len() || !is_ident_byte(bytes[end]))
     })
 }
 
@@ -514,11 +532,17 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
 
 /// The type of a uniform block as the user declared it: naga's SPIR-V
 /// writer wraps block structs in a struct with a single unnamed member.
-fn unwrap_block_type(module: &naga::Module, ty: naga::Handle<naga::Type>) -> naga::Handle<naga::Type> {
+fn unwrap_block_type(
+    module: &naga::Module,
+    ty: naga::Handle<naga::Type>,
+) -> naga::Handle<naga::Type> {
     if let naga::TypeInner::Struct { members, .. } = &module.types[ty].inner {
         if let [member] = members.as_slice() {
             if member.name.is_none()
-                && matches!(module.types[member.ty].inner, naga::TypeInner::Struct { .. })
+                && matches!(
+                    module.types[member.ty].inner,
+                    naga::TypeInner::Struct { .. }
+                )
             {
                 return member.ty;
             }
@@ -583,7 +607,10 @@ fn type_handle(compiler: &spvc_compiler, id: spvc_type_id) -> Option<naga::Handl
         .map(|(h, _)| h)
 }
 
-pub fn spvc_compiler_get_type_handle(compiler: &spvc_compiler, id: spvc_type_id) -> Option<spvc_type<'_>> {
+pub fn spvc_compiler_get_type_handle(
+    compiler: &spvc_compiler,
+    id: spvc_type_id,
+) -> Option<spvc_type<'_>> {
     let handle = type_handle(compiler, id)?;
     Some(spvc_type {
         ty: &compiler.module.types[handle],
@@ -597,7 +624,11 @@ pub fn spvc_type_get_num_member_types(ty: spvc_type<'_>) -> u32 {
     }
 }
 
-pub fn spvc_compiler_get_member_name(compiler: &spvc_compiler, id: spvc_type_id, index: u32) -> &str {
+pub fn spvc_compiler_get_member_name(
+    compiler: &spvc_compiler,
+    id: spvc_type_id,
+    index: u32,
+) -> &str {
     let Some(handle) = type_handle(compiler, id) else {
         return "";
     };

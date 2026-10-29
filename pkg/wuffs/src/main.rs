@@ -59,10 +59,7 @@ mod tests {
     #[test]
     fn rgba_size_limits() {
         assert_eq!(rgba_size("wuffs_test", 2, 3), Ok(24));
-        assert_eq!(
-            rgba_size("wuffs_test", 32768, 32769),
-            Err(Error::Overflow)
-        );
+        assert_eq!(rgba_size("wuffs_test", 32768, 32769), Err(Error::Overflow));
         #[cfg(target_pointer_width = "64")]
         assert_eq!(rgba_size("wuffs_test", 32768, 32768), Ok(1 << 32));
     }

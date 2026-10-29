@@ -27,9 +27,8 @@ pub fn decode(data: &[u8], limit: usize, size_hint: Option<usize>) -> Result<Vec
         | inflate_flags::TINFL_FLAG_COMPUTE_ADLER32
         | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
 
-    let initial_size = 1.max(limit.min(size_hint.unwrap_or_else(|| {
-        data.len().checked_mul(2).unwrap_or(limit)
-    })));
+    let initial_size =
+        1.max(limit.min(size_hint.unwrap_or_else(|| data.len().checked_mul(2).unwrap_or(limit))));
     let mut destination = alloc_zeroed(initial_size)?;
 
     let mut in_pos = 0usize;

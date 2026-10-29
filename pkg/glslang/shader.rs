@@ -248,7 +248,10 @@ fn rewrite_sampler(toks: &[&str], indent: &str) -> Option<String> {
         return None;
     }
     rest = &rest[1..];
-    if matches!(rest.first(), Some(&"lowp") | Some(&"mediump") | Some(&"highp")) {
+    if matches!(
+        rest.first(),
+        Some(&"lowp") | Some(&"mediump") | Some(&"highp")
+    ) {
         rest = &rest[1..];
     }
     let [ty, name, ";"] = rest else {
@@ -288,7 +291,9 @@ fn is_builtin_redeclaration(toks: &[&str]) -> bool {
             *q,
             "in" | "out" | "flat" | "smooth" | "noperspective" | "invariant" | "centroid"
         )
-    }) && decl[..decl.len() - 2].iter().any(|q| matches!(*q, "in" | "out"))
+    }) && decl[..decl.len() - 2]
+        .iter()
+        .any(|q| matches!(*q, "in" | "out"))
 }
 
 /// Rewrite a `#version` line for naga.
@@ -314,7 +319,8 @@ fn strip_uniform_words(line: &str) -> String {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < line.len() {
-        let is_word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        let is_word_start =
+            i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
         if is_word_start && line[i..].starts_with("uniform") {
             let end = i + "uniform".len();
             let is_word_end =
@@ -514,10 +520,11 @@ mod tests {
         let out = naga_compat(src);
         assert!(out.starts_with("#version 450 core\n"));
         assert!(out.contains("    vec3  iResolution; // comment\n"));
-        assert!(out.contains(
-            "layout(set = 0, binding = 0) uniform texture2D iChannel0_ghostty_texture;"
-        ));
-        assert!(out.contains("layout(set = 1, binding = 0) uniform sampler iChannel0_ghostty_sampler;"));
+        assert!(out
+            .contains("layout(set = 0, binding = 0) uniform texture2D iChannel0_ghostty_texture;"));
+        assert!(
+            out.contains("layout(set = 1, binding = 0) uniform sampler iChannel0_ghostty_sampler;")
+        );
         assert!(out.contains(
             "#define iChannel0 sampler2D(iChannel0_ghostty_texture, iChannel0_ghostty_sampler)\n"
         ));

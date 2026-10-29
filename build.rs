@@ -40,6 +40,15 @@ fn pkg_c_libraries() {
         }
     }
     glad.compile("glad");
+
+    // pkg/macos: the os_log_with_type macro wrapper.
+    if target_os == "macos" {
+        println!("cargo:rerun-if-changed=pkg/macos/os/zig_macos.c");
+        cc::Build::new()
+            .file("pkg/macos/os/zig_macos.c")
+            .flag("-std=c99")
+            .compile("ghostty_macos");
+    }
     if target_os == "linux" {
         // glad's loader uses dlopen.
         println!("cargo:rustc-link-lib=dylib=dl");

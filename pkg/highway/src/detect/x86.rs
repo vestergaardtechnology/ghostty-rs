@@ -93,7 +93,11 @@ pub fn detect() -> i64 {
     // Check XSAVE / AVX OS support before enabling any AVX-dependent target.
     let has_xsave = bit(leaf1.ecx, 27);
     let has_avx_bit = bit(leaf1.ecx, 28);
-    let xcr0: u32 = if has_xsave && has_avx_bit { xgetbv0() } else { 0 };
+    let xcr0: u32 = if has_xsave && has_avx_bit {
+        xgetbv0()
+    } else {
+        0
+    };
     let has_avx_save = (xcr0 & 0x6) == 0x6; // SSE + AVX state
 
     // Darwin lazily saves AVX-512 context on first use.

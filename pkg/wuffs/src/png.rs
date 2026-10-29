@@ -18,10 +18,8 @@ const LOG: &str = "wuffs_png";
 pub fn decode(data: &[u8]) -> Result<ImageData, Error> {
     // We do our own size limit check (below) so that the behavior matches
     // the Zig version: the decoder's own allocation limit is disabled.
-    let mut decoder = png::Decoder::new_with_limits(
-        Cursor::new(data),
-        png::Limits { bytes: usize::MAX },
-    );
+    let mut decoder =
+        png::Decoder::new_with_limits(Cursor::new(data), png::Limits { bytes: usize::MAX });
 
     // Expand palettes, low bit depths and tRNS chunks, add an alpha channel
     // and strip 16-bit samples so the output is always 8 bits per sample.

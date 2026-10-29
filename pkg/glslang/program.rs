@@ -20,7 +20,11 @@ struct Linked {
 }
 
 pub struct Program {
-    shaders: Vec<(c::glslang_stage_t, c::glslang_target_language_version_t, Option<naga::Module>)>,
+    shaders: Vec<(
+        c::glslang_stage_t,
+        c::glslang_target_language_version_t,
+        Option<naga::Module>,
+    )>,
     linked: Option<Linked>,
     spirv: Vec<u32>,
     spirv_messages: String,
@@ -131,10 +135,14 @@ impl Program {
             .find(|s| s.0 == stage)
             .map_or(c::GLSLANG_TARGET_SPV_1_0, |s| s.1);
         let options = naga::back::spv::Options {
-            lang_version: (((version >> 16) & 0xFF) as u8, ((version >> 8) & 0xFF) as u8),
+            lang_version: (
+                ((version >> 16) & 0xFF) as u8,
+                ((version >> 8) & 0xFF) as u8,
+            ),
             // Keep debug names (like glslang does) so that reflection on the
             // SPIR-V sees variable and member names.
-            flags: naga::back::spv::WriterFlags::DEBUG | naga::back::spv::WriterFlags::LABEL_VARYINGS,
+            flags: naga::back::spv::WriterFlags::DEBUG
+                | naga::back::spv::WriterFlags::LABEL_VARYINGS,
             ..Default::default()
         };
         let pipeline = naga_stage(stage).map(|shader_stage| naga::back::spv::PipelineOptions {
@@ -287,8 +295,11 @@ fn order_functions(module: &mut naga::Module) -> Vec<String> {
         return undefined;
     }
 
-    let funcs: Vec<(naga::Function, naga::Span)> =
-        module.functions.drain().map(|(_, f, span)| (f, span)).collect();
+    let funcs: Vec<(naga::Function, naga::Span)> = module
+        .functions
+        .drain()
+        .map(|(_, f, span)| (f, span))
+        .collect();
     let n = funcs.len();
     let deps: Vec<Vec<usize>> = funcs
         .iter()
@@ -318,7 +329,8 @@ fn order_functions(module: &mut naga::Module) -> Vec<String> {
         visit(i, &deps, &mut state, &mut order);
     }
 
-    let mut slots: Vec<Option<(naga::Function, naga::Span)>> = funcs.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<(naga::Function, naga::Span)>> =
+        funcs.into_iter().map(Some).collect();
     let mut map: Vec<Option<naga::Handle<naga::Function>>> = vec![None; n];
     for old in order {
         let (f, span) = slots[old].take().unwrap();
@@ -364,8 +376,12 @@ mod tests {
     fn compile(code: &str) -> Result<Vec<u32>, (Error, String)> {
         let input = input(code);
         let mut shader = Shader::create(&input).unwrap();
-        shader.preprocess(&input).map_err(|e| (e, shader.get_info_log().to_owned()))?;
-        shader.parse(&input).map_err(|e| (e, shader.get_info_log().to_owned()))?;
+        shader
+            .preprocess(&input)
+            .map_err(|e| (e, shader.get_info_log().to_owned()))?;
+        shader
+            .parse(&input)
+            .map_err(|e| (e, shader.get_info_log().to_owned()))?;
         let mut program = Program::create().unwrap();
         program.add_shader(&shader);
         program

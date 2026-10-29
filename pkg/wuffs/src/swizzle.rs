@@ -204,7 +204,10 @@ fn swizzle(src: &[u8], src_fmt: PixelFormat, dst_fmt: PixelFormat) -> Result<Vec
     dst.resize(dst_len, 0);
 
     let alpha_math = src_fmt.has_alpha() && dst_fmt.has_alpha();
-    for (s, d) in src.chunks_exact(src_size).zip(dst.chunks_exact_mut(dst_size)) {
+    for (s, d) in src
+        .chunks_exact(src_size)
+        .zip(dst.chunks_exact_mut(dst_size))
+    {
         let mut v = src_fmt.read(s);
         if alpha_math {
             v = convert_alpha(v, src_fmt.premul(), dst_fmt.premul());
