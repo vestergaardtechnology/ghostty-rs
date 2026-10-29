@@ -302,7 +302,10 @@ fn take_byte<R: BufRead + ?Sized>(reader: &mut R) -> io::Result<Option<u8>> {
 
 fn trim<'a>(s: &'a [u8], chars: &[u8]) -> &'a [u8] {
     let start = s.iter().position(|c| !chars.contains(c)).unwrap_or(s.len());
-    let end = s.iter().rposition(|c| !chars.contains(c)).map_or(start, |i| i + 1);
+    let end = s
+        .iter()
+        .rposition(|c| !chars.contains(c))
+        .map_or(start, |i| i + 1);
     &s[start..end]
 }
 
@@ -564,8 +567,12 @@ mod tests {
         let v = Envelope::parse(&mut reader).unwrap();
 
         assert_eq!(2usize, v.items.len());
-        let Item::Encoded(a) = &v.items[0] else { panic!() };
-        let Item::Encoded(b) = &v.items[1] else { panic!() };
+        let Item::Encoded(a) = &v.items[0] else {
+            panic!()
+        };
+        let Item::Encoded(b) = &v.items[1] else {
+            panic!()
+        };
         assert_eq!(ItemType::Session, a.r#type);
         assert_eq!(ItemType::Attachment, b.r#type);
     }
@@ -583,8 +590,12 @@ mod tests {
         let v = Envelope::parse(&mut reader).unwrap();
 
         assert_eq!(2usize, v.items.len());
-        let Item::Encoded(a) = &v.items[0] else { panic!() };
-        let Item::Encoded(b) = &v.items[1] else { panic!() };
+        let Item::Encoded(a) = &v.items[0] else {
+            panic!()
+        };
+        let Item::Encoded(b) = &v.items[1] else {
+            panic!()
+        };
         assert_eq!(ItemType::Session, a.r#type);
         assert_eq!(ItemType::Attachment, b.r#type);
     }
@@ -596,7 +607,9 @@ mod tests {
         let v = Envelope::parse(&mut reader).unwrap();
 
         assert_eq!(1usize, v.items.len());
-        let Item::Encoded(a) = &v.items[0] else { panic!() };
+        let Item::Encoded(a) = &v.items[0] else {
+            panic!()
+        };
         assert_eq!(ItemType::Session, a.r#type);
     }
 
@@ -616,7 +629,9 @@ mod tests {
         let Item::Encoded(enc) = &*item else { panic!() };
         assert_eq!(ItemType::Attachment, enc.r#type);
         item.decode().unwrap();
-        let Item::Attachment(att) = &*item else { panic!() };
+        let Item::Attachment(att) = &*item else {
+            panic!()
+        };
         assert_eq!("test.txt", att.filename);
 
         // Serialization test

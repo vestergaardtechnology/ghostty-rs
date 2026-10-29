@@ -235,12 +235,30 @@ mod tests {
         let src = Source {
             names: &["ghostty", "xterm-ghostty", "Ghostty"],
             capabilities: &[
-                Capability { name: "am", value: Value::Boolean },
-                Capability { name: "colors", value: Value::Numeric(256) },
-                Capability { name: "kx", value: Value::String("^?") },
-                Capability { name: "kbs", value: Value::String("^H") },
-                Capability { name: "kf1", value: Value::String("\\EOP") },
-                Capability { name: "Smulx", value: Value::String("\\E[4:%p1%dm") },
+                Capability {
+                    name: "am",
+                    value: Value::Boolean,
+                },
+                Capability {
+                    name: "colors",
+                    value: Value::Numeric(256),
+                },
+                Capability {
+                    name: "kx",
+                    value: Value::String("^?"),
+                },
+                Capability {
+                    name: "kbs",
+                    value: Value::String("^H"),
+                },
+                Capability {
+                    name: "kf1",
+                    value: Value::String("\\EOP"),
+                },
+                Capability {
+                    name: "Smulx",
+                    value: Value::String("\\E[4:%p1%dm"),
+                },
             ],
         };
 
@@ -272,10 +290,22 @@ mod tests {
         let src = Source {
             names: &["ghostty", "xterm-ghostty", "Ghostty"],
             capabilities: &[
-                Capability { name: "am", value: Value::Boolean },
-                Capability { name: "ccc", value: Value::Canceled },
-                Capability { name: "colors", value: Value::Numeric(256) },
-                Capability { name: "bel", value: Value::String("^G") },
+                Capability {
+                    name: "am",
+                    value: Value::Boolean,
+                },
+                Capability {
+                    name: "ccc",
+                    value: Value::Canceled,
+                },
+                Capability {
+                    name: "colors",
+                    value: Value::Numeric(256),
+                },
+                Capability {
+                    name: "bel",
+                    value: Value::String("^G"),
+                },
             ],
         };
 

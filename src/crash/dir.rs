@@ -125,12 +125,18 @@ pub(crate) mod xdg {
     use std::path::PathBuf;
 
     /// `xdg.state`
-    pub fn state(environ_map: &EnvironMap, subdir: Option<&str>) -> Result<PathBuf, DefaultDirError> {
+    pub fn state(
+        environ_map: &EnvironMap,
+        subdir: Option<&str>,
+    ) -> Result<PathBuf, DefaultDirError> {
         dir(environ_map, subdir, "XDG_STATE_HOME", ".local/state")
     }
 
     /// `xdg.cache`
-    pub fn cache(environ_map: &EnvironMap, subdir: Option<&str>) -> Result<PathBuf, DefaultDirError> {
+    pub fn cache(
+        environ_map: &EnvironMap,
+        subdir: Option<&str>,
+    ) -> Result<PathBuf, DefaultDirError> {
         dir(environ_map, subdir, "XDG_CACHE_HOME", ".cache")
     }
 
@@ -233,12 +239,18 @@ mod tests {
         let mut env = EnvironMap::new();
         env.insert("HOME".into(), "/home/test".into());
         let dir = default_dir(&env).unwrap();
-        assert_eq!(PathBuf::from("/home/test/.local/state/ghostty/crash"), dir.path);
+        assert_eq!(
+            PathBuf::from("/home/test/.local/state/ghostty/crash"),
+            dir.path
+        );
 
         // An empty XDG var is ignored.
         env.insert("XDG_STATE_HOME".into(), "".into());
         let dir = default_dir(&env).unwrap();
-        assert_eq!(PathBuf::from("/home/test/.local/state/ghostty/crash"), dir.path);
+        assert_eq!(
+            PathBuf::from("/home/test/.local/state/ghostty/crash"),
+            dir.path
+        );
     }
 
     #[test]
@@ -273,7 +285,10 @@ mod tests {
         }
         names.sort();
         assert_eq!(
-            vec![OsString::from("a.ghosttycrash"), OsString::from("b.ghosttycrash")],
+            vec![
+                OsString::from("a.ghosttycrash"),
+                OsString::from("b.ghosttycrash")
+            ],
             names
         );
     }

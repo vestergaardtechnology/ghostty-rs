@@ -348,8 +348,10 @@ mod native {
             pub fn sentry_free(ptr: *mut c_void);
 
             pub fn sentry_value_new_object() -> sentry_value_t;
-            pub fn sentry_value_new_string_n(value: *const c_char, value_len: usize)
-                -> sentry_value_t;
+            pub fn sentry_value_new_string_n(
+                value: *const c_char,
+                value_len: usize,
+            ) -> sentry_value_t;
             pub fn sentry_value_new_int32(value: i32) -> sentry_value_t;
             pub fn sentry_value_decref(value: sentry_value_t);
             pub fn sentry_value_is_null(value: sentry_value_t) -> c_int;
@@ -423,7 +425,12 @@ mod native {
             // SAFETY: the key pointer/length pair is valid; ownership of
             // `value` moves into the object.
             unsafe {
-                c::sentry_value_set_by_key_n(self.value, key.as_ptr().cast(), key.len(), value.value);
+                c::sentry_value_set_by_key_n(
+                    self.value,
+                    key.as_ptr().cast(),
+                    key.len(),
+                    value.value,
+                );
             }
         }
 
@@ -444,7 +451,12 @@ mod native {
     fn set_tag(key: &str, value: &str) {
         // SAFETY: the pointer/length pairs are valid strings.
         unsafe {
-            c::sentry_set_tag_n(key.as_ptr().cast(), key.len(), value.as_ptr().cast(), value.len());
+            c::sentry_set_tag_n(
+                key.as_ptr().cast(),
+                key.len(),
+                value.as_ptr().cast(),
+                value.len(),
+            );
         }
     }
 
@@ -631,7 +643,9 @@ mod native {
         // SAFETY: valid envelope; the returned buffer is freed below.
         let ptr = unsafe { c::sentry_envelope_serialize(envelope, &mut len) };
         if ptr.is_null() {
-            return Err(Error::Io(io::Error::other("sentry_envelope_serialize failed")));
+            return Err(Error::Io(io::Error::other(
+                "sentry_envelope_serialize failed",
+            )));
         }
         struct Free(*mut c_char);
         impl Drop for Free {
@@ -689,11 +703,7 @@ mod tests {
     #[test]
     fn transport_discards_envelope_without_event() {
         let tmp = TmpDir::new();
-        let json = concat!(
-            "{}\n",
-            "{\"type\":\"session\",\"length\":2}\n",
-            "{}",
-        );
+        let json = concat!("{}\n", "{\"type\":\"session\",\"length\":2}\n", "{}",);
         let result = Transport::persist(&tmp.path, json.as_bytes(), "uuid").unwrap();
         assert!(result.is_none());
         assert!(!tmp.path.exists());
@@ -752,7 +762,10 @@ mod tests {
         assert_eq!(ThreadType::Renderer, st.r#type);
         assert_eq!("renderer", st.r#type.as_str());
         // SAFETY: `s` is alive.
-        assert_eq!(800, unsafe { (*st.surface).crash_dimensions() }.screen_width);
+        assert_eq!(
+            800,
+            unsafe { (*st.surface).crash_dimensions() }.screen_width
+        );
         std::thread::spawn(|| assert!(thread_state().is_none()))
             .join()
             .unwrap();
@@ -774,6 +787,9 @@ mod tests {
     fn cache_dir_path() {
         let mut env = EnvironMap::new();
         env.insert("XDG_CACHE_HOME".into(), "/cache".into());
-        assert_eq!(PathBuf::from("/cache/ghostty/sentry"), cache_dir(&env).unwrap());
+        assert_eq!(
+            PathBuf::from("/cache/ghostty/sentry"),
+            cache_dir(&env).unwrap()
+        );
     }
 }

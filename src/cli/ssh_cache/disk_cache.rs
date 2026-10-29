@@ -292,7 +292,9 @@ fn read_entries(file: &File) -> Result<Entries, Error> {
     // allocRemaining(.limited(MAX_CACHE_SIZE))
     let mut content = Vec::new();
     let reader = file;
-    reader.take(MAX_CACHE_SIZE as u64 + 1).read_to_end(&mut content)?;
+    reader
+        .take(MAX_CACHE_SIZE as u64 + 1)
+        .read_to_end(&mut content)?;
     if content.len() > MAX_CACHE_SIZE {
         return Err(Error::StreamTooLong);
     }
@@ -368,7 +370,10 @@ pub fn split_host_port(s: &str) -> HostPort<'_> {
                 port: Some(&s[close + 2..]),
             };
         }
-        return HostPort { host: s, port: None };
+        return HostPort {
+            host: s,
+            port: None,
+        };
     }
 
     if let Some(colon) = s.find(':') {
@@ -380,7 +385,10 @@ pub fn split_host_port(s: &str) -> HostPort<'_> {
         }
     }
 
-    HostPort { host: s, port: None }
+    HostPort {
+        host: s,
+        port: None,
+    }
 }
 
 fn is_valid_host_port(s: &str) -> bool {
@@ -449,7 +457,8 @@ fn host_name_validate(host: &str) -> bool {
             && b.len() <= 63
             && b[0] != b'-'
             && b[b.len() - 1] != b'-'
-            && b.iter().all(|&c| !c.is_ascii() || c == b'-' || c.is_ascii_alphanumeric())
+            && b.iter()
+                .all(|&c| !c.is_ascii() || c == b'-' || c.is_ascii_alphanumeric())
     })
 }
 
@@ -733,7 +742,10 @@ mod tests {
         let cache = DiskCache { path };
         let mut entries = cache.list().unwrap();
         assert_eq!(3, entries.len());
-        assert_eq!("xterm-newer", entries.get("a.com").unwrap().terminfo_version);
+        assert_eq!(
+            "xterm-newer",
+            entries.get("a.com").unwrap().terminfo_version
+        );
         deinit_entries(&mut entries);
     }
 
