@@ -7,6 +7,7 @@
 //! with one marker type per key implementing [`Setting`] (whose associated
 //! `Type` is the value type) and the [`NonAllocating`] marker trait that
 //! [`get`] requires.
+#![cfg(feature = "gtk")]
 
 use std::os::raw::c_int;
 

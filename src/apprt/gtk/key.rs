@@ -8,6 +8,7 @@
 //! helpers (`gdk_keyval_name`, `gdk_unicode_to_keyval`,
 //! `gdk_keyval_to_unicode`) are called through the C API because, unlike
 //! C, the gtk-rs wrappers insist on an initialized GTK.
+#![cfg(feature = "gtk")]
 
 use std::ffi::CStr;
 use std::fmt::{self, Write as _};

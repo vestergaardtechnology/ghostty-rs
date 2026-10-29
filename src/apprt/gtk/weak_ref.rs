@@ -1,6 +1,7 @@
 //! Port of `src/apprt/gtk/weak_ref.zig`.
 //!
 //! STATUS: ported
+#![cfg(feature = "gtk")]
 
 use glib::prelude::*;
 

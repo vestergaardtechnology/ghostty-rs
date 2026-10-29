@@ -1,11 +1,11 @@
 //! Port of `src/apprt/gtk.zig`.
 //!
-//! STATUS: partial — only the module tree is set up; the re-exports of
-//! `App`/`Surface`/`resourcesDir` wait for `App.zig`, `Surface.zig` and
-//! `class/*.zig` to be ported.
+//! STATUS: partial — the `App`/`Surface` re-exports wait for `App.zig`,
+//! `Surface.zig` and `class/*.zig` to be ported.
 //!
-//! The whole GTK apprt is only built with the `gtk` Cargo feature.
-#![cfg(feature = "gtk")]
+//! The GTK apprt is only built with the `gtk` Cargo feature. This module
+//! itself always exists (`apprt::rt` names it on Linux); its ported children
+//! each start with `#![cfg(feature = "gtk")]`.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "gtk/adw_version.rs"]
@@ -53,7 +53,9 @@ pub mod winproto;
 // The required comptime API for any apprt.
 // TODO(port-dedupe): `App` (`gtk/App.zig`) and `Surface` (`gtk/Surface.zig`)
 // once ported.
+#[cfg(feature = "gtk")]
 pub use self::flatpak::resources_dir;
 
 // The exported API, custom for the apprt.
+#[cfg(feature = "gtk")]
 pub use self::weak_ref::WeakRef;

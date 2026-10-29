@@ -11,6 +11,7 @@
 //! parameters are dropped; tracking cannot fail, so the Zig test
 //! "desktop notifications allocation failure preserves entries"
 //! (`checkAllAllocationFailures`) has no counterpart.
+#![cfg(feature = "gtk")]
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};

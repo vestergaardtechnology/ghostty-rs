@@ -12,6 +12,7 @@
 //! `v1_5` feature), so that check is not done at build time:
 //! [`log_version`] still reports [`AdwaitaMinimumVersionError`] at runtime,
 //! exactly as in Zig.
+#![cfg(feature = "gtk")]
 
 use std::cmp::Ordering;
 

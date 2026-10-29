@@ -6,6 +6,7 @@
 //! style to zig-gobject. These should, wherever possible, be Zig-friendly
 //! wrappers around existing GTK functionality, rather than complex new
 //! helpers.
+#![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "ext/actions.rs"]

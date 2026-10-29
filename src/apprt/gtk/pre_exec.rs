@@ -5,6 +5,7 @@
 //! Zig's `preExec(cmd: *Command)` reads `cmd.rt_pre_exec_info`. The ported
 //! `crate::command::Command` still carries an empty placeholder there
 //! (`RtPreExecInfo`), so [`pre_exec`] takes the [`PreExecInfo`] directly.
+#![cfg(feature = "gtk")]
 // TODO(port-dedupe): once `Command.rt_pre_exec_info` is this `PreExecInfo`,
 // add `fn(cmd: &mut Command) -> Option<u8>` reading it and calling `pre_exec`.
 

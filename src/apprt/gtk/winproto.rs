@@ -11,6 +11,7 @@
 //! `class/global_shortcuts.zig`'s `GlobalShortcuts`); they are described by
 //! the [`ApprtWindow`] and [`GlobalShortcuts`] traits below, which the
 //! ported classes are expected to implement.
+#![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "winproto/blur_region.rs"]

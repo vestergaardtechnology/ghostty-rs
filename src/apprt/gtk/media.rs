@@ -1,6 +1,7 @@
 //! Port of `src/apprt/gtk/media.zig`.
 //!
 //! STATUS: ported
+#![cfg(feature = "gtk")]
 
 use std::path::Path;
 

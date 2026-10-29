@@ -1,6 +1,7 @@
 //! Port of `src/apprt/gtk/portal.zig`.
 //!
 //! STATUS: ported
+#![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "portal/open_uri.rs"]

@@ -8,6 +8,7 @@
 //! [`post_fork`] takes the child PID and the [`PostForkInfo`] directly.
 //! `Application.default()` is the process's default `GApplication`, which is
 //! what `gio::Application::default()` returns.
+#![cfg(feature = "gtk")]
 // TODO(port-dedupe): once `Command.rt_post_fork_info` is this
 // `PostForkInfo`, add `fn(cmd: &mut Command) -> Result<(), PostForkError>`
 // reading it and calling `post_fork`.

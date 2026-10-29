@@ -1,6 +1,7 @@
 //! Port of `src/apprt/gtk/scale.zig`.
 //!
 //! STATUS: ported
+#![cfg(feature = "gtk")]
 
 use std::os::raw::c_int;
 

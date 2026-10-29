@@ -4,6 +4,7 @@
 //!
 //! Contains all the logic for putting individual surfaces into
 //! transient systemd scopes.
+#![cfg(feature = "gtk")]
 
 use gio::prelude::*;
 

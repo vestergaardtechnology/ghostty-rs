@@ -1,6 +1,7 @@
 //! Port of `src/apprt/gtk/flatpak.zig`.
 //!
 //! STATUS: ported
+#![cfg(feature = "gtk")]
 
 use crate::os::resourcesdir::NoSpaceLeft;
 use crate::os::{self as internal_os, ResourcesDir};

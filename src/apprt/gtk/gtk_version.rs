@@ -11,6 +11,7 @@
 //! (a `@compileError`). The port targets GTK 4.14 (the gtk-rs `v4_14`
 //! feature), so that check is not done at build time: [`log_version`] still
 //! reports [`GtkMinimumVersionError`] at runtime, exactly as in Zig.
+#![cfg(feature = "gtk")]
 
 use std::cmp::Ordering;
 
