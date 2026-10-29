@@ -25,6 +25,7 @@ sentry = []
 gtk = ["dep:gio", "dep:glib"]
 
 [dependencies]
+base64 = "0.22"
 getrandom = "0.3"
 gio = { version = "0.21", optional = true }
 glib = { version = "0.21", optional = true }
