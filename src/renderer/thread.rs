@@ -447,7 +447,7 @@ impl Thread {
 
             match crate::os::macos::set_qos_class(class) {
                 Ok(()) => log::debug!(target: LOG, "thread QoS class set class={class:?}"),
-                Err(err) => log::warn!(target: LOG, "error setting QoS class err={err}"),
+                Err(err) => log::warn!(target: LOG, "error setting QoS class err={err:?}"),
             }
         }
     }
