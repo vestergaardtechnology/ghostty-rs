@@ -63,8 +63,8 @@ pub use self::library::Library;
 pub use self::metrics::Metrics;
 // pub use self::shape::Cache as ShaperCache;
 // pub use self::shape::Shaper;
-// pub use self::shared_grid::SharedGrid;
-// pub use self::shared_grid_set::SharedGridSet;
+pub use self::shared_grid::SharedGrid;
+pub use self::shared_grid_set::SharedGridSet;
 pub use self::sprite::Face as SpriteFace;
 pub use self::sprite::Sprite;
 
