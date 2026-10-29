@@ -17,6 +17,8 @@ path = "src/main.rs"
 [features]
 default = []
 inspector = []
+# Crash reporting via the Sentry native SDK (links the system `sentry` C library).
+sentry = []
 
 [dependencies]
 getrandom = "0.3"
@@ -26,6 +28,7 @@ libc = "0.2"
 log = "0.4"
 memchr = "2"
 png = "0.18"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
 
