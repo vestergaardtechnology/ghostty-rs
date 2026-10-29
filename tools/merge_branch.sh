@@ -15,6 +15,6 @@ if ! git merge --no-ff --no-edit -m "$msg" "$br"; then
 fi
 python3 tools/scaffold.py >/dev/null
 if ! git diff --quiet; then git commit -qam "scaffold: refresh generated mod blocks"; fi
-cargo build -q 2>&1 | grep -E '^error' -A12 | head -40 || true
-cargo test -q --lib 2>&1 | grep -E '^test result|FAILED|panicked' | tail -15
+timeout 3000 cargo build -q 2>&1 | grep -E '^error' -A12 | head -40 || true
+timeout 3000 cargo test -q --lib 2>&1 | grep -E '^test result|FAILED|panicked' | tail -15
 git push -q origin main 2>&1 | tail -2; python3 tools/status.py | head -3
