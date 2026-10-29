@@ -12317,4 +12317,931 @@ mod tests {
         s.untrack_pin(retained_pin);
         s.untrack_pin(removed_pin);
     }
+
+    #[test]
+    fn page_list_set_max_limits_remain_independent() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+        let byte_limit = 3 * PagePool::item_size();
+        let line_limit = page_rows / 2;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 1,
+            max_size: None,
+            max_lines: None,
+        });
+
+        s.grow_rows(4 * page_rows).unwrap();
+
+        // The byte setter leaves the line limit unlimited.
+        s.set_max_bytes(Some(byte_limit));
+        assert_eq!(byte_limit, s.limits.bytes.explicit);
+        assert_eq!(usize::MAX, s.limits.lines.explicit);
+        assert_eq!(3, s.total_pages());
+        assert_eq!(2 * page_rows, s.total_rows - s.rows as usize);
+
+        // The smaller runtime line limit prunes one more complete page without
+        // changing the configured byte limit. Its effective value is raised to
+        // the existing one-page minimum.
+        s.set_max_lines(Some(line_limit));
+        assert_eq!(byte_limit, s.limits.bytes.explicit);
+        assert_eq!(line_limit, s.limits.lines.explicit);
+        assert_eq!(page_rows, s.limits.max(LimitKey::Lines));
+        assert_eq!(2, s.total_pages());
+        assert_eq!(page_rows, s.total_rows - s.rows as usize);
+
+        // Removing only the line limit leaves byte enforcement in effect.
+        s.set_max_lines(None);
+        s.grow_rows(3 * page_rows).unwrap();
+        assert_eq!(byte_limit, s.page_size);
+        assert_eq!(3, s.total_pages());
+        assert!(s.total_rows - s.rows as usize > page_rows);
+    }
+
+    #[test]
+    fn page_list_max_lines_uses_one_page_minimum() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 1,
+            max_lines: Some(page_rows / 2),
+            ..Default::default()
+        });
+
+        assert_eq!(page_rows, s.limits.max(LimitKey::Lines));
+
+        // The requested limit is below one page, so a complete page of history
+        // remains valid.
+        s.grow_rows(page_rows).unwrap();
+        assert_eq!(page_rows, s.total_rows - s.rows as usize);
+        assert_eq!(2, s.total_pages());
+
+        let first = first(&s);
+        let old_page_size = s.page_size;
+
+        // One more row puts us over the effective limit. The now-complete
+        // historical page is removed rather than partially trimmed.
+        s.grow().unwrap();
+        assert_eq!(1, s.total_rows - s.rows as usize);
+        assert_eq!(1, s.total_pages());
+        assert!(s.pages.first.unwrap() != first);
+        assert_eq!(old_page_size - PagePool::item_size(), s.page_size);
+    }
+
+    #[test]
+    fn page_list_max_lines_does_not_round_larger_limits() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+        let max_lines = page_rows + page_rows / 2;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 1,
+            max_lines: Some(max_lines),
+            ..Default::default()
+        });
+
+        assert_eq!(max_lines, s.limits.max(LimitKey::Lines));
+        s.grow_rows(max_lines).unwrap();
+        assert_eq!(max_lines, s.total_rows - s.rows as usize);
+
+        let first = first(&s);
+        let retained = next(first);
+        let removed_pin = s.track_pin(Pin::new(first)).unwrap();
+        let retained_pin = s.track_pin(Pin::new(retained)).unwrap();
+
+        s.scroll(Scroll::Pin(*tp(retained_pin)));
+        assert_eq!(page_rows, s.scrollbar().offset);
+
+        let old_page_size = s.page_size;
+        s.grow().unwrap();
+
+        // Whole-page pruning undershoots the requested limit without rounding it.
+        assert_eq!(max_lines + 1 - page_rows, s.total_rows - s.rows as usize);
+        assert_eq!(retained, s.pages.first.unwrap());
+        assert_eq!(retained, tp(removed_pin).node);
+        assert!(tp(removed_pin).garbage);
+        assert_eq!(retained, tp(retained_pin).node);
+        assert!(!tp(retained_pin).garbage);
+        assert_eq!(0, s.scrollbar().offset);
+        assert_eq!(old_page_size - PagePool::item_size(), s.page_size);
+
+        s.untrack_pin(retained_pin);
+        s.untrack_pin(removed_pin);
+    }
+
+    #[test]
+    fn page_list_max_lines_and_max_size_enforce_the_smaller_limit() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        // A line limit of one page keeps the logical allocation below a much
+        // larger byte limit.
+        {
+            let mut s = init_opts(Options {
+                cols,
+                rows: 1,
+                max_size: Some(8 * PagePool::item_size()),
+                max_lines: Some(page_rows),
+            });
+
+            s.grow_rows(4 * page_rows).unwrap();
+            assert!(s.total_rows - s.rows as usize <= s.limits.max(LimitKey::Lines));
+            assert!(s.total_pages() <= 2);
+            assert!(s.page_size < s.limits.max(LimitKey::Bytes));
+        }
+
+        // A two-page byte limit prunes before the larger line limit is reached.
+        {
+            let mut s = init_opts(Options {
+                cols,
+                rows: 1,
+                max_size: Some(PagePool::item_size()),
+                max_lines: Some(4 * page_rows),
+            });
+
+            s.grow_rows(2 * page_rows).unwrap();
+            assert!(s.total_rows - (s.rows as usize) < s.limits.max(LimitKey::Lines));
+            assert_eq!(s.limits.max(LimitKey::Bytes), s.page_size);
+        }
+    }
+
+    #[test]
+    fn page_list_max_lines_applies_to_resize_and_clone() {
+        let cols: CellCountInt = 80;
+        let page_rows: usize = initial_capacity(cols).rows as usize;
+
+        let mut s = init_opts(Options {
+            cols,
+            rows: 2,
+            max_lines: Some(page_rows),
+            ..Default::default()
+        });
+
+        s.grow_rows(page_rows).unwrap();
+        assert_eq!(page_rows, s.total_rows - s.rows as usize);
+
+        // Prevent row shrinking from trimming the trailing active row instead of
+        // turning it into history.
+        let cell = s.get_cell(pt_active(0, 1)).unwrap();
+        unsafe { *cell.cell = cp('A') };
+
+        s.resize(Resize {
+            rows: Some(1),
+            reflow: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(1, s.total_rows - s.rows as usize);
+
+        let new_cols: CellCountInt = cols + 1;
+        s.resize(Resize {
+            cols: Some(new_cols),
+            reflow: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(Limits::min_max_lines(new_cols), s.limits.lines.min);
+
+        // Exercise the same active-row shrink through the reflow path. Reflow
+        // completes before the newly historical complete page is pruned.
+        {
+            let mut reflowed = init_opts(Options {
+                cols,
+                rows: 2,
+                max_lines: Some(page_rows),
+                ..Default::default()
+            });
+
+            reflowed.grow_rows(page_rows).unwrap();
+            let active_cell = reflowed.get_cell(pt_active(0, 1)).unwrap();
+            unsafe { *active_cell.cell = cp('A') };
+
+            reflowed
+                .resize(Resize {
+                    cols: Some(new_cols),
+                    rows: Some(1),
+                    reflow: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(Limits::min_max_lines(new_cols), reflowed.limits.lines.min);
+            assert!(
+                reflowed.total_rows - reflowed.rows as usize <= reflowed.limits.max(LimitKey::Lines)
+                    || reflowed.pages.first.unwrap() == reflowed.get_top_left(Tag::Active).node
+            );
+        }
+
+        let mut cloned = s.clone(clone_opts(pt_screen(0, 0), None)).unwrap();
+
+        assert_eq!(s.limits, cloned.limits);
+
+        let max = cloned.limits.max(LimitKey::Lines);
+        cloned.grow_rows(2 * max).unwrap();
+        assert!(
+            cloned.total_rows - cloned.rows as usize <= cloned.limits.max(LimitKey::Lines)
+                || cloned.pages.first.unwrap() == cloned.get_top_left(Tag::Active).node
+        );
+    }
+
+    #[test]
+    fn page_list_grow_prune_scrollback() {
+        // Use std_size to limit scrollback so pruning is triggered.
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(std_size()),
+            ..Default::default()
+        });
+
+        // Grow to capacity
+        let page1_node = last(&s);
+        let page1 = pg(page1_node);
+        for _ in 0..(page1.capacity.rows - page1.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // Grow and allocate one more page. Then fill that page up.
+        let page2_node = s.grow().unwrap().unwrap();
+        let page2 = pg(page2_node);
+        for _ in 0..(page2.capacity.rows - page2.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // Get our page size
+        let old_page_size = s.page_size;
+
+        // Create a tracked pin in the first page
+        let p = s.track_pin(s.pin(pt_screen(0, 0)).unwrap()).unwrap();
+        assert!(tp(p).node == first(&s));
+
+        // Scroll back to create a pinned viewport (not active)
+        let pin_y = (page1.capacity.rows / 2) as usize;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+
+        // Get the scrollbar state to populate the cache
+        let scrollbar_before = s.scrollbar();
+        assert_eq!(pin_y, scrollbar_before.offset);
+
+        // Next should create a new page, but it should reuse our first
+        // page since we're at max size.
+        let new = s.grow().unwrap().unwrap();
+        assert!(last(&s) == new);
+        assert_eq!(s.page_size, old_page_size);
+
+        // Our first should now be page2 and our last should be page1
+        assert_eq!(page2_node, first(&s));
+        assert_eq!(page1_node, last(&s));
+
+        // Our tracked pin should point to the top-left of the first page
+        assert!(tp(p).node == first(&s));
+        assert!(tp(p).x == 0);
+        assert!(tp(p).y == 0);
+        assert!(tp(p).garbage);
+
+        // Verify the viewport offset cache was invalidated. After pruning,
+        // the offset should have changed because we removed rows from
+        // the beginning.
+        {
+            let scrollbar_after = s.scrollbar();
+            let rows_pruned = pg(page1_node).capacity.rows as usize;
+            let expected_offset = if pin_y >= rows_pruned { pin_y - rows_pruned } else { 0 };
+            assert_eq!(expected_offset, scrollbar_after.offset);
+        }
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_grow_prune_scrollback_with_viewport_pin_not_in_pruned_page() {
+        // Use std_size to limit scrollback so pruning is triggered.
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(std_size()),
+            ..Default::default()
+        });
+
+        // Grow to capacity of first page
+        let page1_node = last(&s);
+        let page1 = pg(page1_node);
+        for _ in 0..(page1.capacity.rows - page1.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // Grow and allocate second page, then fill it up
+        let page2_node = s.grow().unwrap().unwrap();
+        let page2 = pg(page2_node);
+        for _ in 0..(page2.capacity.rows - page2.size.rows) {
+            assert!(s.grow().unwrap().is_none());
+        }
+
+        // Get our page size
+        let old_page_size = s.page_size;
+
+        // Scroll back to create a pinned viewport in page2 (NOT page1)
+        // This is the key difference from the previous test - the viewport
+        // pin is NOT in the page that will be pruned.
+        let pin_y = page1.capacity.rows as usize + 5;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert!(vp(&s).node == page2_node);
+
+        // Get the scrollbar state to populate the cache
+        let scrollbar_before = s.scrollbar();
+        assert_eq!(pin_y, scrollbar_before.offset);
+
+        // Next grow will trigger pruning of the first page.
+        // The viewport_pin.node is page2, not page1, so it won't be moved
+        // by the pin update loop, but the cached offset still needs to be
+        // invalidated because rows were removed from the beginning.
+        let new = s.grow().unwrap().unwrap();
+        assert!(last(&s) == new);
+        assert_eq!(s.page_size, old_page_size);
+
+        // Our first should now be page2 (page1 was pruned)
+        assert_eq!(page2_node, first(&s));
+
+        // The viewport pin should still be on page2, unchanged
+        assert!(vp(&s).node == page2_node);
+
+        // Verify the viewport offset cache was invalidated/updated.
+        // After pruning, the offset should have decreased by the number
+        // of rows that were pruned.
+        let scrollbar_after = s.scrollbar();
+        let rows_pruned = pg(page1_node).capacity.rows as usize;
+        let expected_offset = pin_y - rows_pruned;
+        assert_eq!(expected_offset, scrollbar_after.offset);
+    }
+
+    /// Grow `count` rows (Zig: `for (0..count) |_| if (try s.grow()) |new_page| cur_page = new_page;`).
+    fn grow_n(s: &mut PageList, count: usize) {
+        for _ in 0..count {
+            s.grow().unwrap();
+        }
+    }
+
+    #[test]
+    fn page_list_erase_rows_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 3);
+
+        // Scroll back to create a pinned viewport somewhere in the middle
+        // of the scrollback
+        let pin_y = cap_rows;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase some history rows BEFORE the viewport pin.
+        // This removes rows from before our pin, which changes its absolute
+        // offset from the top, but the cache is not invalidated.
+        let rows_to_erase = cap_rows / 2;
+        s.erase_history(Some(pt_history(0, rows_to_erase as u32 - 1)));
+
+        assert_eq!(
+            sb(s.total_rows, pin_y - rows_to_erase, s.rows as usize),
+            s.scrollbar()
+        );
+    }
+
+    #[test]
+    fn page_list_erase_row_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 3);
+
+        // Scroll back to create a pinned viewport somewhere in the middle
+        // of the scrollback
+        let pin_y = cap_rows;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase a single row from the history BEFORE the viewport pin.
+        // This removes one row from before our pin, which changes its absolute
+        // offset from the top by 1, but the cache is not invalidated.
+        s.erase_row(pt_history(0, 0));
+
+        assert_eq!(sb(s.total_rows, pin_y - 1, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 3);
+
+        // Scroll back to create a pinned viewport somewhere in the middle
+        // of the scrollback
+        let pin_y: usize = 4;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase a row from the history BEFORE the viewport pin with a bounded
+        // shift. This removes one row from before our pin, which changes its
+        // absolute offset from the top by 1, but the cache is not invalidated.
+        s.erase_row_bounded(pt_history(0, 0), 10);
+
+        // Verify the scrollbar reflects the change (offset decreased by 1)
+        assert_eq!(sb(s.total_rows, pin_y - 1, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_row_erasure_renews_affected_page_generations() {
+        let mut s = init(80, 24);
+        while s.total_pages() < 2 {
+            s.grow().unwrap();
+        }
+
+        let first = first(&s);
+        let second = next(first);
+        let mut first_serial = n(first).serial;
+        let mut second_serial = n(second).serial;
+        let mut activity = s.page_compression.activity_serial;
+
+        s.erase_row(pt_history(0, 0));
+        assert!(!s.node_is_valid(first, first_serial));
+        assert!(!s.node_is_valid(second, second_serial));
+        assert!(activity != s.page_compression.activity_serial);
+
+        first_serial = n(first).serial;
+        second_serial = n(second).serial;
+        activity = s.page_compression.activity_serial;
+        s.erase_row_bounded(pt_history(0, 0), n(first).rows() as usize + 1);
+        assert!(!s.node_is_valid(first, first_serial));
+        assert!(!s.node_is_valid(second, second_serial));
+        assert!(activity != s.page_compression.activity_serial);
+    }
+
+    #[test]
+    fn page_list_trailing_row_truncation_renews_page_generation() {
+        let mut s = init(80, 24);
+
+        let node = last(&s);
+        let old_serial = n(node).serial;
+        let trimmed = s.trim_trailing_blank_rows(1);
+        s.total_rows -= trimmed as usize;
+        assert_eq!(1, trimmed);
+        assert!(!s.node_is_valid(node, old_serial));
+
+        s.grow().unwrap();
+        s.expect_live_page_serials_valid_for_test();
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_multi_page_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 3);
+
+        // Scroll back to create a pinned viewport somewhere in the middle
+        // of the scrollback, after the first page
+        let pin_y = cap_rows + 1;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase a row from the beginning of history with a limit that spans
+        // across multiple pages. This ensures we hit the code path where
+        // eraseRowBounded finds the limit boundary in a subsequent page.
+        let limit = cap_rows + 10;
+        s.erase_row_bounded(pt_history(0, 0), limit);
+
+        // Verify the scrollbar reflects the change (offset decreased by 1)
+        assert_eq!(sb(s.total_rows, pin_y - 1, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_full_page_shift_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 4);
+
+        // Scroll back to create a pinned viewport somewhere well beyond
+        // the first two pages
+        let pin_y = 5;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase a row from the beginning of history with a limit that is
+        // larger than multiple full pages. This ensures we hit the code path
+        // where eraseRowBounded continues looping through entire pages,
+        // rotating all rows in each page until it reaches the limit or
+        // runs out of pages.
+        let limit = cap_rows * 2 + 10;
+        s.erase_row_bounded(pt_history(0, 0), limit);
+
+        // Verify the scrollbar reflects the change (offset decreased by 1)
+        assert_eq!(sb(s.total_rows, pin_y - 1, s.rows as usize), s.scrollbar());
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_exhausts_pages_invalidates_viewport_offset_cache() {
+        let mut s = init(80, 24);
+
+        // Grow so we take up several pages worth of history
+        let cap_rows = pg(last(&s)).capacity.rows as usize;
+        grow_n(&mut s, cap_rows * 3);
+
+        // Our total rows should include history
+        let total_rows_before = s.total_rows();
+        assert!(total_rows_before > s.rows as usize);
+
+        // Scroll back to create a pinned viewport somewhere in the history,
+        // well after the erase will complete
+        let pin_y = cap_rows * 2 + 10;
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, pin_y as u32)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert_eq!(sb(s.total_rows, pin_y, s.rows as usize), s.scrollbar());
+
+        // Erase a row from the beginning of history with a limit that is
+        // LARGER than all remaining pages combined. This ensures we exhaust
+        // all pages in the while loop and reach the cleanup code after the loop.
+        let limit = total_rows_before * 2;
+        s.erase_row_bounded(pt_history(0, 0), limit);
+
+        // Verify the scrollbar reflects the change (offset decreased by 1)
+        assert_eq!(sb(s.total_rows, pin_y - 1, s.rows as usize), s.scrollbar());
+    }
+
+    /// Fill every active cell with codepoint `x + offset`.
+    fn fill_x(s: &PageList, offset: u32) {
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(s));
+        for y in 0..s.rows as usize {
+            for x in 0..s.cols as usize {
+                *cell_at(page, x, y) = cpu(x as u32 + offset);
+            }
+        }
+    }
+
+    fn check_x(s: &PageList, offset: u32) {
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(s));
+        for y in 0..s.rows as usize {
+            for x in 0..s.cols as usize {
+                assert_eq!(x as u32 + offset, cell_at(page, x, y).content_codepoint());
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_increase_capacity_to_increase_styles() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_styles_cap = n(first(&s)).capacity().styles;
+
+        // Write all our data so we can assert its the same after
+        fill_x(&s, 0);
+
+        // Increase our styles
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        // Verify capacity doubled
+        assert!(s.pages.first == s.pages.last);
+        assert_eq!(original_styles_cap * 2, pg(first(&s)).capacity.styles);
+
+        // Verify data preserved
+        check_x(&s, 0);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_styles_projects_capacity_from_page_density() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_cap = n(first(&s)).capacity().styles;
+
+        // Write styled cells so the page has a measurable per-row style
+        // density (unlike the plain doubling test above, which grows a
+        // page with no styles in use).
+        let mut bold = stylepkg::Style::default();
+        bold.flags.bold = true;
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            for y in 0..s.rows as usize {
+                for x in 0..s.cols as usize {
+                    let (row, cell) = rac(page, x, y);
+                    let style_id = unsafe { page.styles.add(page.memory, bold) }.unwrap();
+                    row.set_styled(true);
+                    let mut c = cpu(x as u32 + 1);
+                    c.set_style_id(style_id);
+                    *cell = c;
+                }
+            }
+        }
+
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // The page uses only two active rows out of thousands of rows
+            // of capacity, so the projected full-page need saturates the
+            // 32x-per-event growth bound instead of merely doubling.
+            assert_eq!(original_cap * 32, page.capacity.styles);
+
+            // All cell content and styles are preserved by the growth.
+            for y in 0..s.rows as usize {
+                for x in 0..s.cols as usize {
+                    let cell = cell_at(page, x, y);
+                    assert_eq!(x as u32 + 1, cell.content_codepoint());
+                    assert!(cell.style_id() != stylepkg::DEFAULT_ID);
+                    assert!(bold.eql(unsafe { &*page.styles.get(page.memory, cell.style_id()) }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_increase_capacity_to_increase_graphemes() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_cap = n(first(&s)).capacity().grapheme_bytes;
+
+        fill_x(&s, 0);
+
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+
+        assert!(s.pages.first == s.pages.last);
+        assert_eq!(original_cap * 2, pg(first(&s)).capacity.grapheme_bytes);
+        check_x(&s, 0);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_graphemes_projects_capacity_from_page_density() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_cap = n(first(&s)).capacity().grapheme_bytes;
+
+        // Write cells with grapheme data so the page has a measurable
+        // per-row grapheme density (unlike the plain doubling test above,
+        // which grows a page with no grapheme usage).
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            for y in 0..s.rows as usize {
+                for x in 0..s.cols as usize {
+                    let (row, cell) = rac(page, x, y);
+                    *cell = cpu(x as u32 + 1);
+                    page.append_grapheme(row, cell, 0x0301).unwrap();
+                    page.append_grapheme(row, cell, 0x0302).unwrap();
+                }
+            }
+        }
+
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // The page uses only two active rows out of thousands of rows
+            // of capacity, so the projected full-page need saturates the
+            // 32x-per-event growth bound instead of merely doubling.
+            assert_eq!(original_cap * 32, page.capacity.grapheme_bytes);
+
+            // All cell and grapheme content is preserved by the growth.
+            assert_eq!(s.rows as usize * s.cols as usize, page.grapheme_count());
+            for y in 0..s.rows as usize {
+                for x in 0..s.cols as usize {
+                    let cell = cell_at(page, x, y);
+                    assert_eq!(x as u32 + 1, cell.content_codepoint());
+                    let cps = page.lookup_grapheme(cell).unwrap();
+                    assert_eq!(2, cps.len());
+                    assert_eq!(0x0301, cps[0]);
+                    assert_eq!(0x0302, cps[1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_increase_capacity_to_increase_hyperlinks() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_cap = n(first(&s)).capacity().hyperlink_bytes;
+
+        fill_x(&s, 0);
+
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::HyperlinkBytes))
+            .unwrap();
+
+        assert!(s.pages.first == s.pages.last);
+        assert_eq!(original_cap * 2, pg(first(&s)).capacity.hyperlink_bytes);
+        check_x(&s, 0);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_to_increase_string_bytes() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let original_cap = n(first(&s)).capacity().string_bytes;
+
+        fill_x(&s, 0);
+
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::StringBytes))
+            .unwrap();
+
+        assert!(s.pages.first == s.pages.last);
+        assert_eq!(original_cap * 2, pg(first(&s)).capacity.string_bytes);
+        check_x(&s, 0);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_tracked_pins() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Create a tracked pin on the first page
+        let tracked = s.track_pin(s.pin(pt_active(1, 1)).unwrap()).unwrap();
+
+        let old_node = first(&s);
+        assert_eq!(old_node, tp(tracked).node);
+
+        // Increase capacity
+        let new_node = s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        // Pin should now point to the new node
+        assert_eq!(new_node, tp(tracked).node);
+        assert_eq!(1, tp(tracked).x);
+        assert_eq!(1, tp(tracked).y);
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_returns_out_of_space_at_max_capacity() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Keep increasing styles capacity until we get OutOfSpace
+        let max_styles = size::StyleCountInt::MAX;
+        loop {
+            if let Err(err) = s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)) {
+                // Before OutOfSpace, we should have reached maxInt
+                assert_eq!(IncreaseCapacityError::OutOfSpace, err);
+                assert_eq!(max_styles, n(first(&s)).capacity().styles);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_increase_capacity_after_col_shrink() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Shrink columns
+        s.resize(Resize {
+            cols: Some(5),
+            reflow: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(5, s.cols);
+
+        {
+            let page = pg(first(&s));
+            assert_eq!(5, page.size.cols);
+            assert!(page.capacity.cols >= 10);
+        }
+
+        // Increase capacity
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        {
+            let page = pg(first(&s));
+            // size.cols should still be 5, not reverted to capacity.cols
+            assert_eq!(5, page.size.cols);
+            assert_eq!(5, s.cols);
+        }
+    }
+
+    #[test]
+    fn page_list_increase_capacity_multi_page() {
+        let mut s = init(80, 24);
+
+        // Grow to create a second page
+        let page1_node = last(&s);
+        pg(page1_node).pause_integrity_checks(true);
+        for _ in 0..(n(page1_node).capacity().rows - n(page1_node).rows()) {
+            assert!(s.grow().unwrap().is_none());
+        }
+        pg(page1_node).pause_integrity_checks(false);
+        assert!(s.grow().unwrap().is_some());
+
+        // Now we have two pages
+        assert!(s.pages.first != s.pages.last);
+        let page2_node = last(&s);
+
+        let page1_styles_cap = n(first(&s)).capacity().styles;
+        let page2_styles_cap = n(page2_node).capacity().styles;
+
+        // Increase capacity on the first page only
+        s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        // First page capacity should be doubled
+        assert_eq!(page1_styles_cap * 2, n(first(&s)).capacity().styles);
+
+        // Second page should be unchanged
+        assert_eq!(page2_styles_cap, n(last(&s)).capacity().styles);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_preserves_dirty_flag() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 4,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Set page dirty flag and mark some rows as dirty
+        let page = pg(first(&s));
+        page.dirty = true;
+
+        row_at(page, 0).set_dirty(true);
+        row_at(page, 1).set_dirty(false);
+        row_at(page, 2).set_dirty(true);
+        row_at(page, 3).set_dirty(false);
+
+        // Increase capacity
+        let new_node = s.increase_capacity(first(&s), Some(IncreaseCapacity::Styles)).unwrap();
+
+        // The page dirty flag should be preserved
+        assert!(pg(new_node).dirty);
+
+        // Row dirty flags should be preserved
+        let np = pg(new_node);
+        assert!(row_at(np, 0).dirty());
+        assert!(!row_at(np, 1).dirty());
+        assert!(row_at(np, 2).dirty());
+        assert!(!row_at(np, 3).dirty());
+    }
 }
