@@ -9261,4 +9261,1994 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_scrollup_preserves_pending_wrap() {
+        let mut t = init(5, 5);
+
+        t.set_cursor_pos(1, 5);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 5);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 5);
+        t.print('C' as u32).unwrap();
+        t.scroll_up(1).unwrap();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("    B\n    C\n\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_full_top_bottom_region() {
+        let mut t = init(5, 5);
+
+        t.print_string("top").unwrap();
+        t.set_cursor_pos(5, 1);
+        t.print_string("ABCDE").unwrap();
+        t.set_top_and_bottom_margin(2, 5);
+
+        t.clear_dirty();
+        t.scroll_up(4).unwrap();
+
+        // This is dirty because the cursor moves from this row
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("top", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_full_top_bottomleft_right_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.print_string("top").unwrap();
+        t.set_cursor_pos(5, 1);
+        t.print_string("ABCDE").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_left_and_right_margin(2, 4);
+
+        t.clear_dirty();
+        t.scroll_up(4).unwrap();
+
+        // This is dirty because the cursor moves from this row
+        assert!(t.is_dirty(act(0, 0)));
+        for y in 1..5 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("top\n\n\n\nA   E", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_creates_scrollback_in_primary_screen() {
+        // When in primary screen with full-width scroll region at top,
+        // scrollUp (CSI S) should push lines into scrollback like xterm.
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(10), ..Default::default() }).unwrap();
+
+        // Fill the screen with content
+        t.print_string("AAAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("BBBBB").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("CCCCC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DDDDD").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("EEEEE").unwrap();
+
+        t.clear_dirty();
+
+        // Scroll up by 1, which should push "AAAAA" into scrollback
+        t.scroll_up(1).unwrap();
+
+        // The cursor row (new empty row) should be dirty
+        assert!(rw(t.screens.active.cursor.page_row).dirty());
+
+        // The active screen should now show BBBBB through EEEEE plus one blank line
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("BBBBB\nCCCCC\nDDDDD\nEEEEE", str);
+        }
+
+        // Now scroll to the top to see scrollback - AAAAA should be there
+        t.screens.active.scroll(screen::Scroll::Top);
+        {
+            let str = t.plain_string().unwrap();
+            // Should see AAAAA in scrollback
+            assert_eq!("AAAAA\nBBBBB\nCCCCC\nDDDDD\nEEEEE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_with_max_scrollback_bytes_zero() {
+        // When max_scrollback_bytes is 0, scrollUp should still work but not retain history
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.print_string("AAAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("BBBBB").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("CCCCC").unwrap();
+
+        t.scroll_up(1).unwrap();
+
+        // Active screen should show scrolled content
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("BBBBB\nCCCCC", str);
+        }
+
+        // Scroll to top - should be same as active since no scrollback
+        t.screens.active.scroll(screen::Scroll::Top);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("BBBBB\nCCCCC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_with_max_scrollback_bytes_zero_and_top_margin() {
+        // When max_scrollback_bytes is 0 and top margin is set, should use deleteLines path
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.print_string("AAAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("BBBBB").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("CCCCC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DDDDD").unwrap();
+
+        // Set top margin (not at row 0)
+        t.set_top_and_bottom_margin(2, 5);
+
+        t.scroll_up(1).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            // First row preserved, rest scrolled
+            assert_eq!("AAAAA\nCCCCC\nDDDDD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_with_max_scrollback_bytes_zero_and_left_right_margin() {
+        // When max_scrollback_bytes is 0 with left/right margins, uses deleteLines path
+        let mut t = Terminal::init(Options { cols: 10, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.print_string("AAAAABBBBB").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("CCCCCDDDDD").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("EEEEEFFFFF").unwrap();
+
+        // Set left/right margins (columns 2-6, 1-indexed = indices 1-5)
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 6);
+
+        t.scroll_up(1).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            // cols 1-5 scroll, col 0 and cols 6+ preserved
+            assert_eq!("ACCCCDBBBB\nCEEEEFDDDD\nE     FFFF", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_simple() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI").unwrap();
+        t.set_cursor_pos(2, 2);
+
+        let cursor = t.screens.active.cursor.clone();
+        t.clear_dirty();
+        t.scroll_down(1);
+        assert_eq!(cursor.x, t.screens.active.cursor.x);
+        assert_eq!(cursor.y, t.screens.active.cursor.y);
+
+        for y in 0..5 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nABC\nDEF\nGHI", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_hyperlink_moves() {
+        let mut t = init(5, 5);
+
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print_string("ABC").unwrap();
+        t.screens.active.end_hyperlink();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI").unwrap();
+        t.set_cursor_pos(2, 2);
+        t.scroll_down(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nABC\nDEF\nGHI", str);
+        }
+
+        for x in 0..3 {
+            let list_cell = t.screens.active.pages.get_cell(vp(x, 1)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+            assert_eq!(1, id);
+            let page = nd(list_cell.node).page();
+            assert_eq!(1, page.hyperlink_set.count());
+        }
+        for x in 0..3 {
+            let list_cell = t.screens.active.pages.get_cell(vp(x, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_outside_of_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI").unwrap();
+        t.set_top_and_bottom_margin(3, 4);
+        t.set_cursor_pos(2, 2);
+
+        let cursor = t.screens.active.cursor.clone();
+        t.clear_dirty();
+        t.scroll_down(1);
+        assert_eq!(cursor.x, t.screens.active.cursor.x);
+        assert_eq!(cursor.y, t.screens.active.cursor.y);
+
+        assert!(!t.is_dirty(act(0, 0)));
+
+        // This is dirty because the cursor moves from this row
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+        assert!(t.is_dirty(act(0, 3)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC\nDEF\n\nGHI", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_left_right_scroll_region() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(2, 2);
+
+        let cursor = t.screens.active.cursor.clone();
+        t.clear_dirty();
+        t.scroll_down(1);
+        assert_eq!(cursor.x, t.screens.active.cursor.x);
+        assert_eq!(cursor.y, t.screens.active.cursor.y);
+
+        for y in 0..4 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A   23\nDBC156\nGEF489\n HI7", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_left_right_scroll_region_hyperlink() {
+        let mut t = init(10, 10);
+
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print_string("ABC123").unwrap();
+        t.screens.active.end_hyperlink();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(2, 2);
+        t.scroll_down(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A   23\nDBC156\nGEF489\n HI7", str);
+        }
+
+        // First row preserves hyperlink where we didn't scroll
+        {
+            for x in 0..1 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 0)).unwrap();
+                let row = rw(list_cell.row);
+                assert!(row.hyperlink());
+                let cell = cl(list_cell.cell);
+                assert!(cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+                assert_eq!(1, id);
+                let page = nd(list_cell.node).page();
+                assert_eq!(1, page.hyperlink_set.count());
+            }
+            for x in 1..4 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 0)).unwrap();
+                let cell = cl(list_cell.cell);
+                assert!(!cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+                assert!(id.is_none());
+            }
+            for x in 4..6 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 0)).unwrap();
+                let row = rw(list_cell.row);
+                assert!(row.hyperlink());
+                let cell = cl(list_cell.cell);
+                assert!(cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+                assert_eq!(1, id);
+                let page = nd(list_cell.node).page();
+                assert_eq!(1, page.hyperlink_set.count());
+            }
+        }
+
+        // Second row gets some hyperlinks
+        {
+            for x in 0..1 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 1)).unwrap();
+                let cell = cl(list_cell.cell);
+                assert!(!cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+                assert!(id.is_none());
+            }
+            for x in 1..4 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 1)).unwrap();
+                let row = rw(list_cell.row);
+                assert!(row.hyperlink());
+                let cell = cl(list_cell.cell);
+                assert!(cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+                assert_eq!(1, id);
+                let page = nd(list_cell.node).page();
+                assert_eq!(1, page.hyperlink_set.count());
+            }
+            for x in 4..6 {
+                let list_cell = t.screens.active.pages.get_cell(vp(x, 1)).unwrap();
+                let cell = cl(list_cell.cell);
+                assert!(!cell.hyperlink());
+                let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+                assert!(id.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_outside_of_left_right_scroll_region() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(1, 1);
+
+        let cursor = t.screens.active.cursor.clone();
+        t.clear_dirty();
+        t.scroll_down(1);
+        assert_eq!(cursor.x, t.screens.active.cursor.x);
+        assert_eq!(cursor.y, t.screens.active.cursor.y);
+
+        for y in 0..4 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A   23\nDBC156\nGEF489\n HI7", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrolldown_preserves_pending_wrap() {
+        let mut t = init(5, 10);
+
+        t.set_cursor_pos(1, 5);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 5);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 5);
+        t.print('C' as u32).unwrap();
+        t.scroll_down(1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n    A\n    B\nX   C", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_simple_operation() {
+        let mut t = init(5, 5);
+
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.erase_chars(2);
+        t.print('X' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(!t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X C", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_minimum_one() {
+        let mut t = init(5, 5);
+
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.erase_chars(0);
+        t.print('X' as u32).unwrap();
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("XBC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_beyond_screen_edge() {
+        let mut t = init(5, 5);
+
+        for c in "  ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 4);
+        t.erase_chars(10);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_wide_character() {
+        let mut t = init(5, 5);
+
+        t.print('橋' as u32).unwrap();
+        for c in "BC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X BC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_resets_pending_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.erase_chars(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_resets_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE123".chars() { t.print(c as u32).unwrap(); }
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.wrap());
+        }
+
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(1);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.wrap());
+        }
+
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("XBCDE\n123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_preserves_background_sgr() {
+        let mut t = init(10, 10);
+
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.erase_chars(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  C", str);
+            {
+                let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+                assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+                assert_eq!(color::Rgb {
+                    r: 0xFF,
+                    g: 0,
+                    b: 0,
+                }, cl(list_cell.cell).content_color_rgb());
+            }
+            {
+                let list_cell = t.screens.active.pages.get_cell(act(1, 0)).unwrap();
+                assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+                assert_eq!(color::Rgb {
+                    r: 0xFF,
+                    g: 0,
+                    b: 0,
+                }, cl(list_cell.cell).content_color_rgb());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_handles_refcounted_styles() {
+        let mut t = init(10, 10);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print('A' as u32).unwrap();
+        t.print('B' as u32).unwrap();
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('C' as u32).unwrap();
+
+        // verify we have styles in our style map
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.styles.count());
+
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(2);
+
+        // verify we have no styles in our style map
+        assert_eq!(0, page.styles.count());
+    }
+
+    #[test]
+    fn terminal_erasechars_protected_attributes_respected_with_iso() {
+        let mut t = init(5, 5);
+
+        t.set_protected_mode(ansi::ProtectedMode::Iso);
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_protected_attributes_ignored_with_dec_most_recent() {
+        let mut t = init(5, 5);
+
+        t.set_protected_mode(ansi::ProtectedMode::Iso);
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_protected_mode(ansi::ProtectedMode::Dec);
+        t.set_protected_mode(ansi::ProtectedMode::Off);
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  C", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_protected_attributes_ignored_with_dec_set() {
+        let mut t = init(5, 5);
+
+        t.set_protected_mode(ansi::ProtectedMode::Dec);
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.erase_chars(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  C", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_wide_char_boundary_conditions() {
+        let mut t = init(8, 1);
+
+        t.print_string("😀a😀b😀").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("😀a😀b😀", str);
+        }
+
+        t.set_cursor_pos(1, 2);
+        t.erase_chars(3);
+        cursor_page(t.screens.active).assert_integrity();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("     b😀", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_wide_char_splits_proper_cell_boundaries() {
+        let mut t = init(30, 1);
+
+        // This is a test for a bug: https://github.com/ghostty-org/ghostty/issues/2817
+        // To explain the setup:
+        // (1) We need our wide characters starting on an even (1-based) column.
+        // (2) We need our cursor to be in the middle somewhere.
+        // (3) We need our count to be less than our cursor X and on a split cell.
+        // The bug was that we split the wrong cell boundaries.
+
+        t.print_string("x食べて下さい").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("x食べて下さい", str);
+        }
+
+        t.set_cursor_pos(1, 6); // At: て
+        t.erase_chars(4); // Delete: て下
+        cursor_page(t.screens.active).assert_integrity();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("x食べ    さい", str);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_wide_char_wrap_boundary_conditions() {
+        let mut t = init(8, 3);
+
+        t.print_string(".......😀abcde😀......").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(".......\n😀abcde\n😀......", str);
+
+            let unwrapped = t.plain_string_unwrapped().unwrap();
+            assert_eq!(".......😀abcde😀......", unwrapped);
+        }
+
+        t.set_cursor_pos(2, 2);
+        t.erase_chars(3);
+        cursor_page(t.screens.active).assert_integrity();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(".......\n    cde\n😀......", str);
+
+            let unwrapped = t.plain_string_unwrapped().unwrap();
+            assert_eq!(".......     cde\n😀......", unwrapped);
+        }
+    }
+
+    #[test]
+    fn terminal_erasechars_clearing_wrapped_wide_char_marks_spacer_head_row_dirty() {
+        let mut t = init(5, 3);
+
+        // The wide char doesn't fit so it wraps, leaving a spacer head at
+        // the end of the first row.
+        t.print_string("ABCD字").unwrap();
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(4, 0)).unwrap();
+            assert_eq!(Wide::SpacerHead, cl(list_cell.cell).wide());
+            assert!(rw(list_cell.row).wrap());
+        }
+
+        t.set_cursor_pos(2, 1);
+        t.clear_dirty();
+        t.erase_chars(1);
+        cursor_page(t.screens.active).assert_integrity();
+
+        // Erasing the wide char also clears the spacer head on the previous
+        // row, so that row must be dirty too.
+        assert!(t.is_dirty(scr(0, 0)));
+        assert!(t.is_dirty(scr(0, 1)));
+        assert!(!t.is_dirty(scr(0, 2)));
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(4, 0)).unwrap();
+            assert_eq!(Wide::Narrow, cl(list_cell.cell).wide());
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex() {
+        let mut t = init(2, 5);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.reverse_index();
+        t.print('D' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nBD\nC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_from_the_top() {
+        let mut t = init(2, 5);
+
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        t.set_cursor_pos(1, 1);
+        t.reverse_index();
+        t.print('D' as u32).unwrap();
+
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.set_cursor_pos(1, 1);
+        t.reverse_index();
+        t.print('E' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("E\nD\nA\nB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_top_of_scrolling_region() {
+        let mut t = init(2, 10);
+
+        // Initial value
+        t.set_cursor_pos(2, 1);
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('D' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        // Set our scroll region
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(2, 1);
+        t.reverse_index();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nX\nA\nB\nC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_top_of_screen() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+        t.reverse_index();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X\nA\nB\nC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_not_top_of_screen() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.reverse_index();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X\nB\nC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_top_bottom_margins() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('C' as u32).unwrap();
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(2, 1);
+        t.reverse_index();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n\nB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_outside_top_bottom_margins() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('C' as u32).unwrap();
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(1, 1);
+        t.reverse_index();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nB\nC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_left_right_margins() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print_string("DEF").unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print_string("GHI").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 3);
+        t.set_cursor_pos(1, 2);
+        t.reverse_index();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nDBC\nGEF\n HI", str);
+        }
+    }
+
+    #[test]
+    fn terminal_reverseindex_outside_left_right_margins() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print_string("DEF").unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print_string("GHI").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 3);
+        t.set_cursor_pos(1, 1);
+        t.reverse_index();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC\nDEF\nGHI", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index() {
+        let mut t = init(2, 5);
+
+        t.index().unwrap();
+        t.print('A' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nA", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_from_the_bottom() {
+        let mut t = init(2, 5);
+
+        t.set_cursor_pos(5, 1);
+        t.print('A' as u32).unwrap();
+        t.cursor_left(1); // undo moving right from 'A'
+
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('B' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 3)));
+        assert!(t.is_dirty(act(0, 4)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\n\nA\nB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_scrolling_with_hyperlink() {
+        let mut t = init(2, 5);
+
+        t.set_cursor_pos(5, 1);
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print('A' as u32).unwrap();
+        t.screens.active.end_hyperlink();
+        t.cursor_left(1); // undo moving right from 'A'
+        t.index().unwrap();
+        t.print('B' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\n\nA\nB", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(vp(0, 3)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+            assert_eq!(1, id);
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(vp(0, 4)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_index_outside_of_scrolling_region() {
+        let mut t = init(2, 5);
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        t.set_top_and_bottom_margin(2, 5);
+        t.index().unwrap();
+        assert_eq!(1, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_index_from_the_bottom_outside_of_scroll_region() {
+        let mut t = init(2, 5);
+
+        t.set_top_and_bottom_margin(1, 2);
+        t.set_cursor_pos(5, 1);
+        t.print('A' as u32).unwrap();
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('B' as u32).unwrap();
+        assert!(t.is_dirty(act(0, 4)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\n\n\nAB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_no_scroll_region_top_of_screen() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_primary_screen() {
+        let mut t = init(5, 5);
+
+        t.set_cursor_pos(5, 1);
+        t.print('A' as u32).unwrap();
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 3)));
+        assert!(t.is_dirty(act(0, 4)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\n\nA\n X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_primary_screen_background_sgr() {
+        let mut t = init(5, 5);
+
+        t.set_cursor_pos(5, 1);
+        t.print('A' as u32).unwrap();
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.index().unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\n\nA", str);
+            for x in 0..5 {
+                let list_cell = t.screens.active.pages.get_cell(act(x, 4)).unwrap();
+                assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+                assert_eq!(color::Rgb {
+                    r: 0xFF,
+                    g: 0,
+                    b: 0,
+                }, cl(list_cell.cell).content_color_rgb());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_index_inside_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.print('A' as u32).unwrap();
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_with_hyperlinks() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 2);
+        t.print('A' as u32).unwrap();
+        t.index().unwrap();
+        t.carriage_return();
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print('B' as u32).unwrap();
+        t.screens.active.end_hyperlink();
+        t.index().unwrap();
+        t.carriage_return();
+        t.print('C' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("B\nC", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(vp(0, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+            assert_eq!(1, id);
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(vp(0, 1)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_clear_hyperlinks() {
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(2, 1);
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print('A' as u32).unwrap();
+        t.screens.active.end_hyperlink();
+        t.index().unwrap();
+        t.carriage_return();
+        t.print('B' as u32).unwrap();
+        t.index().unwrap();
+        t.carriage_return();
+        t.print('C' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nB\nC", str);
+        }
+
+        for y in 1..3 {
+            let list_cell = t.screens.active.pages.get_cell(vp(0, y)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+            let page = nd(list_cell.node).page();
+            assert_eq!(0, page.hyperlink_set.count());
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_with_background_sgr() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(4, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.index().unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nA\n\nB", str);
+        }
+
+        for x in 0..t.cols {
+            let list_cell = t.screens.active.pages.get_cell(act(x, 2)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_primary_screen_with_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(5, 1);
+        t.clear_dirty();
+        t.index().unwrap();
+        t.index().unwrap();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        for y in 0..4 { assert!(!t.is_dirty(act(0, y))); }
+        assert!(t.is_dirty(act(0, 4)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\nA\n\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_outside_left_right_margin() {
+        let mut t = init(10, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.scrolling_region.left = 3;
+        t.scrolling_region.right = 5;
+        t.set_cursor_pos(3, 3);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        assert!(t.is_dirty(act(0, 2)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\nX A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_inside_left_right_margin() {
+        let mut t = init(10, 5);
+
+        t.print_string("AAAAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("AAAAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("AAAAAA").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_left_and_right_margin(1, 3);
+        t.set_cursor_pos(3, 1);
+
+        t.clear_dirty();
+        t.index().unwrap();
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+
+        assert_eq!(2, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AAAAAA\nAAAAAA\n   AAA", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_creates_scrollback() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.print_string("1\n2\n3").unwrap();
+        t.set_cursor_pos(4, 1);
+        t.print('X' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.index().unwrap();
+        t.print('Y' as u32).unwrap();
+
+        {
+            let str = t.screens.active.dump_string_alloc(vp(0, 0)).unwrap();
+            assert_eq!("2\n3\nY\nX", str);
+        }
+        {
+            let str = t.screens.active.dump_string_alloc(scr(0, 0)).unwrap();
+            assert_eq!("1\n2\n3\nY\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_no_scrollback() {
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(4, 1);
+        t.print('B' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.clear_dirty();
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nA\n X\nB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_blank_line_preserves_sgr() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.print_string("1\n2\n3").unwrap();
+        t.set_cursor_pos(4, 1);
+        t.print('X' as u32).unwrap();
+        t.set_cursor_pos(3, 1);
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.index().unwrap();
+
+        {
+            let str = t.screens.active.dump_string_alloc(vp(0, 0)).unwrap();
+            assert_eq!("2\n3\n\nX", str);
+        }
+        {
+            let str = t.screens.active.dump_string_alloc(scr(0, 0)).unwrap();
+            assert_eq!("1\n2\n3\n\nX", str);
+        }
+        for x in 0..t.cols {
+            let list_cell = t.screens.active.pages.get_cell(act(x, 2)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_scroll_region_with_top_margin_and_background_sgr() {
+        let mut t = init(5, 5);
+
+        t.print_string("1\n2\n3\n4\n5").unwrap();
+        t.set_top_and_bottom_margin(2, 4);
+        t.set_cursor_pos(4, 1);
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.index().unwrap();
+
+        // The region (rows 2-4) scrolled up, rows outside are unchanged.
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1\n3\n4\n\n5", str);
+        }
+
+        // The cursor is on the new blank row.
+        assert_eq!(3, t.screens.active.cursor.y);
+
+        // The new blank row must be filled with our background color.
+        for x in 0..t.cols {
+            let list_cell = t.screens.active.pages.get_cell(act(x, 3)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_alt_screen_full_region() {
+        let mut t = init(5, 3);
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        t.print_string("A\nB\nC").unwrap();
+        t.index().unwrap();
+        t.carriage_return();
+        t.print('D' as u32).unwrap();
+
+        // Content scrolled up and the scrolled-out row is discarded, NOT
+        // moved into scrollback (the alt screen has none).
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("B\nC\nD", str);
+        }
+        {
+            let str = t.screens.active.dump_string_alloc(scr(0, 0)).unwrap();
+            assert_eq!("B\nC\nD", str);
+        }
+
+        // Primary screen is untouched.
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, false).unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+    }
+
+    #[test]
+    fn terminal_index_bottom_of_alt_screen_top_region() {
+        let mut t = init(5, 5);
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        t.print_string("1\n2\n3\n4\n5").unwrap();
+
+        // Region at the top of the screen, excluding the last row. On the
+        // alt screen this must NOT create scrollback.
+        t.set_top_and_bottom_margin(1, 4);
+        t.set_cursor_pos(4, 1);
+        t.index().unwrap();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("2\n3\n4\nX\n5", str);
+        }
+        {
+            let str = t.screens.active.dump_string_alloc(scr(0, 0)).unwrap();
+            assert_eq!("2\n3\n4\nX\n5", str);
+        }
+    }
+
+    #[test]
+    fn terminal_scrollup_top_region_no_scrollback() {
+        let mut t = Terminal::init(Options { cols: 5, rows: 5, max_scrollback_bytes: Some(0), ..Default::default() }).unwrap();
+
+        t.print_string("A\nB\nC\nD\nE").unwrap();
+        t.set_top_and_bottom_margin(1, 3);
+        t.scroll_up(1).unwrap();
+
+        // The region scrolled and the scrolled-out row is discarded.
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("B\nC\n\nD\nE", str);
+        }
+        {
+            let str = t.screens.active.dump_string_alloc(scr(0, 0)).unwrap();
+            assert_eq!("B\nC\n\nD\nE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorup_basic() {
+        let mut t = init(5, 5);
+
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.cursor_up(10);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(" X\n\nA", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorup_below_top_scroll_margin() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(2, 4);
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.cursor_up(5);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n X\nA", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorup_above_top_scroll_margin() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(3, 5);
+        t.set_cursor_pos(3, 1);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(2, 1);
+        t.cursor_up(10);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X\n\nA", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorup_resets_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_up(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_no_wrap() {
+        let mut t = init(10, 5);
+
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.cursor_left(10);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nB", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_stops_at_left_margin() {
+        let mut t = init(5, 5);
+
+        t.scrolling_region.left = 2;
+        t.set_cursor_pos(1, 4);
+        t.cursor_left(100);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_left_of_left_margin() {
+        let mut t = init(5, 5);
+
+        t.scrolling_region.left = 3;
+        t.set_cursor_pos(1, 3);
+        t.cursor_left(100);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_backspace_at_left_margin() {
+        let mut t = init(5, 5);
+
+        t.scrolling_region.left = 2;
+        t.set_cursor_pos(1, 3);
+        t.backspace();
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_unsets_pending_wrap_state() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_left(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCXE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_unsets_pending_wrap_state_with_longer_jump() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_left(3);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AXCDE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_with_pending_wrap_state() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_left(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_with_pending_wrap_above_top_margin() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(1, 2);
+        for c in "AB".chars() { t.print(c as u32).unwrap(); }
+        t.save_cursor();
+
+        // Restore pending wrap at the left margin, above the top margin.
+        t.set_left_and_right_margin(2, 5);
+        t.set_top_and_bottom_margin(3, 5);
+        t.restore_cursor();
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        t.cursor_left(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        assert_eq!(1, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_extended_with_pending_wrap_state() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrapExtended, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_left(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+
+        for c in "ABCDE1".chars() { t.print(c as u32).unwrap(); }
+        t.cursor_left(2);
+        t.print('X' as u32).unwrap();
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX\n1", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_with_no_soft_wrap() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('1' as u32).unwrap();
+        t.cursor_left(2);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDE\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_before_left_margin() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+        t.set_top_and_bottom_margin(3, 0);
+        t.cursor_left(1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\n\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_extended_reverse_wrap() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrapExtended, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('1' as u32).unwrap();
+        t.cursor_left(2);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX\n1", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_extended_reverse_wrap_bottom_wraparound() {
+        let mut t = init(5, 3);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrapExtended, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('1' as u32).unwrap();
+        t.cursor_left(1 + t.cols as usize + 1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDE\n1\n    X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_extended_reverse_wrap_is_priority_if_both_set() {
+        let mut t = init(5, 3);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+        t.modes.set(Mode::ReverseWrapExtended, true);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('1' as u32).unwrap();
+        t.cursor_left(1 + t.cols as usize + 1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDE\n1\n    X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorleft_extended_reverse_wrap_above_top_scroll_region() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrapExtended, true);
+
+        t.set_top_and_bottom_margin(3, 0);
+        t.set_cursor_pos(2, 1);
+        t.cursor_left(1000);
+
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_cursorleft_reverse_wrap_on_first_row() {
+        let mut t = init(5, 5);
+
+        t.modes.set(Mode::Wraparound, true);
+        t.modes.set(Mode::ReverseWrap, true);
+
+        t.set_top_and_bottom_margin(3, 0);
+        t.set_cursor_pos(1, 2);
+        t.cursor_left(1000);
+
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_cursordown_basic() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+        t.cursor_down(10);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n\n\n\n X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursordown_above_bottom_scroll_margin() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.print('A' as u32).unwrap();
+        t.cursor_down(10);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n\n X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursordown_below_bottom_scroll_margin() {
+        let mut t = init(5, 5);
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(4, 1);
+        t.cursor_down(10);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\n\n\n\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursordown_resets_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_down(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDE\n    X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorright_resets_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.cursor_right(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorright_to_the_edge_of_screen() {
+        let mut t = init(5, 5);
+
+        t.cursor_right(100);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("    X", str);
+        }
+    }
+
 }
