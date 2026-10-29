@@ -11251,4 +11251,1961 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_cursorright_left_of_right_margin() {
+        let mut t = init(5, 5);
+
+        t.scrolling_region.right = 2;
+        t.cursor_right(100);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_cursorright_right_of_right_margin() {
+        let mut t = init(5, 5);
+
+        t.scrolling_region.right = 2;
+        t.set_cursor_pos(1, 4);
+        t.cursor_right(100);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("    X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_simple() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI").unwrap();
+        t.set_cursor_pos(2, 2);
+
+        let node = tp(t.screens.active.cursor.page_pin).node;
+        let serial = nd(node).serial;
+        t.clear_dirty();
+        t.delete_lines(1);
+        assert!(!t.screens.active.pages.node_is_valid(node, serial));
+
+        assert!(!t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+        assert!(t.is_dirty(act(0, 3)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC\nGHI", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_colors_with_bg_color() {
+        let mut t = init(5, 5);
+
+        t.print_string("ABC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI").unwrap();
+        t.set_cursor_pos(2, 2);
+
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC\nGHI", str);
+        }
+
+        for x in 0..t.cols {
+            let list_cell = t.screens.active.pages.get_cell(act(x, 4)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_across_page_boundary_marks_all_shifted_rows_dirty() {
+        let mut t = Terminal::init(Options { cols: 10, rows: 5, max_scrollback_bytes: Some(1024), ..Default::default() }).unwrap();
+
+        let first_page = t.screens.active.pages.pages.first.unwrap();
+        let first_page_nrows = nd(first_page).capacity().rows;
+
+        // Fill up the first page minus 3 rows
+        for _ in 0..first_page_nrows - 3 { t.linefeed().unwrap(); }
+
+        // Add content that will cross a page boundary
+        t.print_string("1AAAA").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("2BBBB").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("3CCCC").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("4DDDD").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("5EEEE").unwrap();
+
+        // Verify we now have a second page
+        let second_page = nd(first_page).next.unwrap();
+        let first_serial = nd(first_page).serial;
+        let second_serial = nd(second_page).serial;
+
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.delete_lines(1);
+        assert!(!t.screens.active.pages.node_is_valid(first_page, first_serial));
+        assert!(!t.screens.active.pages.node_is_valid(second_page, second_serial));
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+        assert!(t.is_dirty(act(0, 3)));
+        assert!(t.is_dirty(act(0, 4)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("2BBBB\n3CCCC\n4DDDD\n5EEEE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_hyperlink_dense_row_crosses_page_boundary() {
+        // Regression test for the cross-page copy of deleteLines: when the
+        // shifted row carries more unique hyperlinks than the destination
+        // page's hyperlink capacity, the copy must increase the destination
+        // page's capacity and retry rather than corrupting the page list.
+        //
+        // This is the mirror of the insertLines variant: the dense row
+        // starts as the first row of the second page and is pulled up into
+        // the first page, which also happens to be the cursor's page so
+        // this exercises the cursor accounting of the capacity increase.
+        let mut t = Terminal::init(Options { cols: 10, rows: 5, max_scrollback_bytes: Some(1024), ..Default::default() }).unwrap();
+
+        let sp = t.screens.active;
+        let pages = &sp.pages;
+
+        // Fill the first page so it is exactly full, then two more rows so
+        // the second page holds the last two active rows (y=3 and y=4).
+        let first_page_rows = nd(pages.pages.first.unwrap()).capacity().rows;
+        for _ in 0..first_page_rows + 1 {
+            t.linefeed().unwrap();
+        }
+        assert!(pages.pages.first != pages.pages.last);
+        assert_eq!(2, nd(pages.pages.last.unwrap()).rows());
+
+        // Marker rows so we can verify the shift afterwards.
+        t.set_cursor_pos(1, 1);
+        t.print_string("0").unwrap();
+        t.set_cursor_pos(2, 1);
+        t.print_string("1").unwrap();
+        t.set_cursor_pos(3, 1);
+        t.print_string("2").unwrap();
+        t.set_cursor_pos(5, 1);
+        t.print_string("4").unwrap();
+
+        // Fill the first row of the second page (active y=3) with unique
+        // hyperlinks: more than the first page can hold with its default
+        // hyperlink capacity. Writing them grows the second page's
+        // capacity as needed; the first page keeps its default capacity.
+        t.set_cursor_pos(4, 1);
+        for i in 0..10u32 {
+            let uri = format!("http://example.com/{i}");
+            t.screens.active.start_hyperlink(uri.as_bytes(), None).unwrap();
+            t.print('A' as u32 + i).unwrap();
+            t.screens.active.end_hyperlink();
+        }
+        {
+            let pin = pages.pin(act(0, 3)).unwrap();
+            assert_eq!(pages.pages.last.unwrap(), pin.node);
+            assert_eq!(0, pin.y);
+        }
+        assert!(nd(pages.pages.first.unwrap()).page().hyperlink_set.layout.cap < 10);
+
+        // Delete the top line: every row shifts up by one and the dense
+        // row crosses the page boundary into the first page.
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("1\n2\nABCDEFGHIJ\n4", str);
+        }
+
+        // The first page's hyperlink capacity had to grow to receive the
+        // row, proving the capacity-retry path ran.
+        assert!(nd(pages.pages.first.unwrap()).page().hyperlink_set.layout.cap >= 10);
+
+        // Every cell of the dense row must still resolve to a real
+        // hyperlink entry with the correct URI. A half-applied shift
+        // leaves cells whose hyperlink flag is set but that have no map
+        // entry, which aborts in clearCells later.
+        for x in 0..10 {
+            let list_cell = pages.get_cell(act(x, 2)).unwrap();
+            assert!(cl(list_cell.cell).hyperlink());
+            let page: &mut Page = nd(list_cell.node).page();
+            let id = page.lookup_hyperlink(cl(list_cell.cell)).unwrap();
+            let uri = format!("http://example.com/{x}");
+            assert_eq!(uri.as_bytes(), &link_uri(page, id)[..]);
+        }
+
+        // All pages must pass integrity checks.
+        let mut node_ = pages.pages.first;
+        while let Some(node) = node_ {
+            nd(node).page().assert_integrity();
+            node_ = nd(node).next;
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_legacy() {
+        let mut t = init(80, 80);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('D' as u32).unwrap();
+
+        t.cursor_up(2);
+        t.delete_lines(1);
+
+        t.print('E' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        // We should be
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert_eq!(2, t.screens.active.cursor.y);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nE\nD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_with_scroll_region() {
+        let mut t = init(80, 80);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('D' as u32).unwrap();
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.delete_lines(1);
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+        assert!(!t.is_dirty(act(0, 3)));
+
+        t.print('E' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        // We should be
+        // assert_eq!(0, t.screens.active.cursor.x);
+        // assert_eq!(2, t.screens.active.cursor.y);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("E\nC\n\nD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_with_scroll_region_large_count() {
+        let mut t = init(80, 80);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('D' as u32).unwrap();
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.delete_lines(5);
+
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(t.is_dirty(act(0, 1)));
+        assert!(t.is_dirty(act(0, 2)));
+        assert!(!t.is_dirty(act(0, 3)));
+
+        t.print('E' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+
+        // We should be
+        // assert_eq!(0, t.screens.active.cursor.x);
+        // assert_eq!(2, t.screens.active.cursor.y);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("E\n\n\nD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_with_scroll_region_cursor_outside_of_region() {
+        let mut t = init(80, 80);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('C' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('D' as u32).unwrap();
+
+        t.set_top_and_bottom_margin(1, 3);
+        t.set_cursor_pos(4, 1);
+
+        t.clear_dirty();
+        t.delete_lines(1);
+
+        for y in 0..4 { assert!(!t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A\nB\nC\nD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_resets_pending_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.delete_lines(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('B' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("B", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_resets_wrap() {
+        let mut t = init(3, 3);
+
+        t.print('1' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        for c in "ABCDEF".chars() { t.print(c as u32).unwrap(); }
+
+        t.set_top_and_bottom_margin(1, 2);
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("XBC\n\nDEF", str);
+        }
+
+        for y in 0..t.rows {
+            let list_cell = t.screens.active.pages.get_cell(act(0, y)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.wrap());
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_left_right_scroll_region() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(2, 2);
+
+        t.clear_dirty();
+        t.delete_lines(1);
+
+        assert!(!t.is_dirty(act(0, 0)));
+        for y in 1..3 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC123\nDHI756\nG   89", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_left_right_scroll_region_from_top() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_lines(1);
+
+        for y in 0..3 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AEF423\nDHI756\nG   89", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_left_right_scroll_region_high_count() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("DEF456").unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print_string("GHI789").unwrap();
+        t.scrolling_region.left = 1;
+        t.scrolling_region.right = 3;
+        t.set_cursor_pos(2, 2);
+
+        t.clear_dirty();
+        t.delete_lines(100);
+
+        assert!(!t.is_dirty(act(0, 0)));
+        for y in 1..3 { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC123\nD   56\nG   89", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_character_spacer_head() {
+        let mut t = init(5, 3);
+
+        // Initial value
+        // +-----+
+        // |AAAAA| < Wrapped
+        // |BBBB*| < Wrapped     (continued)
+        // |WWCCC| < Non-wrapped (continued)
+        // +-----+
+        // where * represents a spacer head cell
+        // and WW is the wide character.
+        t.print_string("AAAAABBBB\u{1F600}CCC").unwrap();
+
+        // Delete the top line
+        // +-----+
+        // |BBBB | < Non-wrapped
+        // |WWCCC| < Non-wrapped
+        // |     | < Non-wrapped
+        // +-----+
+        // This should convert the spacer head to
+        // a regular empty cell, and un-set wrap.
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            let unwrapped_str = t.plain_string_unwrapped().unwrap();
+            assert_eq!("BBBB\n\u{1F600}CCC", str);
+            assert_eq!("BBBB\n\u{1F600}CCC", unwrapped_str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_character_spacer_head_left_scroll_margin() {
+        let mut t = init(5, 3);
+
+        // Initial value
+        // +-----+
+        // |AAAAA| < Wrapped
+        // |BBBB*| < Wrapped     (continued)
+        // |WWCCC| < Non-wrapped (continued)
+        // +-----+
+        // where * represents a spacer head cell
+        // and WW is the wide character.
+        t.print_string("AAAAABBBB\u{1F600}CCC").unwrap();
+
+        t.scrolling_region.left = 2;
+
+        // Delete the top line
+        //    ###  <- scrolling region
+        // +-----+
+        // |AABB | < Wrapped
+        // |BBCCC| < Wrapped     (continued)
+        // |WW   | < Non-wrapped (continued)
+        // +-----+
+        // This should convert the spacer head to
+        // a regular empty cell, but due to the
+        // left scrolling margin, wrap state should
+        // remain.
+        t.set_cursor_pos(1, 3);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            let unwrapped_str = t.plain_string_unwrapped().unwrap();
+            assert_eq!("AABB\nBBCCC\n\u{1F600}", str);
+            assert_eq!("AABB BBCCC\u{1F600}", unwrapped_str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_character_spacer_head_right_scroll_margin() {
+        let mut t = init(5, 3);
+
+        // Initial value
+        // +-----+
+        // |AAAAA| < Wrapped
+        // |BBBB*| < Wrapped     (continued)
+        // |WWCCC| < Non-wrapped (continued)
+        // +-----+
+        // where * represents a spacer head cell
+        // and WW is the wide character.
+        t.print_string("AAAAABBBB\u{1F600}CCC").unwrap();
+
+        t.scrolling_region.right = 3;
+
+        // Delete the top line
+        //  ####   <- scrolling region
+        // +-----+
+        // |BBBBA| < Wrapped
+        // |WWCC | < Wrapped     (continued)
+        // |    C| < Non-wrapped (continued)
+        // +-----+
+        // This should convert the spacer head to
+        // a regular empty cell, but due to the
+        // right scrolling margin, wrap state should
+        // remain.
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            let unwrapped_str = t.plain_string_unwrapped().unwrap();
+            assert_eq!("BBBBA\n\u{1F600}CC\n    C", str);
+            assert_eq!("BBBBA\u{1F600}CC     C", unwrapped_str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_character_spacer_head_left_and_right_scroll_margin() {
+        let mut t = init(5, 3);
+
+        // Initial value
+        // +-----+
+        // |AAAAA| < Wrapped
+        // |BBBB*| < Wrapped     (continued)
+        // |WWCCC| < Non-wrapped (continued)
+        // +-----+
+        // where * represents a spacer head cell
+        // and WW is the wide character.
+        t.print_string("AAAAABBBB\u{1F600}CCC").unwrap();
+
+        t.scrolling_region.right = 3;
+        t.scrolling_region.left = 2;
+
+        // Delete the top line
+        //    ##   <- scrolling region
+        // +-----+
+        // |AABBA| < Wrapped
+        // |BBCC*| < Wrapped     (continued)
+        // |WW  C| < Non-wrapped (continued)
+        // +-----+
+        // Because there is both a left scrolling
+        // margin > 1 and a right scrolling margin
+        // the spacer head should remain, and the
+        // wrap state should be untouched.
+        t.set_cursor_pos(1, 3);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            let unwrapped_str = t.plain_string_unwrapped().unwrap();
+            assert_eq!("AABBA\nBBCC\n\u{1F600}  C", str);
+            assert_eq!("AABBABBCC\u{1F600}  C", unwrapped_str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_character_spacer_head_left_2_and_right_scroll_margin() {
+        let mut t = init(5, 3);
+
+        // Initial value
+        // +-----+
+        // |AAAAA| < Wrapped
+        // |BBBB*| < Wrapped     (continued)
+        // |WWCCC| < Non-wrapped (continued)
+        // +-----+
+        // where * represents a spacer head cell
+        // and WW is the wide character.
+        t.print_string("AAAAABBBB\u{1F600}CCC").unwrap();
+
+        t.scrolling_region.right = 3;
+        t.scrolling_region.left = 1;
+
+        // Delete the top line
+        //   ###   <- scrolling region
+        // +-----+
+        // |ABBBA| < Wrapped
+        // |B CC | < Wrapped     (continued)
+        // |    C| < Non-wrapped (continued)
+        // +-----+
+        // Because the left margin is 1, the wide
+        // char is split, and therefore removed,
+        // along with the spacer head - however,
+        // wrap state should be untouched.
+        t.set_cursor_pos(1, 2);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            let unwrapped_str = t.plain_string_unwrapped().unwrap();
+            assert_eq!("ABBBA\nB CC\n    C", str);
+            assert_eq!("ABBBAB CC     C", unwrapped_str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_wide_characters_split_by_left_right_scroll_region_boundaries() {
+        let mut t = init(5, 2);
+
+        // Initial value
+        // +-----+
+        // |AAAAA|
+        // |WWBWW|
+        // +-----+
+        // where WW represents a wide character
+        t.print_string("AAAAA\n\u{1F600}B\u{1F600}").unwrap();
+
+        t.scrolling_region.right = 3;
+        t.scrolling_region.left = 1;
+
+        // Delete the top line
+        //   ###   <- scrolling region
+        // +-----+
+        // |A B A|
+        // |     |
+        // +-----+
+        // The two wide chars, because they're
+        // split by the edge of the scrolling
+        // region, get removed.
+        t.set_cursor_pos(1, 2);
+        t.delete_lines(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A B A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletelines_zero() {
+        let mut t = init(2, 5);
+
+        // This should do nothing
+        t.set_cursor_pos(1, 1);
+        t.delete_lines(0);
+    }
+
+    #[test]
+    fn terminal_default_style_is_empty() {
+        let mut t = init(5, 5);
+
+        t.print('A' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('A' as u32, cell.content_codepoint());
+            assert_eq!(0, cell.style_id());
+        }
+    }
+
+    #[test]
+    fn terminal_bold_style() {
+        let mut t = init(5, 5);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print('A' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('A' as u32, cell.content_codepoint());
+            assert!(cell.style_id() != 0);
+            let page = cursor_page(t.screens.active);
+            assert!(unsafe { page.styles.ref_count(page.memory, t.screens.active.cursor.style_id) } > 1);
+        }
+    }
+
+    #[test]
+    fn terminal_garbage_collect_overwritten() {
+        let mut t = init(5, 5);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print('A' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('B' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('B' as u32, cell.content_codepoint());
+            assert!(cell.style_id() == 0);
+        }
+
+        // verify we have no styles in our style map
+        let page = cursor_page(t.screens.active);
+        assert_eq!(0, page.styles.count());
+    }
+
+    #[test]
+    fn terminal_do_not_garbage_collect_old_styles_in_use() {
+        let mut t = init(5, 5);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print('A' as u32).unwrap();
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('B' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('B' as u32, cell.content_codepoint());
+            assert!(cell.style_id() == 0);
+        }
+
+        // verify we have no styles in our style map
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.styles.count());
+    }
+
+    #[test]
+    fn terminal_print_with_style_marks_the_row_as_styled() {
+        let mut t = init(5, 5);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print('A' as u32).unwrap();
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('B' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            assert!(rw(list_cell.row).styled());
+        }
+    }
+
+    #[test]
+    fn terminal_decaln() {
+        let mut t = init(2, 2);
+
+        // Initial value
+        t.print('A' as u32).unwrap();
+        t.carriage_return();
+        t.linefeed().unwrap();
+        t.print('B' as u32).unwrap();
+        t.decaln().unwrap();
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+
+        for y in 0..t.rows { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("EE\nEE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_decaln_reset_margins() {
+        let mut t = init(3, 3);
+
+        // Initial value
+        t.modes.set(Mode::Origin, true);
+        t.set_top_and_bottom_margin(2, 3);
+        t.decaln().unwrap();
+        t.scroll_down(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nEEE\nEEE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_decaln_preserves_color() {
+        let mut t = init(3, 3);
+
+        // Initial value
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb { r: 0xFF, g: 0, b: 0 })).unwrap();
+        t.modes.set(Mode::Origin, true);
+        t.set_top_and_bottom_margin(2, 3);
+        t.decaln().unwrap();
+        t.scroll_down(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("\nEEE\nEEE", str);
+        }
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_decaln_resets_graphemes_with_protected_mode() {
+        let mut t = init(3, 3);
+
+        // Add protected mode. A previous version of DECALN accidentally preserved
+        // protected mode which left dangling managed memory.
+        t.set_protected_mode(ansi::ProtectedMode::Iso);
+
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        t.decaln().unwrap();
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.protected);
+        assert!(t.screens.active.protected_mode == ansi::ProtectedMode::Iso);
+
+        for y in 0..t.rows { assert!(t.is_dirty(act(0, y))); }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("EEE\nEEE\nEEE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_zero() {
+        let mut t = init(5, 2);
+
+        t.print('A' as u32).unwrap();
+        t.print('B' as u32).unwrap();
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+
+        t.insert_blanks(0);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks() {
+        // NOTE: this is not verified with conformance tests, so these
+        // tests might actually be verifying wrong behavior.
+        let mut t = init(5, 2);
+
+        t.print('A' as u32).unwrap();
+        t.print('B' as u32).unwrap();
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(t.is_dirty(act(0, 0)));
+        assert!(!t.is_dirty(act(0, 1)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  ABC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_pushes_off_end() {
+        // NOTE: this is not verified with conformance tests, so these
+        // tests might actually be verifying wrong behavior.
+        let mut t = init(3, 2);
+
+        t.print('A' as u32).unwrap();
+        t.print('B' as u32).unwrap();
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_more_than_size() {
+        // NOTE: this is not verified with conformance tests, so these
+        // tests might actually be verifying wrong behavior.
+        let mut t = init(3, 2);
+
+        t.print('A' as u32).unwrap();
+        t.print('B' as u32).unwrap();
+        t.print('C' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.insert_blanks(5);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_no_scroll_region_fits() {
+        let mut t = init(10, 10);
+
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  ABC", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_preserves_background_sgr() {
+        let mut t = init(10, 10);
+
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 1);
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.insert_blanks(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  ABC", str);
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_shift_off_screen() {
+        let mut t = init(5, 10);
+
+        for c in "  ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 3);
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(t.is_dirty(act(0, 0)));
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_split_multi_cell_character() {
+        let mut t = init(5, 10);
+
+        for c in "123".chars() { t.print(c as u32).unwrap(); }
+        t.print('橋' as u32).unwrap();
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.insert_blanks(1);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(" 123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_inside_left_right_scroll_region() {
+        let mut t = init(10, 10);
+
+        t.scrolling_region.left = 2;
+        t.scrolling_region.right = 4;
+        t.set_cursor_pos(1, 3);
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 3);
+
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(t.is_dirty(act(0, 0)));
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_outside_left_right_scroll_region() {
+        let mut t = init(6, 10);
+
+        t.set_cursor_pos(1, 4);
+        for c in "ABC".chars() { t.print(c as u32).unwrap(); }
+        t.scrolling_region.left = 2;
+        t.scrolling_region.right = 4;
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.clear_dirty();
+        t.insert_blanks(2);
+        assert!(!t.is_dirty(act(0, 0)));
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("   ABX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_left_right_scroll_region_large_count() {
+        let mut t = init(10, 10);
+
+        t.modes.set(Mode::Origin, true);
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(3, 5);
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.insert_blanks(140);
+        assert!(t.is_dirty(act(0, 0)));
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  X", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_deleting_graphemes() {
+        let mut t = init(5, 5);
+
+        // Disable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print_string("ABC").unwrap();
+
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have one cell with graphemes
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.grapheme_count());
+
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.insert_blanks(4);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("    A", str);
+        }
+
+        // We should have no graphemes
+        assert_eq!(0, page.grapheme_count());
+    }
+
+    #[test]
+    fn terminal_insertblanks_shift_graphemes() {
+        let mut t = init(5, 5);
+
+        // Enable grapheme clustering
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        t.print_string("A").unwrap();
+
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have one cell with graphemes
+        let page = cursor_page(t.screens.active);
+        assert_eq!(1, page.grapheme_count());
+
+        t.set_cursor_pos(1, 1);
+        t.clear_dirty();
+        t.insert_blanks(1);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(" A👨‍👩‍👧", str);
+        }
+
+        // We should have no graphemes
+        assert_eq!(1, page.grapheme_count());
+    }
+
+    #[test]
+    fn terminal_insertblanks_split_multi_cell_character_from_tail() {
+        let mut t = init(5, 10);
+
+        t.print_string("橋123").unwrap();
+        t.set_cursor_pos(1, 2);
+        t.insert_blanks(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("   12", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_shifts_hyperlinks() {
+        // osc "8;;http://example.com"
+        // printf "link"
+        // printf "\r"
+        // csi "3@"
+        // echo
+        //
+        // link should be preserved, blanks should not be linked
+
+        let mut t = init(10, 2);
+
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print_string("ABC").unwrap();
+        t.set_cursor_pos(1, 1);
+        t.insert_blanks(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  ABC", str);
+        }
+
+        // Verify all our cells have a hyperlink
+        for x in 2..5 {
+            let list_cell = t.screens.active.pages.get_cell(scr(x, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell).unwrap();
+            assert_eq!(1, id);
+        }
+        for x in 0..2 {
+            let list_cell = t.screens.active.pages.get_cell(scr(x, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_pushes_hyperlink_off_end_completely() {
+        let mut t = init(3, 2);
+
+        t.screens.active.start_hyperlink(b"http://example.com", None).unwrap();
+        t.print_string("ABC").unwrap();
+        t.set_cursor_pos(1, 1);
+        t.insert_blanks(3);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("", str);
+        }
+
+        for x in 0..3 {
+            let list_cell = t.screens.active.pages.get_cell(scr(x, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.hyperlink());
+            let cell = cl(list_cell.cell);
+            assert!(!cell.hyperlink());
+            let id = nd(list_cell.node).page().lookup_hyperlink(cell);
+            assert!(id.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_wide_char_straddling_right_margin() {
+        // Crash found by AFL++ fuzzer.
+        //
+        // When a wide character straddles the right scroll margin (head at the
+        // margin, spacer_tail just beyond it), insertBlanks shifts the wide head
+        // away via swapCells but leaves the orphaned spacer_tail in place,
+        // causing a page integrity violation.
+        let mut t = init(10, 5);
+
+        // Fill row: A B C D 橋 _ _ _ _ _
+        // Positions: 0 1 2 3 4W 5T 6 7 8 9
+        t.set_cursor_pos(1, 1);
+        for c in "ABCD".chars() { t.print(c as u32).unwrap(); }
+        t.print('橋' as u32).unwrap(); // wide char: head at 4, spacer_tail at 5
+
+        // Set right margin so the wide head is AT the boundary and the
+        // spacer_tail is just outside it.
+        t.scrolling_region.right = 4;
+
+        // Position cursor at x=2 (1-indexed col 3) and insert one blank.
+        // This triggers the swap loop which displaces the wide head at
+        // position 4 without clearing the spacer_tail at position 5.
+        t.set_cursor_pos(1, 3);
+        t.insert_blanks(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AB CD", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertblanks_wide_char_spacer_tail_orphaned_beyond_right_margin() {
+        // Regression test for AFL++ crash.
+        //
+        // When insertBlanks clears the entire region from cursor to the right
+        // margin (scroll_amount == 0), a wide character whose head is AT the
+        // right margin gets cleared but its spacer_tail just beyond the margin
+        // is left behind, causing a page integrity violation:
+        //   "spacer tail not following wide"
+        let mut t = init(10, 5);
+
+        // Fill cols 0–9 with wide chars: 中中中中中
+        // Positions: 0W 1T 2W 3T 4W 5T 6W 7T 8W 9T
+        for _ in 0..5 { t.print(0x4E2D).unwrap(); }
+
+        // Set left/right margins so that the last wide char (cols 8–9)
+        // straddles the boundary: head at col 8 (inside), tail at col 9 (outside).
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(1, 9); // 1-indexed: left=0, right=8
+
+        // Cursor is now at (0, 0) after DECSLRM.  Print a narrow char to
+        // advance cursor to col 1.
+        t.print('a' as u32).unwrap();
+
+        // ICH 8: insert 8 blanks at cursor x=1.
+        // rem = right(8) - x(1) + 1 = 8, adjusted_count = 8, scroll_amount = 0.
+        // The code clears cols 1–8 without noticing the spacer_tail at col 9.
+        t.insert_blanks(8);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("a", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_with_space() {
+        let mut t = init(10, 2);
+
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+        t.modes.set(Mode::Insert, true);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hXello", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_doesn_t_wrap_pushed_characters() {
+        let mut t = init(5, 2);
+
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+        t.modes.set(Mode::Insert, true);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hXell", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_does_nothing_at_the_end_of_the_line() {
+        let mut t = init(5, 2);
+
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        t.modes.set(Mode::Insert, true);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hello\nX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_with_wide_characters() {
+        let mut t = init(5, 2);
+
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+        t.modes.set(Mode::Insert, true);
+        t.print('😀' as u32).unwrap(); // 0x1F600
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("h😀el", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_with_wide_characters_at_end() {
+        let mut t = init(5, 2);
+
+        for c in "well".chars() { t.print(c as u32).unwrap(); }
+        t.modes.set(Mode::Insert, true);
+        t.print('😀' as u32).unwrap(); // 0x1F600
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("well\n😀", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insert_mode_pushing_off_wide_character() {
+        let mut t = init(5, 2);
+
+        for c in "123".chars() { t.print(c as u32).unwrap(); }
+        t.print('😀' as u32).unwrap(); // 0x1F600
+        t.modes.set(Mode::Insert, true);
+        t.set_cursor_pos(1, 1);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("X123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_chars(2);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ADE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_zero_count() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_chars(0);
+        assert!(!t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_more_than_half() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_chars(3);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_more_than_line_width() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_chars(10);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_should_shift_left() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 2);
+
+        t.clear_dirty();
+        t.delete_chars(1);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ACDE", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_resets_pending_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.delete_chars(1);
+        assert!(!t.screens.active.cursor.pending_wrap);
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABCDX", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_resets_wrap() {
+        let mut t = init(5, 5);
+
+        for c in "ABCDE123".chars() { t.print(c as u32).unwrap(); }
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(row.wrap());
+        }
+        t.set_cursor_pos(1, 1);
+        t.delete_chars(1);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(act(0, 0)).unwrap();
+            let row = rw(list_cell.row);
+            assert!(!row.wrap());
+        }
+
+        t.print('X' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("XCDE\n123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_simple_operation() {
+        let mut t = init(10, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.set_cursor_pos(1, 3);
+
+        t.clear_dirty();
+        t.delete_chars(2);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AB23", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_preserves_background_sgr() {
+        let mut t = init(10, 10);
+
+        for c in "ABC123".chars() { t.print(c as u32).unwrap(); }
+        t.set_cursor_pos(1, 3);
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.delete_chars(2);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("AB23", str);
+        }
+        for x in t.cols - 2..t.cols {
+            let list_cell = t.screens.active.pages.get_cell(act(x, 0)).unwrap();
+            assert!(cl(list_cell.cell).content_tag() == pagepkg::ContentTag::BgColorRgb);
+            assert_eq!(color::Rgb {
+                r: 0xFF,
+                g: 0,
+                b: 0,
+            }, cl(list_cell.cell).content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_outside_scroll_region() {
+        let mut t = init(6, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.scrolling_region.left = 2;
+        t.scrolling_region.right = 4;
+        assert!(t.screens.active.cursor.pending_wrap);
+        t.clear_dirty();
+        t.delete_chars(2);
+        assert!(!t.is_dirty(act(0, 0)));
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_inside_scroll_region() {
+        let mut t = init(6, 10);
+
+        t.print_string("ABC123").unwrap();
+        t.scrolling_region.left = 2;
+        t.scrolling_region.right = 4;
+        t.set_cursor_pos(1, 4);
+
+        t.clear_dirty();
+        t.delete_chars(1);
+        assert!(t.is_dirty(act(0, 0)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("ABC2 3", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_split_wide_character_from_spacer_tail() {
+        let mut t = init(6, 10);
+
+        t.print_string("A橋123").unwrap();
+        t.set_cursor_pos(1, 3);
+        t.delete_chars(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("A 123", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_split_wide_character_from_wide() {
+        let mut t = init(6, 10);
+
+        t.print_string("橋123").unwrap();
+        t.set_cursor_pos(1, 1);
+        t.delete_chars(1);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('1' as u32, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_split_wide_character_from_end() {
+        let mut t = init(6, 10);
+
+        t.print_string("A橋123").unwrap();
+        t.set_cursor_pos(1, 1);
+        t.delete_chars(1);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x6A4B, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_with_a_spacer_head_at_the_end() {
+        let mut t = init(5, 10);
+
+        t.print_string("0123橋123").unwrap();
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(4, 0)).unwrap();
+            let row = rw(list_cell.row);
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerHead, cell.wide());
+            assert!(row.wrap());
+        }
+
+        t.set_cursor_pos(1, 1);
+        t.delete_chars(1);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(3, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_split_wide_character_tail() {
+        let mut t = init(5, 5);
+
+        t.set_cursor_pos(1, t.cols as usize - 1);
+        t.print(0x6A4B).unwrap(); // 橋
+        t.carriage_return();
+        t.delete_chars(t.cols as usize - 1);
+        t.print('0' as u32).unwrap();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("0", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_wide_char_boundary_conditions() {
+        let mut t = init(8, 1);
+
+        // EXPLANATION(qwerasd):
+        //
+        // There are 3 or 4 boundaries to be concerned with in deleteChars,
+        // depending on how you count them. Consider the following terminal:
+        //
+        //   +--------+
+        // 0 |.ABCDEF.|
+        //   : ^      : (^ = cursor)
+        //   +--------+
+        //
+        // if we DCH 3 we get
+        //
+        //   +--------+
+        // 0 |.DEF....|
+        //   +--------+
+        //
+        // The boundaries exist at the following points then:
+        //
+        //   +--------+
+        // 0 |.ABCDEF.|
+        //   :11 22 33:
+        //   +--------+
+        //
+        // I'm counting 2 for double since it's both the end of the deleted
+        // content and the start of the content that is shifted in to place.
+        //
+        // Now consider wide characters (represented as `WW`) at these boundaries:
+        //
+        //   +--------+
+        // 0 |WWaWWbWW|
+        //   : ^      : (^ = cursor)
+        //   : ^^^    : (^ = deleted by DCH 3)
+        //   +--------+
+        //
+        // -> DCH 3
+        // -> The first 2 wide characters are split & destroyed (verified in xterm)
+        //
+        //   +--------+
+        // 0 |..bWW...|
+        //   +--------+
+
+        t.print_string("😀a😀b😀").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("😀a😀b😀", str);
+        }
+
+        t.set_cursor_pos(1, 2);
+        t.delete_chars(3);
+        cursor_page(t.screens.active).assert_integrity();
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("  b😀", str);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_wide_char_wrap_boundary_conditions() {
+        let mut t = init(8, 3);
+
+        // EXPLANATION(qwerasd):
+        // (cont. from "Terminal: deleteChars wide char boundary conditions")
+        //
+        // Additionally consider soft-wrapped wide chars (`H` = spacer head):
+        //
+        //   +--------+
+        // 0 |.......H…
+        // 1 …WWabcdeH…
+        //   : ^      : (^ = cursor)
+        //   : ^^^    : (^ = deleted by DCH 3)
+        // 2 …WW......|
+        //   +--------+
+        //
+        // -> DCH 3
+        // -> First wide character split and destroyed, including spacer head,
+        //    second spacer head removed (verified in xterm).
+        // -> Wrap state of row reset
+        //
+        //   +--------+
+        // 0 |........|
+        // 1 |.cde....|
+        // 2 |WW......|
+        //   +--------+
+        //
+
+        t.print_string(".......😀abcde😀......").unwrap();
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(".......\n😀abcde\n😀......", str);
+
+            let unwrapped = t.plain_string_unwrapped().unwrap();
+            assert_eq!(".......😀abcde😀......", unwrapped);
+        }
+
+        t.set_cursor_pos(2, 2);
+        t.clear_dirty();
+        t.delete_chars(3);
+        cursor_page(t.screens.active).assert_integrity();
+
+        // Deleting the wide char also clears the spacer head on the previous
+        // row, so that row must be dirty too.
+        assert!(t.is_dirty(scr(0, 0)));
+        assert!(t.is_dirty(scr(0, 1)));
+        assert!(!t.is_dirty(scr(0, 2)));
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(".......\n cde\n😀......", str);
+
+            let unwrapped = t.plain_string_unwrapped().unwrap();
+            assert_eq!(".......  cde\n😀......", unwrapped);
+        }
+    }
+
+    #[test]
+    fn terminal_deletechars_wide_char_across_right_margin() {
+        let mut t = init(8, 3);
+
+        // scroll region
+        //    VVVVVV
+        //  +-######-+
+        //  |.abcdeWW|
+        //  : ^      : (^ = cursor)
+        //  +--------+
+        //
+        // DCH 1
+
+        t.print_string("123456橋").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 7);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("123456橋", str);
+        }
+
+        t.set_cursor_pos(1, 2);
+        t.delete_chars(1);
+        cursor_page(t.screens.active).assert_integrity();
+
+        // NOTE: This behavior is slightly inconsistent with xterm. xterm
+        // _visually_ splits the wide character (half the wide character shows
+        // up in col 6 and half in col 8). In all other wide char split scenarios,
+        // xterm clears the cell. Therefore, we've chosen to clear the cell here.
+        // Given we have space, we also could actually preserve it, but I haven't
+        // yet found a terminal that behaves that way. We should be open to
+        // revisiting this behavior but for now we're going with the simpler
+        // impl.
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("13456", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertcolumns() {
+        let mut t = init(8, 3);
+
+        t.print_string("abcdefg\nABCDEFG\nzyxwvut").unwrap();
+        t.set_cursor_pos(2, 2);
+        t.insert_columns(2);
+
+        assert_eq!(1, t.screens.active.cursor.x);
+        assert_eq!(1, t.screens.active.cursor.y);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("a  bcdef\nA  BCDEF\nz  yxwvu", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertcolumns_with_margins() {
+        let mut t = init(8, 4);
+
+        t.print_string("abcdefg\nABCDEFG\nzyxwvut\nZYXWVUT").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 5);
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(2, 3);
+        t.insert_columns(1);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("abcdefg\nAB CDFG\nzy xwut\nZYXWVUT", str);
+        }
+    }
+
+    #[test]
+    fn terminal_insertcolumns_outside_scrolling_region() {
+        let mut t = init(8, 4);
+
+        t.print_string("abcdefg\nABCDEFG").unwrap();
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 5);
+        t.set_cursor_pos(1, 1);
+        t.insert_columns(10);
+        t.set_top_and_bottom_margin(3, 4);
+        t.set_cursor_pos(1, 3);
+        t.insert_columns(10);
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("abcdefg\nABCDEFG", str);
+        }
+    }
+
 }
