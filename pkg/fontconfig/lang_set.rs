@@ -27,7 +27,10 @@ impl LangSet {
 
     pub fn add_lang(self, lang: &CStr) -> bool {
         // SAFETY: valid handle and NUL-terminated string.
-        unsafe { c::FcLangSetAdd(self.cval(), lang.as_ptr() as *const c::FcChar8) == c::FcTrue as c::FcBool }
+        unsafe {
+            c::FcLangSetAdd(self.cval(), lang.as_ptr() as *const c::FcChar8)
+                == c::FcTrue as c::FcBool
+        }
     }
 
     pub fn has_lang(self, lang: &CStr) -> bool {

@@ -207,8 +207,7 @@ impl Buffer {
     /// (an invalid enum value in the Zig version).
     pub fn get_script(self) -> Script {
         // SAFETY: valid buffer handle.
-        Script::from_raw(unsafe { c::hb_buffer_get_script(self.handle) })
-            .unwrap_or(Script::Unknown)
+        Script::from_raw(unsafe { c::hb_buffer_get_script(self.handle) }).unwrap_or(Script::Unknown)
     }
 
     /// Sets the language of buffer to language .
@@ -423,9 +422,8 @@ pub struct GlyphPosition {
     pub _var: u32,
 }
 
-const _: () = assert!(
-    std::mem::size_of::<GlyphPosition>() == std::mem::size_of::<c::hb_glyph_position_t>()
-);
+const _: () =
+    assert!(std::mem::size_of::<GlyphPosition>() == std::mem::size_of::<c::hb_glyph_position_t>());
 
 #[cfg(test)]
 mod tests {

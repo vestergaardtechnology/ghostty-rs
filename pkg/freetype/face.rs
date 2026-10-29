@@ -488,9 +488,13 @@ mod tests {
             (c::FT_LOAD_FORCE_AUTOHINT, "force_autohint", |f| {
                 f.force_autohint = true
             }),
-            (c::FT_LOAD_CROP_BITMAP, "crop_bitmap", |f| f.crop_bitmap = true),
+            (c::FT_LOAD_CROP_BITMAP, "crop_bitmap", |f| {
+                f.crop_bitmap = true
+            }),
             (c::FT_LOAD_PEDANTIC, "pedantic", |f| f.pedantic = true),
-            (c::FT_LOAD_ADVANCE_ONLY, "advance_only", |f| f.advance_only = true),
+            (c::FT_LOAD_ADVANCE_ONLY, "advance_only", |f| {
+                f.advance_only = true
+            }),
             (
                 c::FT_LOAD_IGNORE_GLOBAL_ADVANCE_WIDTH,
                 "ignore_global_advance_width",
@@ -505,7 +509,9 @@ mod tests {
                 f.linear_design = true
             }),
             (c::FT_LOAD_SBITS_ONLY, "sbits_only", |f| f.sbits_only = true),
-            (c::FT_LOAD_NO_AUTOHINT, "no_autohint", |f| f.no_autohint = true),
+            (c::FT_LOAD_NO_AUTOHINT, "no_autohint", |f| {
+                f.no_autohint = true
+            }),
             (c::FT_LOAD_COLOR, "color", |f| f.color = true),
             (c::FT_LOAD_COMPUTE_METRICS, "compute_metrics", |f| {
                 f.compute_metrics = true

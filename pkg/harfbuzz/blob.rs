@@ -107,7 +107,9 @@ impl Blob {
         // The Zig version wraps the typed callback in a comptime-generated
         // C callback; a `fn(*mut T)` is ABI-identical to `fn(*mut c_void)`.
         let cb: c::hb_destroy_func_t = destroycb.map(|f| {
-            std::mem::transmute::<unsafe extern "C" fn(*mut T), unsafe extern "C" fn(*mut c_void)>(f)
+            std::mem::transmute::<unsafe extern "C" fn(*mut T), unsafe extern "C" fn(*mut c_void)>(
+                f,
+            )
         });
 
         c::hb_blob_set_user_data(

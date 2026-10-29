@@ -60,7 +60,11 @@ impl Config {
         }
     }
 
-    pub fn font_render_prepare(self, pat: Pattern, font: Pattern) -> std::result::Result<Pattern, Error> {
+    pub fn font_render_prepare(
+        self,
+        pat: Pattern,
+        font: Pattern,
+    ) -> std::result::Result<Pattern, Error> {
         // SAFETY: valid handles.
         let ptr = unsafe { c::FcFontRenderPrepare(self.cval(), pat.cval(), font.cval()) };
         if ptr.is_null() {

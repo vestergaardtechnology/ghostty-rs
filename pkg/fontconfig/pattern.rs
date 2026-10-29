@@ -138,7 +138,9 @@ impl<'a> ObjectIterator<'a> {
 
                 let mut iter: c::_FcPatternIter = std::mem::zeroed();
                 c::FcPatternIterStart(self.pat, &mut iter);
-                debug_assert!(c::FcPatternIterIsValid(self.pat, &mut iter) == c::FcTrue as c::FcBool);
+                debug_assert!(
+                    c::FcPatternIterIsValid(self.pat, &mut iter) == c::FcTrue as c::FcBool
+                );
                 self.iter = Some(iter);
 
                 // Return right away because the fontconfig iterator pattern

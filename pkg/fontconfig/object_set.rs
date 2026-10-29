@@ -16,7 +16,9 @@ pub struct ObjectSet(NonNull<c::FcObjectSet>);
 impl ObjectSet {
     pub fn create() -> ObjectSet {
         // SAFETY: no preconditions.
-        ObjectSet(NonNull::new(unsafe { c::FcObjectSetCreate() }).expect("FcObjectSetCreate failed"))
+        ObjectSet(
+            NonNull::new(unsafe { c::FcObjectSetCreate() }).expect("FcObjectSetCreate failed"),
+        )
     }
 
     /// # Safety

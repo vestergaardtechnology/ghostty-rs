@@ -146,7 +146,9 @@ mod tests {
         )
         .unwrap();
 
-        let reg = re.search(b"hello foo bar", types::Option::default()).unwrap();
+        let reg = re
+            .search(b"hello foo bar", types::Option::default())
+            .unwrap();
         assert_eq!(1usize, reg.count());
 
         assert_eq!(
