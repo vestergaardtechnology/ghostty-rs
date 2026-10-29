@@ -10,8 +10,6 @@
 //! - `std.AutoArrayHashMapUnmanaged` is an [`IndexMap`] (insertion ordered,
 //!   O(1) lookup, `shift_remove` for ordered removal).
 //! - Allocator parameters are dropped; entries free their outlines on drop.
-//! - `font/Glyph.zig` (`DesignMetrics`, `RenderOptions.Constraint`) is being
-//!   ported concurrently; [`font_glyph`] is a local stand-in.
 
 use std::fmt;
 
@@ -20,7 +18,7 @@ use indexmap::IndexMap;
 use super::request::{self, register_option as ro, Register as RegisterReq};
 use crate::font::opentype::glyf::Outline;
 
-use font_glyph::{Constraint, ConstraintAlign, ConstraintSize, DesignMetrics};
+use crate::font::glyph::{Constraint, ConstraintAlign, ConstraintSize, DesignMetrics};
 
 /// Maximum entries allowed in the glossary before eviction.
 /// Defined by the specification.
@@ -309,141 +307,6 @@ fn is_private_use(cp: u32) -> bool {
     (0xE000..=0xF8FF).contains(&cp)
         || (0xF0000..=0xFFFFD).contains(&cp)
         || (0x100000..=0x10FFFD).contains(&cp)
-}
-
-/// Stand-in for the parts of `src/font/Glyph.zig` the glossary uses.
-///
-/// TODO(port-dedupe): replace with `crate::font::glyph::{DesignMetrics,
-/// RenderOptions Constraint}` once `font/Glyph.zig` is ported.
-pub mod font_glyph {
-    /// Metrics describing the authored glyph coordinate space.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct DesignMetrics {
-        /// Units-per-em for outline/design coordinates.
-        pub units_per_em: u32,
-
-        /// Authored advance width in design units.
-        pub advance_width: u32,
-
-        /// Authored line height in design units.
-        pub line_height: u32,
-    }
-
-    /// `RenderOptions.Constraint`
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    pub struct Constraint {
-        /// Sizing rule.
-        pub size: ConstraintSize,
-
-        /// Vertical alignment rule.
-        pub align_vertical: ConstraintAlign,
-        /// Horizontal alignment rule.
-        pub align_horizontal: ConstraintAlign,
-
-        /// Top padding when resizing.
-        pub pad_top: f64,
-        /// Left padding when resizing.
-        pub pad_left: f64,
-        /// Right padding when resizing.
-        pub pad_right: f64,
-        /// Bottom padding when resizing.
-        pub pad_bottom: f64,
-
-        // Size and bearings of the glyph relative
-        // to the bounding box of its scale group.
-        pub relative_width: f64,
-        pub relative_height: f64,
-        pub relative_x: f64,
-        pub relative_y: f64,
-
-        /// Maximum aspect ratio (width/height) to allow when stretching.
-        pub max_xy_ratio: Option<f64>,
-
-        /// Maximum number of cells horizontally to use (Zig: `u2`).
-        pub max_constraint_width: u8,
-
-        /// What to use as the height metric when constraining the glyph and
-        /// the constraint width is 1,
-        pub height: ConstraintHeight,
-    }
-
-    impl Constraint {
-        /// Don't constrain the glyph in any way.
-        pub const NONE: Constraint = Constraint {
-            size: ConstraintSize::None,
-            align_vertical: ConstraintAlign::None,
-            align_horizontal: ConstraintAlign::None,
-            pad_top: 0.0,
-            pad_left: 0.0,
-            pad_right: 0.0,
-            pad_bottom: 0.0,
-            relative_width: 1.0,
-            relative_height: 1.0,
-            relative_x: 0.0,
-            relative_y: 0.0,
-            max_xy_ratio: None,
-            max_constraint_width: 2,
-            height: ConstraintHeight::Cell,
-        };
-    }
-
-    impl Default for Constraint {
-        fn default() -> Self {
-            Constraint::NONE
-        }
-    }
-
-    /// `Constraint.Size`
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConstraintSize {
-        /// Don't change the size of this glyph.
-        None,
-        /// Scale the glyph down if needed to fit within the bounds,
-        /// preserving aspect ratio.
-        Fit,
-        /// Scale the glyph up or down to exactly match the bounds,
-        /// preserving aspect ratio.
-        Cover,
-        /// Scale the glyph down if needed to fit within the bounds,
-        /// preserving aspect ratio. If the glyph doesn't cover a
-        /// single cell, scale up. If the glyph exceeds a single
-        /// cell but is within the bounds, do nothing.
-        /// (Nerd Font specific rule.)
-        FitCover1,
-        /// Stretch the glyph to exactly fit the bounds in both
-        /// directions, disregarding aspect ratio.
-        Stretch,
-    }
-
-    /// `Constraint.Align`
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConstraintAlign {
-        /// Don't move the glyph on this axis.
-        None,
-        /// Move the glyph so that its leading (bottom/left)
-        /// edge aligns with the leading edge of the axis.
-        Start,
-        /// Move the glyph so that its trailing (top/right)
-        /// edge aligns with the trailing edge of the axis.
-        End,
-        /// Move the glyph so that it is centered on this axis.
-        Center,
-        /// Move the glyph so that it is centered on this axis,
-        /// but always with respect to the first cell even for
-        /// multi-cell constraints. (Nerd Font specific rule.)
-        Center1,
-    }
-
-    /// `Constraint.Height`
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ConstraintHeight {
-        /// Use the full line height of the primary face for
-        /// constraining this glyph.
-        Cell,
-        /// Use the icon height from the grid metrics for
-        /// constraining this glyph.
-        Icon,
-    }
 }
 
 #[cfg(test)]
