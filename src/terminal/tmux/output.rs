@@ -46,11 +46,7 @@ impl fmt::Display for VariableParseError {
 impl std::error::Error for VariableParseError {}
 
 /// `std.fmt.ParseIntError`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParseIntError {
-    InvalidCharacter,
-    Overflow,
-}
+pub use crate::lib::parse_int::ParseIntError;
 
 impl From<ParseIntError> for VariableParseError {
     fn from(e: ParseIntError) -> Self {
@@ -67,40 +63,7 @@ impl From<ParseIntError> for VariableParseError {
 /// between digits, `InvalidCharacter` for anything else (including an
 /// empty string) and `Overflow` when the value doesn't fit.
 pub(crate) fn parse_int_usize(buf: &[u8]) -> Result<usize, ParseIntError> {
-    if buf.is_empty() {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    let (neg, digits) = match buf[0] {
-        b'+' => (false, &buf[1..]),
-        b'-' => (true, &buf[1..]),
-        _ => (false, buf),
-    };
-    if digits.is_empty() {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    if digits[0] == b'_' || digits[digits.len() - 1] == b'_' {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-
-    let mut x: usize = 0;
-    for &c in digits {
-        if c == b'_' {
-            continue;
-        }
-        let digit = match c {
-            b'0'..=b'9' => (c - b'0') as usize,
-            _ => return Err(ParseIntError::InvalidCharacter),
-        };
-        if x != 0 {
-            x = x.checked_mul(10).ok_or(ParseIntError::Overflow)?;
-        }
-        x = if neg {
-            x.checked_sub(digit).ok_or(ParseIntError::Overflow)?
-        } else {
-            x.checked_add(digit).ok_or(ParseIntError::Overflow)?
-        };
-    }
-    Ok(x)
+    crate::lib::parse_int::std_parse_int(buf, 10)
 }
 
 /// Parse the output from a command with the given format struct

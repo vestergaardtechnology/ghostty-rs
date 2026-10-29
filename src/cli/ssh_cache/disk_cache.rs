@@ -72,12 +72,18 @@ impl DiskCache {
     ///
     /// On all platforms, this is `${XDG_STATE_HOME}/ghostty/ssh_cache`.
     pub fn default_path(program: &str) -> Result<PathBuf, Error> {
-        // TODO(port-dedupe): replace with crate::global::environ_map() and
-        // crate::os::xdg::state once ported.
-        let environ_map = crate::crash::dir::environ_map();
-        let state_dir = crate::crash::dir::xdg::state(&environ_map, Some(program))
-            .map_err(|_| Error::XdgLookupFailed)?;
-        Ok(state_dir.join("ssh_cache"))
+        // TODO(port-dedupe): replace with crate::global::environ_map()
+        // once global.zig is ported.
+        let environ_map = crate::os::environ_map();
+        let state_dir = crate::os::xdg::state(
+            &environ_map,
+            crate::os::xdg::Options {
+                subdir: Some(program),
+                ..Default::default()
+            },
+        )
+        .map_err(|_| Error::XdgLookupFailed)?;
+        Ok(PathBuf::from(state_dir).join("ssh_cache"))
     }
 
     /// Clear all cache data stored in the disk cache.

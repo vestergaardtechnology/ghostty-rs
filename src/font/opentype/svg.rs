@@ -5,7 +5,10 @@
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::sfnt::{ReadError, Reader};
+use std::io::Cursor;
+
+use super::sfnt::ReadError;
+use crate::lib::compat::reader::{self as compat_reader, Endian};
 
 /// Errors that can be returned from [`Svg::init`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +22,12 @@ impl From<ReadError> for SvgError {
         match e {
             ReadError::EndOfStream => SvgError::EndOfStream,
         }
+    }
+}
+
+impl From<std::io::Error> for SvgError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::from(e).into()
     }
 }
 
@@ -57,29 +66,32 @@ pub struct Svg<'a> {
 
 impl<'a> Svg<'a> {
     pub fn init(data: &'a [u8]) -> Result<Svg<'a>, SvgError> {
-        let mut reader = Reader::fixed(data);
+        let mut reader = Cursor::new(data);
 
         // Version
-        if reader.read_be::<u16>()? != 0 {
+        if compat_reader::reader_int::<_, u16>(&mut reader, Endian::Big)? != 0 {
             return Err(SvgError::SvgVersionNotSupported);
         }
 
         // Offset
-        let offset = reader.read_be::<u32>()? as usize;
+        let offset = compat_reader::reader_int::<_, u32>(&mut reader, Endian::Big)? as usize;
 
         // Seek to the offset to get our document list
         if offset > data.len() {
             return Err(SvgError::EndOfStream);
         }
-        reader.seek = offset;
+        reader.set_position(offset as u64);
 
         // Get our document records along with the start/end glyph range.
-        let len = reader.read_be::<u16>()? as usize;
+        let len = compat_reader::reader_int::<_, u16>(&mut reader, Endian::Big)? as usize;
 
         // Port note: the Zig code reinterprets the rest of the data as
         // records without a bounds check; here the record array (and the
         // first record that is always read) must fit in the data.
-        let record_bytes = reader.take(len.max(1) * 12)?;
+        let seek = reader.position() as usize;
+        let record_bytes = data
+            .get(seek..seek + len.max(1) * 12)
+            .ok_or(SvgError::EndOfStream)?;
         let (records, _) = record_bytes.as_chunks::<12>();
         let records = &records[..len];
 
@@ -129,8 +141,11 @@ fn compare_glyph_id(glyph_id: u16, record: &[u8; 12]) -> Ordering {
 }
 
 fn glyph_range(record: &[u8]) -> Result<(u16, u16), ReadError> {
-    let mut reader = Reader::fixed(record);
-    Ok((reader.read_be::<u16>()?, reader.read_be::<u16>()?))
+    let mut reader = Cursor::new(record);
+    Ok((
+        compat_reader::reader_int(&mut reader, Endian::Big)?,
+        compat_reader::reader_int(&mut reader, Endian::Big)?,
+    ))
 }
 
 #[cfg(test)]

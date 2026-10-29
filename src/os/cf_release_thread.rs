@@ -9,9 +9,10 @@
 
 #![cfg(target_os = "macos")]
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::{Arc, Condvar, Mutex};
+
+use crate::datastruct::BlockingQueue;
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -33,37 +34,9 @@ pub enum Message {
 }
 
 /// The type used for sending messages to the thread. For now this is
-/// hardcoded with a capacity.
-///
-/// TODO(port-dedupe): replace with `crate::datastruct::BlockingQueue<Message, 64>`
-/// (owned by another port).
-pub struct Mailbox {
-    queue: Mutex<VecDeque<Message>>,
-}
-
-impl Mailbox {
-    pub const CAPACITY: usize = 64;
-
-    fn new() -> Mailbox {
-        Mailbox {
-            queue: Mutex::new(VecDeque::with_capacity(Self::CAPACITY)),
-        }
-    }
-
-    /// Push a message. Returns false if the mailbox is full.
-    pub fn push(&self, message: Message) -> bool {
-        let mut q = self.queue.lock().unwrap();
-        if q.len() >= Self::CAPACITY {
-            return false;
-        }
-        q.push_back(message);
-        true
-    }
-
-    pub fn pop(&self) -> Option<Message> {
-        self.queue.lock().unwrap().pop_front()
-    }
-}
+/// hardcoded with a capacity. We can make this a comptime parameter in
+/// the future if we want it configurable.
+pub type Mailbox = BlockingQueue<Message, 64>;
 
 /// Stand-in for the xev loop + async handles (wakeup/stop).
 ///

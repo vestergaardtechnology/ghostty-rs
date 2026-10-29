@@ -2,7 +2,10 @@
 //!
 //! STATUS: ported
 
-use super::sfnt::{self, be_struct, Fword, Int16, ReadError, Reader, Ufword, Uint16};
+use std::io::Cursor;
+
+use super::sfnt::{self, be_struct, Fword, Int16, ReadError, Ufword, Uint16};
+use crate::lib::compat::reader::{self as compat_reader, Endian};
 
 be_struct! {
     /// Horizontal Header Table
@@ -80,8 +83,8 @@ be_struct! {
 impl Hhea {
     /// Parse the table from raw data.
     pub fn init(data: &[u8]) -> Result<Hhea, ReadError> {
-        let mut reader = Reader::fixed(data);
-        reader.read_be::<Hhea>()
+        let mut reader = Cursor::new(data);
+        Ok(compat_reader::read_struct_endian(&mut reader, Endian::Big)?)
     }
 }
 

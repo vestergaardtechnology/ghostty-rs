@@ -3,6 +3,9 @@
 //! STATUS: ported
 
 use std::fmt;
+use std::io::{self, Cursor, Read};
+
+use crate::lib::compat::reader::{self as compat_reader, Endian, ReadEndian};
 
 /// 8-bit unsigned integer.
 pub type Uint8 = u8;
@@ -139,9 +142,9 @@ macro_rules! fixed_point {
             }
         }
 
-        impl ReadBe for $name {
-            fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError> {
-                Ok(Self::from_bits(<$T>::read_be(r)?))
+        impl ReadEndian for $name {
+            fn read_endian<R: Read + ?Sized>(r: &mut R, endian: Endian) -> io::Result<Self> {
+                Ok(Self::from_bits(<$T>::read_endian(r, endian)?))
             }
         }
     };
@@ -163,15 +166,15 @@ fixed_point!(
 );
 
 // ---------------------------------------------------------------------------
-// Big-endian reading helpers.
+// Reading helpers.
 //
-// TODO(port-dedupe): the Zig tables read through `lib/compat/reader.zig`
-// (a std.Io.Reader shim, `readStructEndian`/`readerInt`/`readByte`/...).
-// This is a minimal slice-based equivalent shared by the opentype parsers.
+// The Zig tables read through `std.Io.Reader.fixed(data)` and the helpers in
+// `lib/compat/reader.zig`. In Rust a fixed reader is a
+// `std::io::Cursor<&[u8]>` (its `position()` is `reader.seek`) and the
+// helpers are `crate::lib::compat::reader`.
 // ---------------------------------------------------------------------------
 
-/// Error returned when reading past the end of a fixed buffer
-/// (the only member of `std.Io.Reader.Error` a fixed reader can produce).
+/// `std.Io.Reader.Error`. A fixed reader can only fail with `EndOfStream`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadError {
     EndOfStream,
@@ -187,87 +190,23 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// A reader over a fixed byte buffer (Zig `std.Io.Reader.fixed`).
-#[derive(Debug, Clone)]
-pub struct Reader<'a> {
-    pub buffer: &'a [u8],
-    /// Current read position.
-    pub seek: usize,
-}
-
-impl<'a> Reader<'a> {
-    pub const fn fixed(buffer: &'a [u8]) -> Self {
-        Self { buffer, seek: 0 }
-    }
-
-    /// Number of unread bytes.
-    pub fn remaining(&self) -> usize {
-        self.buffer.len().saturating_sub(self.seek)
-    }
-
-    /// Take the next `n` bytes or fail with `EndOfStream`.
-    pub fn take(&mut self, n: usize) -> Result<&'a [u8], ReadError> {
-        if self.remaining() < n {
-            // Like std.Io.Reader, a failed read consumes what was there.
-            self.seek = self.buffer.len().max(self.seek);
-            return Err(ReadError::EndOfStream);
-        }
-        let s = &self.buffer[self.seek..self.seek + n];
-        self.seek += n;
-        Ok(s)
-    }
-
-    pub fn read_slice_all(&mut self, out: &mut [u8]) -> Result<(), ReadError> {
-        out.copy_from_slice(self.take(out.len())?);
-        Ok(())
-    }
-
-    pub fn read_byte(&mut self) -> Result<u8, ReadError> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub fn read_skip_bytes(&mut self, n: usize) -> Result<(), ReadError> {
-        self.take(n).map(|_| ())
-    }
-
-    /// Read a big-endian value (`readerInt(.., .big)` / `readStructEndian(.., .big)`).
-    pub fn read_be<T: ReadBe>(&mut self) -> Result<T, ReadError> {
-        T::read_be(self)
+impl From<io::Error> for ReadError {
+    /// Reading from a fixed buffer (`std::io::Cursor<&[u8]>`) only fails
+    /// when it runs out of data.
+    fn from(_: io::Error) -> Self {
+        ReadError::EndOfStream
     }
 }
 
-/// Types that can be read in big-endian byte order from a [`Reader`].
-pub trait ReadBe: Sized {
-    fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError>;
-}
-
-macro_rules! impl_read_be_int {
-    ($($t:ty),*) => {$(
-        impl ReadBe for $t {
-            fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError> {
-                let b = r.take(std::mem::size_of::<$t>())?;
-                Ok(<$t>::from_be_bytes(b.try_into().unwrap()))
-            }
-        }
-    )*};
-}
-impl_read_be_int!(u8, i8, u16, i16, u32, i32, u64, i64);
-
-impl<const N: usize> ReadBe for [u8; N] {
-    fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError> {
-        Ok(r.take(N)?.try_into().unwrap())
-    }
-}
-
-impl ReadBe for Version16Dot16 {
-    fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError> {
-        Ok(Self::from_bits(u32::read_be(r)?))
+impl ReadEndian for Version16Dot16 {
+    fn read_endian<R: Read + ?Sized>(r: &mut R, endian: Endian) -> io::Result<Self> {
+        Ok(Self::from_bits(u32::read_endian(r, endian)?))
     }
 }
 
 /// Define a struct whose binary layout is a sequence of big-endian fields
 /// (a Zig `extern struct` with `align(1)` fields read via
-/// `readStructEndian(.., .big)`), and implement [`ReadBe`] for it.
+/// `readStructEndian(.., .big)`), and implement [`ReadEndian`] for it.
 macro_rules! be_struct {
     (
         $(#[$m:meta])*
@@ -286,13 +225,16 @@ macro_rules! be_struct {
             )*
         }
 
-        impl $crate::font::opentype::sfnt::ReadBe for $name {
-            fn read_be(
-                r: &mut $crate::font::opentype::sfnt::Reader<'_>,
-            ) -> Result<Self, $crate::font::opentype::sfnt::ReadError> {
+        impl $crate::lib::compat::reader::ReadEndian for $name {
+            fn read_endian<R: ::std::io::Read + ?Sized>(
+                r: &mut R,
+                endian: $crate::lib::compat::reader::Endian,
+            ) -> ::std::io::Result<Self> {
                 Ok(Self {
                     $(
-                        $field: <$ty as $crate::font::opentype::sfnt::ReadBe>::read_be(r)?,
+                        $field: <$ty as $crate::lib::compat::reader::ReadEndian>::read_endian(
+                            r, endian,
+                        )?,
                     )*
                 })
             }
@@ -396,13 +338,16 @@ impl<'a> Sfnt<'a> {
     /// reference to `data` and use it for future operations.
     pub fn init(data: &'a [u8]) -> Result<Sfnt<'a>, ReadError> {
         // SFNT files use big endian; the reader converts to native.
-        let mut reader = Reader::fixed(data);
+        let mut reader = Cursor::new(data);
 
-        let offset: OffsetSubtable = reader.read_be()?;
+        let offset: OffsetSubtable = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
 
         let mut records = Vec::with_capacity(offset.num_tables as usize);
         for _ in 0..offset.num_tables {
-            records.push(reader.read_be::<TableRecord>()?);
+            records.push(compat_reader::read_struct_endian::<_, TableRecord>(
+                &mut reader,
+                Endian::Big,
+            )?);
         }
 
         Ok(Sfnt {
@@ -432,9 +377,10 @@ impl<'a> Sfnt<'a> {
 mod tests {
     use super::*;
 
-    // TODO(port-dedupe): replace with
-    // crate::terminal::build_options artifact == Artifact::Lib.
-    const ARTIFACT_IS_LIB: bool = false;
+    use crate::terminal::build_options::{self, Artifact};
+
+    /// `@import("terminal_options").artifact == .lib`
+    const ARTIFACT_IS_LIB: bool = matches!(build_options::ARTIFACT, Artifact::Lib);
 
     #[test]
     fn fixed_point() {

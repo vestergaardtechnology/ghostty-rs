@@ -40,6 +40,14 @@ macro_rules! impl_read_endian {
 
 impl_read_endian!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
+/// Byte arrays (e.g. table tags) have no byte order and are read as is,
+/// like `[N]u8` fields of an extern struct in Zig's `readStructEndian`.
+impl<const N: usize> ReadEndian for [u8; N] {
+    fn read_endian<R: Read + ?Sized>(reader: &mut R, _endian: Endian) -> io::Result<Self> {
+        read_bytes_no_eof::<R, N>(reader)
+    }
+}
+
 /// Pulled from old stdlib as this function has been removed.
 pub fn read_skip_until_delimiter_or_eof<R: Read + ?Sized>(
     reader: &mut R,

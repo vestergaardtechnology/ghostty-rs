@@ -1,8 +1,6 @@
 //! Port of `src/terminal/lib.zig`.
 //!
-//! STATUS: partial — the forwarded re-exports of `crate::lib` items (alloc,
-//! TinyIo, Buffer, Enum, parseInt, TaggedUnion, Struct, String,
-//! checkGhosttyHEnum, structSizedFieldFits) are pending the `src/lib` port.
+//! STATUS: ported
 //!
 //! Helpers for the terminal package's C ABI (`libghostty-vt`).
 //!
@@ -11,25 +9,21 @@
 //! otherwise. The Rust port is always the Ghostty application build
 //! (`build_options::C_ABI == false`), so such enums are written as plain Rust
 //! enums with explicit `#[repr(u8)]` discriminants equal to the key index.
+//!
+//! Rust notes: Zig's comptime type generators `lib.Struct` and
+//! `lib.TaggedUnion` are the `#[macro_export]` macros [`crate::lib_struct!`]
+//! and [`crate::lib_tagged_union!`] (re-exported here as [`Struct`] and
+//! [`TaggedUnion`]); `std.lang.CallingConvention` has no Rust value
+//! counterpart, so [`CallingConvention`] is a local enum.
 
 use super::build_options;
-
-/// The ABI flavor of a library build (`lib.Target`).
-///
-/// TODO(port-dedupe): replace with crate::lib::target::Target
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    /// C ABI compatible types (`c_int` enums, extern structs).
-    C,
-    /// Native types with the smallest possible representation.
-    Zig,
-}
+use crate::lib;
 
 /// The target for the terminal lib in particular.
-pub const TARGET: Target = if build_options::C_ABI {
-    Target::C
+pub const TARGET: lib::Target = if build_options::C_ABI {
+    lib::Target::C
 } else {
-    Target::Zig
+    lib::Target::Zig
 };
 
 /// A calling convention (`std.lang.CallingConvention`), restricted to what
@@ -51,15 +45,16 @@ pub enum CallingConvention {
 pub const CALLING_CONV: CallingConvention = CallingConvention::C;
 
 // Forwarded decls from lib that are used.
-//
-// TODO(port-dedupe): once `src/lib` is ported, re-export:
-//   pub use crate::lib::allocator as alloc;
-//   pub use crate::lib::tinyio::TinyIo;
-//   pub use crate::lib::types::{Buffer, String};
-//   pub use crate::lib::r#enum::{Enum, check_ghostty_h_enum};
-//   pub use crate::lib::parse_int::parse_int;
-//   pub use crate::lib::union::TaggedUnion;
-//   pub use crate::lib::r#struct::{Struct, sized_field_fits as struct_sized_field_fits};
+pub use crate::lib::allocator as alloc;
+pub use crate::lib::check_ghostty_h_enum;
+pub use crate::lib::parse_int;
+pub use crate::lib::struct_sized_field_fits;
+pub use crate::lib::Buffer;
+pub use crate::lib::Enum;
+pub use crate::lib::String;
+pub use crate::lib::Struct;
+pub use crate::lib::TaggedUnion;
+pub use crate::lib::TinyIo;
 
 #[cfg(test)]
 mod tests {
@@ -67,7 +62,7 @@ mod tests {
 
     #[test]
     fn target_is_zig_for_app_build() {
-        assert_eq!(TARGET, Target::Zig);
+        assert_eq!(TARGET, lib::Target::Zig);
         assert_eq!(CALLING_CONV, CallingConvention::C);
     }
 }

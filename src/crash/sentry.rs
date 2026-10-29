@@ -13,8 +13,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use super::dir::EnvironMap;
 use super::sentry_envelope::{Envelope, EnvelopeError, ItemType};
+use crate::os::{xdg, EnvironMap};
 
 // The `sentry` log scope.
 #[allow(dead_code)]
@@ -25,7 +25,11 @@ const LOG_TARGET: &str = "sentry";
 pub enum Error {
     SentryInitFailed,
     StateDirNotInitialized,
-    NoHomeDir,
+    /// The XDG directory lookup failed.
+    Xdg(xdg::Error),
+    /// The macOS cache directory lookup failed.
+    #[cfg(target_os = "macos")]
+    AppleAPIFailed,
     Envelope(EnvelopeError),
     Io(io::Error),
 }
@@ -54,10 +58,17 @@ impl From<EnvelopeError> for Error {
     }
 }
 
-impl From<super::dir::DefaultDirError> for Error {
-    fn from(err: super::dir::DefaultDirError) -> Self {
+impl From<xdg::Error> for Error {
+    fn from(err: xdg::Error) -> Self {
+        Error::Xdg(err)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl From<crate::os::macos::CacheDirError> for Error {
+    fn from(err: crate::os::macos::CacheDirError) -> Self {
         match err {
-            super::dir::DefaultDirError::NoHomeDir => Error::NoHomeDir,
+            crate::os::macos::CacheDirError::AppleAPIFailed => Error::AppleAPIFailed,
         }
     }
 }
@@ -178,10 +189,20 @@ fn cache_dir(environ_map: &EnvironMap) -> Result<PathBuf, Error> {
     // On macOS, we prefer to use the NSCachesDirectory value to be
     // a more idiomatic macOS application. But if XDG env vars are set
     // we will respect them.
-    // TODO(port-dedupe): macOS uses `internal_os.macos.cacheDir` when
-    // XDG_CACHE_HOME is set; os/macos is not ported yet so we always use
-    // the XDG lookup.
-    Ok(super::dir::xdg::cache(environ_map, Some("ghostty/sentry"))?)
+    #[cfg(target_os = "macos")]
+    if let Some(xdg_cache_home) = environ_map.get("XDG_CACHE_HOME") {
+        if !xdg_cache_home.is_empty() {
+            return Ok(PathBuf::from(crate::os::macos::cache_dir("sentry")?));
+        }
+    }
+
+    Ok(PathBuf::from(xdg::cache(
+        environ_map,
+        xdg::Options {
+            subdir: Some("ghostty/sentry"),
+            ..Default::default()
+        },
+    )?))
 }
 
 /// The crash report transport. Reports are only ever persisted to the

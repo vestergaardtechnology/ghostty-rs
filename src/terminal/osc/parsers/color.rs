@@ -2,7 +2,7 @@
 //!
 //! STATUS: ported
 
-use crate::terminal::color::parse_int::parse_int_bits;
+use crate::lib::parse_int::parse_int_bits_unsigned;
 use crate::terminal::color::{Dynamic as DynamicColor, Rgb, Special as SpecialColor};
 use crate::terminal::osc::{ColorOperation, Command, Parser, State, Terminator};
 
@@ -157,7 +157,7 @@ fn parse_color(op: Operation, buf: &[u8]) -> Result<List, ParseError> {
 
 /// Parse a color index as a Zig `u9`.
 fn parse_u9(s: &[u8]) -> Option<u16> {
-    parse_int_bits(s, 10, 9, false).ok().map(|v| v as u16)
+    parse_int_bits_unsigned(s, 10, 9).ok().map(|v| v as u16)
 }
 
 /// Map an OSC 4/104 index (0-255 palette, 256-260 special) or an OSC

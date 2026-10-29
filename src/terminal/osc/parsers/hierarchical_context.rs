@@ -14,7 +14,7 @@
 //! [`FieldType`], and `read_option::<fields::User>()` returns that field's
 //! value type.
 
-use crate::terminal::color::parse_int::parse_int;
+use crate::lib::parse_int;
 use crate::terminal::osc::{Command as OscCommand, Parser, State};
 
 const LOG_TARGET: &str = "osc_hierarchical_context";

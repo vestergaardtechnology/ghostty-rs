@@ -9,6 +9,8 @@
 use std::fmt;
 use std::io;
 
+use crate::lib::parse_int::std_parse_int;
+
 /// A single entry within our SSH entry cache.
 ///
 /// The Zig struct borrows its strings from the parsed line; the Rust port
@@ -36,7 +38,7 @@ impl Entry {
         let hostname = iter.next()?;
         let timestamp_str = iter.next()?;
         let terminfo_version = iter.next().unwrap_or("xterm-ghostty");
-        let timestamp = match parse_int_i64(timestamp_str.as_bytes()) {
+        let timestamp = match std_parse_int::<i64>(timestamp_str.as_bytes(), 10) {
             Ok(v) => v,
             Err(err) => {
                 log::warn!(
@@ -72,50 +74,6 @@ impl fmt::Display for Entry {
             self.hostname, self.timestamp, self.terminfo_version
         )
     }
-}
-
-/// `std.fmt.ParseIntError`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParseIntError {
-    InvalidCharacter,
-    Overflow,
-}
-
-// TODO(port-dedupe): replace with a shared `std.fmt.parseInt` port.
-/// `std.fmt.parseInt(i64, buf, 10)`: an optional leading `+` or `-`, `_`
-/// digit separators allowed between digits.
-fn parse_int_i64(buf: &[u8]) -> Result<i64, ParseIntError> {
-    if buf.is_empty() {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-    let (neg, digits) = match buf[0] {
-        b'+' => (false, &buf[1..]),
-        b'-' => (true, &buf[1..]),
-        _ => (false, buf),
-    };
-    if digits.is_empty() || digits[0] == b'_' || digits[digits.len() - 1] == b'_' {
-        return Err(ParseIntError::InvalidCharacter);
-    }
-
-    let mut x: i64 = 0;
-    for &c in digits {
-        if c == b'_' {
-            continue;
-        }
-        let digit = match c {
-            b'0'..=b'9' => (c - b'0') as i64,
-            _ => return Err(ParseIntError::InvalidCharacter),
-        };
-        if x != 0 {
-            x = x.checked_mul(10).ok_or(ParseIntError::Overflow)?;
-        }
-        x = if neg {
-            x.checked_sub(digit).ok_or(ParseIntError::Overflow)?
-        } else {
-            x.checked_add(digit).ok_or(ParseIntError::Overflow)?
-        };
-    }
-    Ok(x)
 }
 
 #[cfg(test)]

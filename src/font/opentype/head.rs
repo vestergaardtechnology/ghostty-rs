@@ -2,7 +2,10 @@
 //!
 //! STATUS: ported
 
-use super::sfnt::{self, be_struct, Fixed, Int16, LongDateTime, ReadError, Reader, Uint16, Uint32};
+use std::io::Cursor;
+
+use super::sfnt::{self, be_struct, Fixed, Int16, LongDateTime, ReadError, Uint16, Uint32};
+use crate::lib::compat::reader::{self as compat_reader, Endian};
 
 be_struct! {
     /// Font Header Table
@@ -144,8 +147,8 @@ be_struct! {
 impl Head {
     /// Parse the table from raw data.
     pub fn init(data: &[u8]) -> Result<Head, ReadError> {
-        let mut reader = Reader::fixed(data);
-        reader.read_be::<Head>()
+        let mut reader = Cursor::new(data);
+        Ok(compat_reader::read_struct_endian(&mut reader, Endian::Big)?)
     }
 }
 
