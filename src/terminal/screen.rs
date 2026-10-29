@@ -2191,7 +2191,7 @@ impl Screen {
         // their pins still identify those rows. Erasing marks those pins as
         // garbage and moves them to the top-left of the retained rows.
         if build_options::KITTY_GRAPHICS {
-            self.kitty_images.erase_history(&self.pages, bl);
+            self.kitty_images.erase_history(&mut self.pages, bl);
         }
 
         self.pages.erase_history(bl);
