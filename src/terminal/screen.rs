@@ -1,6 +1,6 @@
 //! Port of `src/terminal/Screen.zig`.
 //!
-//! STATUS: partial — implementation ported; tests in progress.
+//! STATUS: ported
 //!
 //! Notes on the port:
 //! - The `io` and `alloc` fields are dropped (global allocator, no `std.Io`).
@@ -494,6 +494,30 @@ pub enum ResizeFailPoint {
 }
 
 pub static RESIZE_TW: tripwire::Module<ResizeFailPoint, AllocError> = tripwire::Module::new();
+
+/// Rust-only failure point standing in for the allocation of the cursor
+/// hyperlink in `startHyperlinkOnce` (Zig tests inject it with a
+/// `FailingAllocator`; Rust's global allocator cannot fail).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HyperlinkFailPoint {
+    LinkAlloc,
+}
+
+pub static HYPERLINK_TW: tripwire::Module<HyperlinkFailPoint, AllocError> = tripwire::Module::new();
+
+/// Errors from `startHyperlinkOnce` (Zig: `Allocator.Error ||
+/// Page.InsertHyperlinkError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartHyperlinkOnceError {
+    OutOfMemory,
+    Insert(pagepkg::InsertHyperlinkError),
+}
+
+impl From<AllocError> for StartHyperlinkOnceError {
+    fn from(_: AllocError) -> Self {
+        StartHyperlinkOnceError::OutOfMemory
+    }
+}
 
 /// Options for [`Screen::cursor_copy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3136,20 +3160,30 @@ impl Screen {
 
         // Loop until we have enough page memory to add the hyperlink
         loop {
-            let adjustment = match self.start_hyperlink_once(&link) {
+            use pagepkg::InsertHyperlinkError as E;
+            let r = match self.start_hyperlink_once(&link) {
                 Ok(()) => return Ok(()),
 
+                // An actual self.alloc OOM is a fatal error.
+                Err(StartHyperlinkOnceError::OutOfMemory) => Err(IncreaseCapacityError::OutOfMemory),
+
                 // strings table is out of memory, adjust it up
-                Err(pagepkg::InsertHyperlinkError::StringsOutOfMemory) => Some(IncreaseCapacity::StringBytes),
+                Err(StartHyperlinkOnceError::Insert(E::StringsOutOfMemory)) => {
+                    self.increase_capacity(self.cpin().node, Some(IncreaseCapacity::StringBytes))
+                }
 
                 // hyperlink set is out of memory, adjust it up
-                Err(pagepkg::InsertHyperlinkError::SetOutOfMemory) => Some(IncreaseCapacity::HyperlinkBytes),
+                Err(StartHyperlinkOnceError::Insert(E::SetOutOfMemory)) => {
+                    self.increase_capacity(self.cpin().node, Some(IncreaseCapacity::HyperlinkBytes))
+                }
 
                 // hyperlink set is too full, rehash it
-                Err(pagepkg::InsertHyperlinkError::SetNeedsRehash) => None,
+                Err(StartHyperlinkOnceError::Insert(E::SetNeedsRehash)) => {
+                    self.increase_capacity(self.cpin().node, None)
+                }
             };
 
-            if let Err(e) = self.increase_capacity(self.cpin().node, adjustment) {
+            if let Err(e) = r {
                 // errdefer
                 if let HyperlinkId::Implicit(_) = link.id {
                     self.cursor.hyperlink_implicit_id = self.cursor.hyperlink_implicit_id.wrapping_sub(1);
@@ -3164,9 +3198,10 @@ impl Screen {
     /// This is like startHyperlink but if we have to adjust page capacities
     /// this returns error.PageAdjusted. This is useful so that we unwind
     /// all the previous state and try again.
-    fn start_hyperlink_once(&mut self, source: &Hyperlink<'_>) -> Result<(), pagepkg::InsertHyperlinkError> {
+    fn start_hyperlink_once(&mut self, source: &Hyperlink<'_>) -> Result<(), StartHyperlinkOnceError> {
         // Allocate our new Hyperlink entry in non-page memory. This
         // lets us quickly get access to URI, ID.
+        HYPERLINK_TW.check(HyperlinkFailPoint::LinkAlloc)?;
         let link = Box::new(source.dupe());
 
         // End any prior hyperlink only after duplicating the new value. The
@@ -3175,7 +3210,7 @@ impl Screen {
 
         // Insert the hyperlink into page memory
         let page = self.cpage();
-        let id: hyperlink::Id = page.insert_hyperlink(&link)?;
+        let id: hyperlink::Id = page.insert_hyperlink(&link).map_err(StartHyperlinkOnceError::Insert)?;
 
         // Save it all
         self.cursor.hyperlink = Some(link);
@@ -8417,6 +8452,1239 @@ mod tests {
         s.test_write_string("      ").unwrap();
 
         assert_eq!("👨", sel_string(&s, scr(1, 0), scr(2, 0), true));
+    }
+
+    #[test]
+    fn screen_selection_string_with_zero_width_joiner() {
+        let mut s = init(10, 1, Some(0));
+        let str_ = "👨\u{200d}"; // this has a ZWJ
+        s.test_write_string(str_).unwrap();
+
+        // Integrity check
+        {
+            let p = pin(&s, scr(0, 0));
+            let cell = cl(p.row_and_cell().cell);
+            assert_eq!(0x1F468, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = pg(p.node).lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+
+        // The real test
+        assert_eq!("👨\u{200d}", sel_string(&s, scr(0, 0), scr(1, 0), true));
+    }
+
+    const LOREM: &str = "Lorem ipsum dolor\nsit amet, consectetur\nadipiscing elit, sed do\neiusmod tempor incididunt\nut labore et dolore";
+
+    fn rect_string(s: &Screen, a: Point, b: Point) -> String {
+        let sel = Selection::init(pin(s, a), pin(s, b), true);
+        s.selection_string(SelectionString { sel, trim: true })
+    }
+
+    #[test]
+    fn screen_selection_string_rectangle_basic() {
+        let mut s = init(30, 5, Some(0));
+        let expected = "t ame\nipisc\nusmod";
+        s.test_write_string(LOREM).unwrap();
+
+        assert_eq!(expected, rect_string(&s, scr(2, 1), scr(6, 3)));
+    }
+
+    #[test]
+    fn screen_selection_string_rectangle_w_eol() {
+        let mut s = init(30, 5, Some(0));
+        let expected = "dolor\nnsectetur\nlit, sed do\nor incididunt\n dolore";
+        s.test_write_string(LOREM).unwrap();
+
+        assert_eq!(expected, rect_string(&s, scr(12, 0), scr(26, 4)));
+    }
+
+    #[test]
+    fn screen_selection_string_rectangle_more_complex_w_breaks() {
+        let mut s = init(30, 8, Some(0));
+        let str_ = "Lorem ipsum dolor\nsit amet, consectetur\nadipiscing elit, sed do\neiusmod tempor incididunt\nut labore et dolore\n\nmagna aliqua. Ut enim\nad minim veniam, quis";
+        let expected = "elit, sed do\npor incididunt\nt dolore\n\na. Ut enim\nniam, quis";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!(expected, rect_string(&s, scr(11, 2), scr(26, 7)));
+    }
+
+    #[test]
+    fn screen_selection_string_multi_page() {
+        let mut s = init(10, 3, Some(2048));
+
+        // Lazy way to seek to the first page boundary.
+        fill_first_page(&mut s, 1);
+
+        s.test_write_string("123456789\n!@#$%^&*(\n123456789").unwrap();
+
+        assert_eq!(
+            "123456789\n!@#$%^&*(\n123",
+            sel_string(&s, act(0, 0), act(2, 2), true)
+        );
+    }
+
+    #[test]
+    fn screen_line_iterator() {
+        let mut s = init(5, 5, Some(0));
+        let str_ = "1ABCD\n2EFGH";
+        s.test_write_string(str_).unwrap();
+
+        // Test the line iterator
+        let mut iter = s.line_iterator(pin(&s, vp(0, 0)));
+        let sel = iter.next().unwrap();
+        assert_eq!("1ABCD", sel_str(&s, sel));
+        let sel = iter.next().unwrap();
+        assert_eq!("2EFGH", sel_str(&s, sel));
+    }
+
+    #[test]
+    fn screen_line_iterator_soft_wrap() {
+        let mut s = init(5, 5, Some(0));
+        let str_ = "1ABCD2EFGH\n3ABCD";
+        s.test_write_string(str_).unwrap();
+
+        // Test the line iterator
+        let mut iter = s.line_iterator(pin(&s, vp(0, 0)));
+        let sel = iter.next().unwrap();
+        assert_eq!("1ABCD2EFGH", sel_str(&s, sel));
+        let sel = iter.next().unwrap();
+        assert_eq!("3ABCD", sel_str(&s, sel));
+        // try testing.expect(iter.next() == null);
+    }
+
+    #[test]
+    fn screen_hyperlink_start_end() {
+        let mut s = init(5, 5, Some(0));
+        assert!(s.cursor.hyperlink_id == 0);
+        assert_eq!(0, cpage(&s).hyperlink_set.count());
+
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+        assert!(s.cursor.hyperlink_id != 0);
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+
+        s.end_hyperlink();
+        assert!(s.cursor.hyperlink_id == 0);
+        assert_eq!(0, cpage(&s).hyperlink_set.count());
+    }
+
+    #[test]
+    fn screen_hyperlink_accepts_its_current_values() {
+        let mut s = init(5, 5, Some(0));
+
+        s.start_hyperlink(b"http://example.com", Some(b"current")).unwrap();
+        // The arguments alias the current hyperlink, exactly like the Zig
+        // test (startHyperlink duplicates them before releasing it).
+        let (uri, id): (*const [u8], *const [u8]) = {
+            let current = s.cursor.hyperlink.as_ref().unwrap();
+            let HyperlinkId::Explicit(id) = &current.id else { unreachable!() };
+            (&*current.uri as *const [u8], &**id as *const [u8])
+        };
+        s.start_hyperlink(unsafe { &*uri }, Some(unsafe { &*id })).unwrap();
+
+        let link = s.cursor.hyperlink.as_ref().unwrap();
+        assert_eq!(b"http://example.com", &*link.uri);
+        let HyperlinkId::Explicit(id) = &link.id else { panic!() };
+        assert_eq!(b"current", &**id);
+    }
+
+    #[test]
+    fn screen_implicit_hyperlink_id_wraps() {
+        let mut s = init(5, 5, Some(0));
+
+        s.cursor.hyperlink_implicit_id = size::OffsetInt::MAX;
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+
+        assert_eq!(0, s.cursor.hyperlink_implicit_id);
+        assert_eq!(
+            HyperlinkId::Implicit(size::OffsetInt::MAX),
+            s.cursor.hyperlink.as_ref().unwrap().id
+        );
+
+        // A failed allocation must roll the wrapped counter back to its
+        // original value as well.
+        s.end_hyperlink();
+        s.cursor.hyperlink_implicit_id = size::OffsetInt::MAX;
+        {
+            let tw = &HYPERLINK_TW;
+            tw.error_always(HyperlinkFailPoint::LinkAlloc, AllocError::OutOfMemory);
+            assert_eq!(
+                Err(IncreaseCapacityError::OutOfMemory),
+                s.start_hyperlink(b"http://example.com", None)
+            );
+            tw.end(tripwire::ResetMode::Reset).unwrap();
+        }
+        assert_eq!(size::OffsetInt::MAX, s.cursor.hyperlink_implicit_id);
+    }
+
+    #[test]
+    fn screen_hyperlink_reuse() {
+        let mut s = init(5, 5, Some(0));
+
+        assert!(s.cursor.hyperlink_id == 0);
+        assert_eq!(0, cpage(&s).hyperlink_set.count());
+
+        // Use it for the first time
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+        assert!(s.cursor.hyperlink_id != 0);
+        let id = s.cursor.hyperlink_id;
+
+        // Reuse the same hyperlink, expect we have the same ID
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+        assert_eq!(id, s.cursor.hyperlink_id);
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+
+        s.end_hyperlink();
+        assert!(s.cursor.hyperlink_id == 0);
+        assert_eq!(0, cpage(&s).hyperlink_set.count());
+    }
+
+    #[test]
+    fn screen_hyperlink_cursor_state_on_resize() {
+        // This test depends on underlying PageList implementation so
+        // it may be invalid one day. It's here to document/verify the
+        // current behavior.
+
+        let mut s = init(5, 10, Some(0));
+
+        // Start a hyperlink
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+        assert!(s.cursor.hyperlink_id != 0);
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+
+        // Resize. Any column growth will trigger a page to be reallocated.
+        resize(&mut s, 10, 10, true);
+        assert!(s.cursor.hyperlink_id != 0);
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+
+        s.end_hyperlink();
+        assert!(s.cursor.hyperlink_id == 0);
+        assert_eq!(0, cpage(&s).hyperlink_set.count());
+    }
+
+    #[test]
+    fn screen_cursor_set_hyperlink_oom_uri_too_large_for_string_alloc() {
+        let mut s = init(80, 24, Some(0));
+
+        // Start a hyperlink with a URI that just barely fits in the string alloc.
+        // This will ensure that additional string alloc space is needed for the
+        // redundant copy of the URI when the page is re-alloced.
+        let uri = vec![b'a'; pagepkg::STD_CAPACITY.string_bytes as usize - 8];
+        s.start_hyperlink(&uri, None).unwrap();
+
+        // Figure out how many cells should can have hyperlinks in this page,
+        // and write twice that number, to guarantee the capacity needs to be
+        // increased at some point.
+        let base_capacity = cpage(&s).hyperlink_capacity();
+        let base_string_bytes = nd(cp(&s).node).capacity().string_bytes;
+        for _ in 0..base_capacity * 2 {
+            s.cursor_set_hyperlink().unwrap();
+            if s.cursor.x >= s.pages.cols - 1 {
+                s.cursor_down_or_scroll().unwrap();
+                s.cursor_horizontal_absolute(0);
+            } else {
+                s.cursor_right(1);
+            }
+        }
+
+        // Make sure the capacity really did increase.
+        assert!(base_capacity < cpage(&s).hyperlink_capacity());
+        // And that our string_bytes increased as well.
+        assert!(base_string_bytes < nd(cp(&s).node).capacity().string_bytes);
+    }
+
+    #[test]
+    fn screen_increase_capacity_cursor_style_ref_count_preserved() {
+        let mut s = init(5, 5, Some(0));
+        s.set_attribute(bold()).unwrap();
+        s.test_write_string("1ABCD").unwrap();
+
+        // We should have one page and it should be our cursor page
+        assert!(s.pages.pages.first == s.pages.pages.last);
+        assert!(s.pages.pages.first == Some(cp(&s).node));
+
+        let old_style = s.cursor.style;
+
+        unsafe {
+            let page = pg(last(&s));
+            // 5 chars + cursor = 6 refs
+            assert_eq!(6, page.styles.ref_count(page.memory, s.cursor.style_id));
+        }
+
+        // This forces the page to change via increaseCapacity.
+        let new_node = s
+            .increase_capacity(cp(&s).node, Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+
+        // Cursor's page_pin should now point to the new node
+        assert!(cp(&s).node == new_node);
+
+        // Verify cursor's page_cell and page_row are correctly reloaded from the pin
+        let page_rac = cp(&s).row_and_cell();
+        assert!(s.cursor.page_row == page_rac.row);
+        assert!(s.cursor.page_cell == page_rac.cell);
+
+        // Style should be preserved
+        assert_eq!(old_style, s.cursor.style);
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+
+        // After increaseCapacity, the 5 chars are cloned (5 refs) and
+        // the cursor's style is re-added (1 ref) = 6 total.
+        unsafe {
+            let page = pg(last(&s));
+            assert_eq!(6, page.styles.ref_count(page.memory, s.cursor.style_id));
+        }
+    }
+
+    #[test]
+    fn screen_increase_capacity_cursor_hyperlink_ref_count_preserved() {
+        let mut s = init(5, 5, Some(0));
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        s.test_write_string("1ABCD").unwrap();
+
+        // We should have one page and it should be our cursor page
+        assert!(s.pages.pages.first == s.pages.pages.last);
+        assert!(s.pages.pages.first == Some(cp(&s).node));
+
+        {
+            // Cursor has the hyperlink active = 1 count in hyperlink_set
+            assert_eq!(1, pg(last(&s)).hyperlink_set.count());
+            assert!(s.cursor.hyperlink_id != 0);
+            assert!(s.cursor.hyperlink.is_some());
+        }
+
+        // This forces the page to change via increaseCapacity.
+        let _ = s
+            .increase_capacity(cp(&s).node, Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+
+        // Hyperlink should be preserved with correct URI
+        assert!(s.cursor.hyperlink.is_some());
+        assert!(s.cursor.hyperlink_id != 0);
+        assert_eq!(b"https://example.com/", &*s.cursor.hyperlink.as_ref().unwrap().uri);
+
+        // After increaseCapacity, the hyperlink is re-added to the new page.
+        assert_eq!(1, pg(last(&s)).hyperlink_set.count());
+    }
+
+    #[test]
+    fn screen_increase_capacity_cursor_with_both_style_and_hyperlink_preserved() {
+        let mut s = init(5, 5, Some(0));
+
+        // Set both a non-default style AND an active hyperlink.
+        // Write one character first with bold to mark the row as styled,
+        // then start the hyperlink and write more characters.
+        s.set_attribute(bold()).unwrap();
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        s.test_write_string("1ABCD").unwrap();
+
+        // We should have one page and it should be our cursor page
+        assert!(s.pages.pages.first == s.pages.pages.last);
+        assert!(s.pages.pages.first == Some(cp(&s).node));
+
+        let old_style = s.cursor.style;
+
+        unsafe {
+            let page = pg(last(&s));
+            // 5 chars + cursor = 6 refs for bold style
+            assert_eq!(6, page.styles.ref_count(page.memory, s.cursor.style_id));
+            // Cursor has the hyperlink active = 1 count in hyperlink_set
+            assert_eq!(1, page.hyperlink_set.count());
+            assert!(s.cursor.style_id != style::DEFAULT_ID);
+            assert!(s.cursor.hyperlink_id != 0);
+            assert!(s.cursor.hyperlink.is_some());
+        }
+
+        // This forces the page to change via increaseCapacity.
+        let _ = s
+            .increase_capacity(cp(&s).node, Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+
+        // Style should be preserved
+        assert_eq!(old_style, s.cursor.style);
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+
+        // Hyperlink should be preserved with correct URI
+        assert!(s.cursor.hyperlink.is_some());
+        assert!(s.cursor.hyperlink_id != 0);
+        assert_eq!(b"https://example.com/", &*s.cursor.hyperlink.as_ref().unwrap().uri);
+
+        // After increaseCapacity, both style and hyperlink are re-added to the new page.
+        unsafe {
+            let page = pg(last(&s));
+            assert_eq!(6, page.styles.ref_count(page.memory, s.cursor.style_id));
+            assert_eq!(1, page.hyperlink_set.count());
+        }
+    }
+
+    #[test]
+    fn screen_increase_capacity_non_cursor_page_returns_early() {
+        // Test that calling increaseCapacity on a page that is NOT the cursor's
+        // page properly delegates to pages.increaseCapacity without doing the
+        // extra cursor accounting (style/hyperlink re-adding).
+        let mut s = init(80, 24, Some(10000));
+
+        // Set up a custom style and hyperlink on the cursor
+        s.set_attribute(bold()).unwrap();
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        s.test_write_string("Hello").unwrap();
+
+        // Store cursor state before growing pages
+        let old_style = s.cursor.style;
+        let old_style_id = s.cursor.style_id;
+        let old_hyperlink = s.cursor.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>);
+        let old_hyperlink_id = s.cursor.hyperlink_id;
+
+        // The cursor is on the first (and only) page
+        assert!(s.pages.pages.first == s.pages.pages.last);
+        assert!(cp(&s).node == first(&s));
+
+        // Grow pages until we have multiple pages. The cursor's pin stays on
+        // the first page since we're just adding rows.
+        let first_page_node = first(&s);
+        pg(first_page_node).pause_integrity_checks(true);
+        for _ in 0..nd(first_page_node).capacity().rows - nd(first_page_node).rows() {
+            let _ = s.pages.grow().unwrap();
+        }
+        pg(first_page_node).pause_integrity_checks(false);
+        let _ = s.pages.grow().unwrap();
+
+        // Now we have two pages
+        assert!(s.pages.pages.first != s.pages.pages.last);
+        let second_page = last(&s);
+
+        // Cursor should still be on the first page (where it was created)
+        assert!(cp(&s).node == first(&s));
+        assert!(cp(&s).node != second_page);
+
+        let second_page_styles_cap = nd(second_page).capacity().styles;
+        let cursor_page_styles_cap = nd(cp(&s).node).capacity().styles;
+
+        // Call increaseCapacity on the second page (NOT the cursor's page)
+        let new_second_page = s
+            .increase_capacity(second_page, Some(IncreaseCapacity::Styles))
+            .unwrap();
+
+        // The second page should have increased capacity
+        assert_eq!(second_page_styles_cap * 2, nd(new_second_page).capacity().styles);
+
+        // The cursor's page (first page) should be unchanged
+        assert_eq!(cursor_page_styles_cap, nd(cp(&s).node).capacity().styles);
+
+        // Cursor state should be completely unchanged since we didn't touch its page
+        assert_eq!(old_style, s.cursor.style);
+        assert_eq!(old_style_id, s.cursor.style_id);
+        assert_eq!(
+            old_hyperlink,
+            s.cursor.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
+        );
+        assert_eq!(old_hyperlink_id, s.cursor.hyperlink_id);
+
+        // Verify hyperlink is still valid
+        assert!(s.cursor.hyperlink.is_some());
+        assert_eq!(b"https://example.com/", &*s.cursor.hyperlink.as_ref().unwrap().uri);
+    }
+
+    /// Fill a page's style map with unique bg-color styles until it is full.
+    fn fill_styles_until_full(page: &mut Page) {
+        page.pause_integrity_checks(true);
+        let mut n: u32 = 1;
+        loop {
+            let st = Style {
+                bg_color: style::Color::Rgb(rgb(n as u8, (n >> 8) as u8, (n >> 16) as u8)),
+                ..Style::default()
+            };
+            if unsafe { page.styles.add(page.memory, st) }.is_err() {
+                break;
+            }
+            n += 1;
+        }
+        page.assert_integrity();
+        page.pause_integrity_checks(false);
+    }
+
+    /// Fill a page's style map up to its layout capacity.
+    fn fill_styles_to_layout_cap(page: &mut Page) {
+        page.pause_integrity_checks(true);
+        let max_items = page.styles.layout.cap;
+        let mut n: usize = 1;
+        while n < max_items {
+            let st = Style {
+                bg_color: style::Color::Rgb(rgb(n as u8, (n >> 8) as u8, (n >> 16) as u8)),
+                ..Style::default()
+            };
+            if unsafe { page.styles.add(page.memory, st) }.is_err() {
+                break;
+            }
+            n += 1;
+        }
+        page.assert_integrity();
+        page.pause_integrity_checks(false);
+    }
+
+    #[test]
+    fn screen_cursor_down_to_page_with_insufficient_capacity() {
+        // Regression test for https://github.com/ghostty-org/ghostty/issues/10282
+        //
+        // This test exposes a use-after-realloc bug in cursorDown (and similar
+        // cursor movement functions). The bug pattern:
+        //
+        // 1. cursorDown creates a by-value copy of the pin via page_pin.down(n)
+        // 2. cursorChangePin is called, which may trigger increaseCapacity
+        //    if the target page's style map is full
+        // 3. increaseCapacity frees the old page and creates a new one
+        // 4. The local pin copy still points to the freed page
+        // 5. rowAndCell() on the stale pin accesses freed memory
+
+        // Small screen to make page boundary crossing easy to set up
+        let mut s = init(10, 3, Some(1));
+
+        // Scroll down enough to create a second page
+        let start_page = scroll_to_new_page(&mut s);
+
+        // Cursor should now be on a new page
+        let new_page: *mut Page = cpage(&s);
+        assert!(start_page != new_page);
+
+        // Fill new_page's style map to capacity. When we move INTO this page
+        // with a style set, increaseCapacity will be triggered.
+        fill_styles_until_full(unsafe { &mut *new_page });
+
+        // Move cursor to start of active area and set a style
+        s.cursor_absolute(0, 0);
+        s.set_attribute(bold()).unwrap();
+        assert!(s.cursor.style.flags.bold);
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+
+        // Find the row just before the page boundary
+        let mut found = false;
+        for row in 0..s.pages.rows - 1 {
+            s.cursor_absolute(0, row);
+            let cur_node = cp(&s).node;
+            if let Some(next_pin) = cp(&s).down(1) {
+                if next_pin.node != cur_node {
+                    // Cursor is at 'row', moving down crosses to new_page
+                    assert!(pg(next_pin.node) as *mut Page == new_page);
+
+                    // This cursorDown triggers the bug: the local page_pin copy
+                    // becomes stale after increaseCapacity, causing rowAndCell()
+                    // to access freed memory.
+                    s.cursor_down(1);
+
+                    // If the fix is applied, verify correct state
+                    assert!(s.cursor.y == row + 1);
+                    assert!(s.cursor.style.flags.bold);
+
+                    found = true;
+                    break;
+                }
+            }
+        }
+        // Didn't find boundary
+        assert!(found);
+    }
+
+    #[test]
+    fn screen_set_attribute_increases_capacity_when_style_map_is_full() {
+        // Tests that setAttribute succeeds when the style map is full by
+        // increasing page capacity. When capacity is at max and increaseCapacity
+        // returns OutOfSpace, manualStyleUpdate will split the page instead.
+
+        // Use a small screen with multiple rows
+        let mut s = init(10, 5, Some(10));
+
+        // Write content to multiple rows
+        s.test_write_string("line1\nline2\nline3\nline4\nline5").unwrap();
+
+        // Get the page and fill its style map to capacity
+        let page: *mut Page = cpage(&s);
+        let original_styles_capacity = unsafe { (*page).capacity.styles };
+
+        // Fill the style map to capacity using the StyleSet's layout capacity
+        // which accounts for the load factor
+        fill_styles_to_layout_cap(unsafe { &mut *page });
+
+        // Now try to set a new unique attribute that would require a new style slot
+        // This should succeed by increasing capacity (or splitting if at max capacity)
+        s.set_attribute(bold()).unwrap();
+
+        // The style should have been applied (bold flag set)
+        assert!(s.cursor.style.flags.bold);
+
+        // The cursor should have a valid non-default style_id
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+
+        // Either the capacity increased or the page was split/changed
+        let current_page = cpage(&s);
+        let capacity_increased = current_page.capacity.styles > original_styles_capacity;
+        let page_changed = current_page as *mut Page != page;
+        assert!(capacity_increased || page_changed);
+    }
+
+    #[test]
+    fn screen_set_attribute_splits_page_on_out_of_space_at_max_styles() {
+        let mut s = init(10, 10, Some(0));
+
+        // Write content to multiple rows so we have something to split
+        s.test_write_string("line1\nline2\nline3\nline4\nline5").unwrap();
+
+        // Remember the original node
+        let original_node = cp(&s).node;
+
+        // Increase the page's style capacity to max by repeatedly calling increaseCapacity
+        // Use Screen.increaseCapacity to properly maintain cursor state
+        let max_styles = CellCountInt::MAX;
+        while nd(cp(&s).node).capacity().styles < max_styles {
+            if s.increase_capacity(cp(&s).node, Some(IncreaseCapacity::Styles)).is_err() {
+                break;
+            }
+        }
+
+        // Get the page reference after increaseCapacity - cursor may have moved
+        let page = cpage(&s);
+        assert_eq!(max_styles, page.capacity.styles);
+
+        // Fill the style map to capacity using the StyleSet's layout capacity
+        // which accounts for the load factor
+        fill_styles_to_layout_cap(page);
+
+        // Track the node before setAttribute
+        let node_before_set = cp(&s).node;
+
+        // Now try to set a new unique attribute that would require a new style slot
+        // At max capacity, increaseCapacity will return OutOfSpace, triggering page split
+        s.set_attribute(bold()).unwrap();
+
+        // The style should have been applied (bold flag set)
+        assert!(s.cursor.style.flags.bold);
+
+        // The cursor should have a valid non-default style_id
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+
+        // The page should have been split
+        let page_was_split = cp(&s).node != node_before_set
+            || nd(node_before_set).next.is_some()
+            || nd(node_before_set).prev.is_some()
+            || cp(&s).node != original_node;
+        assert!(page_was_split);
+    }
+
+    /// Enable line click mode and write "> " prompt + `input` input.
+    fn prompt_input(s: &mut Screen, input: &str) {
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("> ").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string(input).unwrap();
+    }
+
+    fn cl_line(s: &mut Screen) {
+        s.semantic_prompt.click = SemanticClick::Cl(osc_sp::Click::Line);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_basic() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor back to start of input (column 2, the 'h')
+        s.cursor_absolute(2, 0);
+
+        // Click on first 'l' (column 4), should require 2 right movements (h->e->l)
+        let result = s.prompt_click_move(pin(&s, act(4, 0)));
+
+        assert_eq!(2, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_cursor_not_on_input() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+
+        // Move cursor back to prompt area (column 0, the '>')
+        s.cursor_absolute(0, 0);
+
+        // Cursor is on prompt, not input - should return zero
+        let result = s.prompt_click_move(pin(&s, act(4, 0)));
+
+        assert_eq!(PromptClickMove::ZERO, result);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_click_on_same_position() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor to column 4
+        s.cursor_absolute(4, 0);
+
+        // Click on same position - no movement needed
+        let result = s.prompt_click_move(pin(&s, act(4, 0)));
+
+        assert_eq!(PromptClickMove::ZERO, result);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_skips_non_input_cells() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write: "> h" then output "X" then input "llo"
+        prompt_input(&mut s, "h");
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("X").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("llo").unwrap();
+
+        // Move cursor to column 2 (the 'h')
+        s.cursor_absolute(2, 0);
+
+        // Click on 'l' at column 5 - should skip the 'X' output cell
+        // Movement: h (start) -> l (col 4) -> l (col 5) = 2 right movements
+        let result = s.prompt_click_move(pin(&s, act(5, 0)));
+
+        assert_eq!(2, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_soft_wrapped_line() {
+        let mut s = init(10, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input that wraps
+        // Write 8 chars of input, first row has 2 for prompt + 8 input = 10 cols
+        prompt_input(&mut s, "abcdefgh");
+        // Continue on next row (soft-wrapped)
+        s.test_write_string("ij").unwrap();
+
+        // Verify soft wrap occurred
+        assert_eq!("> abcdefgh\nij", dump(&s, Tag::Viewport));
+
+        // Move cursor to column 2 (the 'a')
+        s.cursor_absolute(2, 0);
+
+        // Click on 'j' at column 1, row 1 - should count all input cells
+        // Movement: a->b->c->d->e->f->g->h->i->j = 9 right movements
+        let result = s.prompt_click_move(pin(&s, act(1, 1)));
+
+        assert_eq!(9, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_disabled_when_click_is_none() {
+        let mut s = init(20, 5, Some(0));
+
+        // Click mode is .none by default (disabled)
+        assert_eq!(SemanticClick::None, s.semantic_prompt.click);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor to start of input
+        s.cursor_absolute(2, 0);
+
+        // Click should return zero since click mode is disabled
+        let result = s.prompt_click_move(pin(&s, act(4, 0)));
+
+        assert_eq!(PromptClickMove::ZERO, result);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_stops_at_hard_wrap() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write prompt and input on first line
+        prompt_input(&mut s, "hello");
+        // Hard wrap (newline)
+        s.test_write_string("\n").unwrap();
+        s.test_write_string("world").unwrap();
+
+        // Move cursor to column 2 (the 'h')
+        s.cursor_absolute(2, 0);
+
+        // Click on 'w' at column 0, row 1 - but line mode stops at hard wrap
+        // Should only move to end of first line: h->e->l->l->o = 4 movements
+        let result = s.prompt_click_move(pin(&s, act(0, 1)));
+
+        // Should stop at end of first line, not cross hard wrap
+        assert_eq!(5, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_right_stops_at_non_continuation_row() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Row 0: PROMPT "> hello"
+        prompt_input(&mut s, "hello\n");
+
+        // Row 1: CONTINUATION "world"
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Continuation));
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("world\n").unwrap();
+
+        // Row 2: NEW PROMPT "> again"
+        prompt_input(&mut s, "again");
+
+        // Verify content
+        assert_eq!("> hello\nworld\n> again", dump(&s, Tag::Viewport));
+
+        // Move cursor to 'w' at column 0, row 1
+        s.cursor_absolute(0, 1);
+
+        // Click on 'a' at column 2, row 2 - but row 2 is a new prompt
+        // Should stop at end of "world": w->o->r->l->d = 4 movements
+        let result = s.prompt_click_move(pin(&s, act(2, 2)));
+
+        // Should stop at 'd' (end of world), not cross to new prompt
+        assert_eq!(5, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_left_basic() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Cursor is at column 7 (after 'o'), move it to column 6 (the 'o')
+        s.cursor_absolute(6, 0);
+
+        // Click on 'h' (column 2), should require 4 left movements (o->l->l->e->h)
+        let result = s.prompt_click_move(pin(&s, act(2, 0)));
+
+        assert_eq!(4, result.left);
+        assert_eq!(0, result.right);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_left_skips_non_input_cells() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write: "> h" then output "X" then input "llo"
+        prompt_input(&mut s, "h");
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("X").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("llo").unwrap();
+
+        // Move cursor to column 6 (the 'o')
+        s.cursor_absolute(6, 0);
+
+        // Click on 'h' at column 2 - should skip the 'X' output cell
+        // Movement: o->l->l->h = 3 left movements (skipping X)
+        let result = s.prompt_click_move(pin(&s, act(2, 0)));
+
+        assert_eq!(3, result.left);
+        assert_eq!(0, result.right);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_left_soft_wrapped_line() {
+        let mut s = init(10, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input that wraps
+        // Write 8 chars of input, first row has 2 for prompt + 8 input = 10 cols
+        prompt_input(&mut s, "abcdefgh");
+        // Continue on next row (soft-wrapped)
+        s.test_write_string("ij").unwrap();
+
+        // Verify soft wrap occurred
+        assert_eq!("> abcdefgh\nij", dump(&s, Tag::Viewport));
+
+        // Cursor is at column 2, row 1 (after 'j'). Move to 'j' at column 1.
+        s.cursor_absolute(1, 1);
+
+        // Click on 'a' at column 2, row 0 - should count all input cells backwards
+        // Movement: j->i->h->g->f->e->d->c->b->a = 9 left movements
+        let result = s.prompt_click_move(pin(&s, act(2, 0)));
+
+        assert_eq!(9, result.left);
+        assert_eq!(0, result.right);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_line_left_stops_at_hard_wrap() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write prompt and input on first line, then hard wrap
+        prompt_input(&mut s, "hello");
+        // Hard wrap (newline)
+        s.test_write_string("\n").unwrap();
+        s.test_write_string("world").unwrap();
+
+        // Move cursor to 'd' at column 4, row 1 (an actual input cell)
+        s.cursor_absolute(4, 1);
+
+        // Click on 'h' at column 2, row 0 - but line mode stops at hard wrap
+        // Should only move to start of second line, not cross to row 0
+        let result = s.prompt_click_move(pin(&s, act(2, 0)));
+
+        // Should stop at start of second line: d->l->r->o->w = 4 movements
+        assert_eq!(4, result.left);
+        assert_eq!(0, result.right);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_click_right_of_input_same_line() {
+        // Set up: "> hello" where "> " is prompt and "hello" is input
+        // Clicking to the right of the 'o' should move cursor past the input
+
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor to start of input (column 2, the 'h')
+        s.cursor_absolute(2, 0);
+
+        // Click beyond the input (column 15) - should move to one past the 'o'
+        let result = s.prompt_click_move(pin(&s, act(15, 0)));
+
+        assert_eq!(5, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_click_right_of_input_cursor_at_end() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Cursor is already at column 7 (one past 'o') after writing
+        // Click beyond the input (column 15) - no movement needed since
+        // cursor is already at the end position
+        let result = s.prompt_click_move(pin(&s, act(15, 0)));
+
+        assert_eq!(0, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_click_right_of_input_on_lower_line() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor to start of input (column 2, the 'h')
+        s.cursor_absolute(2, 0);
+
+        // Click on a lower line (row 1) - should move to end of input
+        // This is outside the prompt area so should clamp to end
+        let result = s.prompt_click_move(pin(&s, act(5, 1)));
+
+        // From 'h', we need to pass e, l, l, o (4 cells) + 1 past end = 5
+        assert_eq!(5, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_click_right_of_input_cursor_at_end_lower_line() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Cursor is at column 7 after writing (one past 'o')
+        // Click on a lower line (row 1) - cursor already at end, no movement needed
+        let result = s.prompt_click_move(pin(&s, act(5, 1)));
+
+        assert_eq!(0, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    #[test]
+    fn screen_prompt_click_move_click_right_of_input_cursor_on_last_char() {
+        let mut s = init(20, 5, Some(0));
+
+        // Enable line click mode
+        cl_line(&mut s);
+
+        // Write a prompt and input
+        prompt_input(&mut s, "hello");
+
+        // Move cursor to last input char (column 6, the 'o')
+        s.cursor_absolute(6, 0);
+
+        // Click beyond the input (column 15)
+        let result = s.prompt_click_move(pin(&s, act(15, 0)));
+
+        assert_eq!(1, result.right);
+        assert_eq!(0, result.left);
+    }
+
+    /// Mark a row as soft-wrapped, wrap continuation and prompt.
+    fn dirty_row_metadata(s: &Screen, pt: Point) {
+        let row = rw(s.pages.get_cell(pt).unwrap().row);
+        row.set_wrap(true);
+        row.set_wrap_continuation(true);
+        row.set_semantic_prompt(RowSemanticPrompt::Prompt);
+    }
+
+    fn assert_default_row_metadata(s: &Screen, pt: Point) {
+        let row = get_row(s, pt);
+        assert!(!row.wrap());
+        assert!(!row.wrap_continuation());
+        assert_eq!(RowSemanticPrompt::None, row.semantic_prompt());
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_recycled_row_has_default_metadata() {
+        let mut s = init(5, 5, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST").unwrap();
+
+        // Simulate the top region row being part of a soft-wrapped,
+        // prompt-marked line. Its Row storage is recycled as the new
+        // blank cursor row and must not retain the metadata.
+        dirty_row_metadata(&s, act(0, 0));
+
+        s.cursor_absolute(1, 2);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        assert_default_row_metadata(&s, act(0, 2));
+        assert_eq!("2EFGH\n3IJKL\n\n4MNOP\n5QRST", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_cross_page_recycled_row_has_default_metadata() {
+        let mut s = init(10, 5, Some(10));
+
+        // We need to get the active area to span two pages so that the
+        // scroll region does too, exercising the slow path (eraseRowBounded).
+        fill_first_page(&mut s, 3);
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+
+        // The first row of the last page is the Row storage that ends up
+        // recycled as the blank region-bottom row: the erased row's
+        // storage stays on the first page (receiving this row's content
+        // via clone) while this storage is cleared for the blank row.
+        dirty_row_metadata(&s, act(0, 3));
+
+        // Region rows 1-3 with the cursor on the region bottom, which is
+        // on the second page while the region top is on the first page.
+        s.cursor_absolute(0, 3);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        assert_default_row_metadata(&s, act(0, 3));
+        assert_eq!("1A\n3C\n4D\n\n5E", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_cursor_scroll_above_cross_page_recycled_row_has_default_metadata() {
+        let mut s = init(10, 5, Some(10));
+
+        // Get the cursor page and the last page to differ so that
+        // cursorScrollAbove takes the cross-page rotate path.
+        fill_first_page(&mut s, 3);
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+        s.cursor_absolute(0, 1);
+        assert!(cp(&s).node == first(&s));
+        assert!(nd(first(&s)).next.is_some());
+
+        // The last row of the cursor page is the Row storage that gets
+        // recycled as the new blank row below the cursor after its content
+        // is moved down to the next page.
+        dirty_row_metadata(&s, act(0, 2));
+
+        s.cursor_scroll_above().unwrap();
+
+        // One row scrolled into history, so the blank row is at active
+        // y=1 (just below the cursor's original row).
+        assert_default_row_metadata(&s, act(0, 1));
+        assert_eq!("2B\n\n3C\n4D\n5E", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_cursor_down_scroll_no_scrollback_recycled_row_has_default_metadata() {
+        let mut s = init(5, 3, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        dirty_row_metadata(&s, act(0, 0));
+
+        s.cursor_absolute(0, 2);
+        s.cursor_down_scroll().unwrap();
+
+        assert_default_row_metadata(&s, act(0, 2));
+    }
+
+    #[test]
+    fn screen_cursor_down_scroll_single_row_no_scrollback_resets_metadata() {
+        let mut s = init(5, 1, Some(0));
+        s.test_write_string("1ABCD").unwrap();
+
+        dirty_row_metadata(&s, act(0, 0));
+
+        s.cursor_down_scroll().unwrap();
+
+        assert_default_row_metadata(&s, act(0, 0));
+    }
+
+    #[test]
+    fn screen_select_line_does_not_join_lines_across_a_recycled_row() {
+        let mut s = init(6, 5, Some(0));
+
+        // A soft-wrapped line across rows 0 and 1: row 0 gets wrap=true.
+        s.test_write_string("AAAAAAA").unwrap();
+
+        // Scroll a region of rows 0-2 up by one: row 0 is discarded and
+        // its Row storage recycled as the blank row 2.
+        s.cursor_absolute(0, 2);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        // Write unrelated single-line words on the recycled row and below.
+        s.cursor_absolute(0, 2);
+        s.test_write_string("world").unwrap();
+        s.cursor_absolute(0, 3);
+        s.test_write_string("hello").unwrap();
+
+        // Selecting the line "world" must not extend into "hello": these
+        // are separate hard lines. A stale wrap flag on the recycled row
+        // would join them.
+        let sel = select_line_at(&s, act(0, 2)).unwrap();
+        assert_eq!("world", sel_str(&s, sel));
+    }
+
+    fn init_zero_lines() -> Screen {
+        Screen::init(Options {
+            cols: 10,
+            rows: 3,
+            max_scrollback_bytes: None,
+            max_scrollback_lines: Some(0),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn screen_scroll_clear_cursor_page_pruned_keeps_per_page_style_id() {
+        // A scrollback limit of 0 lines still keeps one page of rows, which
+        // is the smallest amount allowed. This means the oldest page is
+        // deleted as soon as all of its rows have scrolled into history.
+        let mut s = init_zero_lines();
+
+        // Fill the first page and put two more rows on a second page. Every
+        // row has text so that scrollClear scrolls the whole active area.
+        let page_rows = nd(first(&s)).capacity().rows;
+        for _ in 0..page_rows + 1 {
+            s.test_write_string("x\n").unwrap();
+        }
+        s.test_write_string("x").unwrap();
+        assert!(first(&s) != last(&s));
+
+        // Move the cursor to the top of the active area, which is the last
+        // row of the first page. Making it bold gives the cursor a style ID
+        // that only exists on the first page.
+        s.cursor_absolute(0, 0);
+        assert!(cp(&s).node == first(&s));
+        s.set_attribute(bold()).unwrap();
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+        let first_node = first(&s);
+
+        // Clearing scrolls all 3 active rows into history. The first page is
+        // now entirely history, so the scrollback limit deletes it and the
+        // cursor pin is moved to another page.
+        s.scroll_clear().unwrap();
+        assert!(cp(&s).node != first_node);
+
+        // The cursor's style must be registered on the page it moved to.
+        let page = cpage(&s);
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+        assert!(unsafe { page.styles.ref_count(page.memory, s.cursor.style_id) } > 0);
+        assert!(!cp(&s).garbage);
+
+        // Printing must work and produce a bold cell.
+        s.test_write_string("y").unwrap();
+        let list_cell = s.pages.get_cell(act(0, 0)).unwrap();
+        let cell_style = list_cell.style();
+        assert!(cell_style.flags.bold);
+    }
+
+    #[test]
+    fn screen_scroll_clear_cursor_page_pruned_keeps_per_page_hyperlink_id() {
+        // Same setup as the style test above, but with a hyperlink instead
+        // of a style. Hyperlink IDs are also only valid on one page.
+        let mut s = init_zero_lines();
+
+        let page_rows = nd(first(&s)).capacity().rows;
+        for _ in 0..page_rows + 1 {
+            s.test_write_string("x\n").unwrap();
+        }
+        s.test_write_string("x").unwrap();
+        assert!(first(&s) != last(&s));
+
+        s.cursor_absolute(0, 0);
+        assert!(cp(&s).node == first(&s));
+        s.start_hyperlink(b"http://example.com", None).unwrap();
+        assert!(s.cursor.hyperlink_id != 0);
+        let first_node = first(&s);
+
+        s.scroll_clear().unwrap();
+        assert!(cp(&s).node != first_node);
+
+        // The cursor's hyperlink must be registered on the page it moved to.
+        let page = cpage(&s);
+        assert!(s.cursor.hyperlink_id != 0);
+        assert!(unsafe { page.hyperlink_set.ref_count(page.memory, s.cursor.hyperlink_id) } > 0);
+        assert!(!cp(&s).garbage);
+
+        // Printing must work and produce a cell with a hyperlink.
+        s.test_write_string("y").unwrap();
+        assert!(get_cell(&s, act(0, 0)).hyperlink());
     }
 
     // @tests-end
