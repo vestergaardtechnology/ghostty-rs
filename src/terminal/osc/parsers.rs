@@ -1,6 +1,6 @@
 //! Port of `src/terminal/osc/parsers.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "parsers/change_window_icon.rs"]
