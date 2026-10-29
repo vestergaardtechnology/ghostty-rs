@@ -670,3 +670,186 @@ fn selection_scroll_callback(
 
     xev::CallbackAction::Disarm
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::apprt::surface::Message as SurfaceMessage;
+    use crate::termio::exec::testing::{direct_config, Harness};
+    use crate::termio::message::{KittyClipboardGrant, ScrollViewport, SizeReport};
+    use crate::termio::DerivedConfig;
+
+    fn size(cols: u32, rows: u32) -> renderer::Size {
+        renderer::Size {
+            screen: renderer::ScreenSize {
+                width: cols * 10,
+                height: rows * 20,
+            },
+            cell: renderer::CellSize {
+                width: 10,
+                height: 20,
+            },
+            padding: renderer::Padding::default(),
+        }
+    }
+
+    fn count(h: &Harness, pred: impl Fn(&SurfaceMessage) -> bool) -> usize {
+        h.messages.iter().filter(|m| pred(m)).count()
+    }
+
+    // Extra (Thread.zig has no tests): resizes are coalesced and reach
+    // the pty.
+    #[test]
+    fn resize_is_coalesced() {
+        let mut h = Harness::new(direct_config(&[
+            "/bin/sh",
+            "-c",
+            "echo ready; sleep 0.5; stty size; sleep 0.5",
+        ]));
+        h.start();
+        h.wait_output("ready");
+        h.send(Message::Resize(size(100, 40)));
+        h.send(Message::Resize(size(90, 35)));
+        h.send(Message::Resize(size(80, 30)));
+        h.wait_io(|io| !io.resizes.is_empty());
+
+        // Wait out a few more coalesce periods: nothing else arrives.
+        std::thread::sleep(Duration::from_millis(Coalesce::MIN_MS * 4));
+        let resizes = h.with_io(|io| io.resizes.clone());
+        assert_eq!(vec![size(80, 30)], resizes);
+
+        h.wait_output("30 80");
+        h.stop();
+    }
+
+    // Extra: synchronized output is reset after the timeout.
+    #[test]
+    fn synchronized_output_reset() {
+        let mut h = Harness::new(direct_config(&["/bin/sh", "-c", "sleep 30"]));
+        h.start();
+        let start = Instant::now();
+        h.send(Message::StartSynchronizedOutput);
+        h.wait_io(|io| io.synchronized_output_resets == 1);
+        assert!(start.elapsed() >= Duration::from_millis(SYNC_RESET_MS - 50));
+        h.stop();
+    }
+
+    // Extra: selection scrolling ticks until stopped.
+    #[test]
+    fn selection_scroll_ticks() {
+        let mut h = Harness::new(direct_config(&["/bin/sh", "-c", "sleep 30"]));
+        h.start();
+        h.send(Message::SelectionScroll(true));
+        // Starting again while active is a no-op.
+        h.send(Message::SelectionScroll(true));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            h.collect_messages();
+            if count(&h, |m| matches!(m, SurfaceMessage::SelectionScrollTick(true))) >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        h.send(Message::SelectionScroll(false));
+        h.wait_message(|m| matches!(m, SurfaceMessage::SelectionScrollTick(false)));
+
+        // The timer stopped: no ticks after the final one.
+        std::thread::sleep(Duration::from_millis(SELECTION_SCROLL_MS * 5));
+        h.collect_messages();
+        let last = h
+            .messages
+            .iter()
+            .rposition(|m| matches!(m, SurfaceMessage::SelectionScrollTick(_)))
+            .unwrap();
+        assert!(matches!(h.messages[last], SurfaceMessage::SelectionScrollTick(false)));
+        assert_eq!(
+            1,
+            count(&h, |m| matches!(m, SurfaceMessage::SelectionScrollTick(false)))
+        );
+        h.stop();
+    }
+
+    // Extra: losing focus pauses termios polling; regaining it checks
+    // immediately.
+    #[test]
+    fn focus_pauses_termios_polling() {
+        let mut h = Harness::new(direct_config(&[
+            "/bin/sh",
+            "-c",
+            "echo ready; sleep 0.5; stty -echo; sleep 30",
+        ]));
+        h.start();
+        h.wait_output("ready");
+        h.send(Message::Focused(false));
+        std::thread::sleep(Duration::from_millis(1200));
+        h.collect_messages();
+        assert_eq!(0, count(&h, |m| matches!(m, SurfaceMessage::PasswordInput(_))));
+
+        h.send(Message::Focused(true));
+        h.wait_message(|m| matches!(m, SurfaceMessage::PasswordInput(true)));
+        h.stop();
+    }
+
+    // Extra: the remaining messages are handled (stand-in no-ops) and the
+    // flags they control are updated.
+    #[test]
+    fn drain_mailbox_messages() {
+        let mut h = Harness::new(direct_config(&[
+            "/bin/sh",
+            "-c",
+            "read line; echo \"got:$line\"; sleep 0.5",
+        ]));
+        h.start();
+        h.send(Message::ColorSchemeReport { force: true });
+        h.send(Message::VisibilityReport {
+            visible: true,
+            force: false,
+        });
+        h.send(Message::ChangeConfig(Box::new(DerivedConfig::default())));
+        h.send(Message::Inspector(true));
+        h.send(Message::SizeReport(SizeReport::Mode2048));
+        h.send(Message::ClearScreen { history: true });
+        h.send(Message::ScrollViewport(ScrollViewport::Top));
+        h.send(Message::JumpToPrompt(-1));
+        h.send(Message::KittyClipboardGrantRead(KittyClipboardGrant {
+            pw: b"pw".to_vec().into_boxed_slice(),
+        }));
+        h.send(Message::KittyClipboardGrantWrite(KittyClipboardGrant {
+            pw: b"pw".to_vec().into_boxed_slice(),
+        }));
+        h.send(Message::WriteStable(b"stable "));
+        h.send(Message::write_req(b"line\n"));
+        h.wait_output("got:stable line");
+        h.stop();
+        assert!(h.thread.flags.has_inspector);
+        assert!(!h.thread.flags.drain);
+    }
+
+    // Extra: a failing threadEnter makes the thread drain and exit.
+    #[test]
+    fn thread_enter_failure_drains() {
+        let mut h = Harness::new(direct_config(&["/bin/s\0h"]));
+        h.start();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.handle.as_ref().unwrap().is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.stop();
+        assert!(h.thread.flags.drain);
+    }
+
+    #[test]
+    fn error_messages() {
+        assert!(Thread::error_message(Error::Exec(exec::Error::OpenptyFailed))
+            .starts_with("Your system cannot allocate any more pty devices."));
+        assert!(Thread::error_message(Error::InputFailed)
+            .starts_with("A configured `input` path was not found"));
+        assert!(Thread::error_message(Error::Exec(exec::Error::SystemResources))
+            .starts_with("error starting IO thread: SystemResources\n"));
+    }
+}
