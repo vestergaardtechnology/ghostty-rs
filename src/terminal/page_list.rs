@@ -14965,4 +14965,650 @@ mod tests {
         assert_eq!(5, s.total_rows());
         assert_eq!(1, s.total_pages());
     }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows_extends_blank_lines() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+
+        // Write codepoint into first line
+        *cell_at(page, 0, 0) = cp('A');
+
+        // Fill remaining lines with a background color
+        for y in 1..s.rows as usize {
+            *cell_at(page, 0, y) = bg_rgb_cell(0xFF, 0, 0);
+        }
+
+        // Resize
+        s.resize(no_reflow(None, Some(7))).unwrap();
+        assert_eq!(7, s.rows);
+        assert_eq!(7, s.total_rows());
+        assert_eq!(pt_screen(0, 0), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows_contains_viewport() {
+        // When the rows are increased we need to make sure that the viewport
+        // doesn't end up below the active area if it's currently in pin mode.
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 5,
+            max_size: Some(1),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+
+        // Make it so we have scrollback
+        s.grow().unwrap();
+
+        assert_eq!(5, s.rows);
+        assert_eq!(6, s.total_rows());
+
+        // Set viewport above active by scrolling up one.
+        s.scroll(Scroll::DeltaRow(-1));
+        // The viewport should be a pin now.
+        assert_eq!(Viewport::Top, s.viewport);
+
+        // Resize
+        s.resize(no_reflow(None, Some(7))).unwrap();
+        assert_eq!(7, s.rows);
+        assert_eq!(7, s.total_rows());
+
+        // Question: maybe the viewport should actually be in the active
+        // here and not pinned to the top.
+        assert_eq!(Viewport::Top, s.viewport);
+    }
+
+    /// Assert every screen row has `cols` cells.
+    fn check_row_widths(s: &PageList, cols: usize) {
+        let mut it = s.row_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        while let Some(offset) = it.next() {
+            let (row, _) = pin_rac(offset);
+            let cells = cells_of(pg(offset.node), row);
+            assert_eq!(cols, cells.len());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_cols() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize
+        s.resize(no_reflow(Some(5), None)).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(10, s.total_rows());
+
+        check_row_widths(&s, 5);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_cols_pin_in_trimmed_cols() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(8, 2)).unwrap()).unwrap();
+
+        // Resize
+        s.resize(no_reflow(Some(5), None)).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(10, s.total_rows());
+
+        check_row_widths(&s, 5);
+
+        assert_eq!(pt_active(4, 2), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_cols_clears_graphemes() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Add a grapheme.
+        let page = pg(first(&s));
+        {
+            let (row, cell) = rac(page, 9, 0);
+            *cell = cp('A');
+            page.append_grapheme(row, cell, 'A' as u32).unwrap();
+        }
+        assert_eq!(1, page.grapheme_count());
+
+        // Resize
+        s.resize(no_reflow(Some(5), None)).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(10, s.total_rows());
+
+        let mut it = s.page_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        while let Some(chunk) = it.next() {
+            assert_eq!(0, pg(chunk.node).grapheme_count());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_cols() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize
+        s.resize(no_reflow(Some(10), None)).unwrap();
+        assert_eq!(10, s.cols);
+        assert_eq!(3, s.total_rows());
+
+        check_row_widths(&s, 10);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_cols_with_spacer_head() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            {
+                let (row, cell) = rac(page, 0, 0);
+                row.set_wrap(true);
+                *cell = cp('x');
+            }
+            *cell_at(page, 1, 0) = wide_cell('\0', Wide::SpacerHead);
+            *cell_at(page, 0, 1) = wide_cell('😀', Wide::Wide);
+            *cell_at(page, 1, 1) = wide_cell('\0', Wide::SpacerTail);
+        }
+
+        // Resize
+        s.resize(no_reflow(Some(3), None)).unwrap();
+        assert_eq!(3, s.cols);
+        assert_eq!(3, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            {
+                let cell = cell_at(page, 0, 0);
+                assert_eq!('x' as u32, cell.content_codepoint());
+                assert_eq!(Wide::Narrow, cell.wide());
+                // assert!(!row.wrap());
+            }
+            {
+                let cell = cell_at(page, 1, 0);
+                assert_eq!(0, cell.content_codepoint());
+                assert_eq!(Wide::Narrow, cell.wide());
+            }
+            {
+                let cell = cell_at(page, 2, 0);
+                assert_eq!(0, cell.content_codepoint());
+                assert_eq!(Wide::Narrow, cell.wide());
+            }
+        }
+    }
+
+    // Regression test for fuzz crash. When we shrink cols and then
+    // grow back, the page retains capacity from the original size so the grow
+    // takes the fast path (just bumps page.size.cols). If any row has a
+    // spacer_head at the old last column, that cell is no longer at the end
+    // of the wider row, violating page integrity.
+    #[test]
+    fn page_list_resize_no_reflow_grow_cols_fast_path_with_spacer_head() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Shrink to 5 cols. The page keeps capacity for 10 cols.
+        s.resize(no_reflow(Some(5), None)).unwrap();
+        assert_eq!(5, s.cols);
+
+        // Place a spacer_head at the last column (col 4) on two rows
+        // to simulate a wide character that didn't fit at the right edge.
+        {
+            let page = pg(first(&s));
+
+            // Row 0: 'x' at col 0..3, spacer_head at col 4, wrap = true
+            *cell_at(page, 0, 0) = cp('x');
+            {
+                let (row, cell) = rac(page, 4, 0);
+                *cell = wide_cell('\0', Wide::SpacerHead);
+                row.set_wrap(true);
+            }
+
+            // Row 1: spacer_head at col 4, wrap = true
+            {
+                let (row, cell) = rac(page, 4, 1);
+                *cell = wide_cell('\0', Wide::SpacerHead);
+                row.set_wrap(true);
+            }
+        }
+
+        // Grow back to 10 cols. This must not leave stale spacer_head
+        // cells at col 4 (which is no longer the last column).
+        s.resize(no_reflow(Some(10), None)).unwrap();
+        assert_eq!(10, s.cols);
+
+        // Verify the old spacer_head positions are now narrow.
+        {
+            let page = pg(first(&s));
+            {
+                let (row, cell) = rac(page, 4, 0);
+                assert_eq!(Wide::Narrow, cell.wide());
+                assert!(!row.wrap());
+            }
+            {
+                let (row, cell) = rac(page, 4, 1);
+                assert_eq!(Wide::Narrow, cell.wide());
+                assert!(!row.wrap());
+            }
+        }
+    }
+
+    // This test is a bit convoluted so I want to explain: what we are trying
+    // to verify here is that when we increase cols such that our rows per page
+    // shrinks, we don't fragment our rows across many pages because this ends
+    // up wasting a lot of memory.
+    //
+    // This is particularly important for alternate screen buffers where we
+    // don't have scrollback so our max size is very small. If we don't do this,
+    // we end up pruning our pages and that causes resizes to fail!
+    #[test]
+    fn page_list_resize_no_reflow_more_cols_forces_less_rows_per_page() {
+        let adjust = |cols: CellCountInt| STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(cols) }).unwrap();
+
+        // This test requires initially that our rows fit into one page.
+        let cols: CellCountInt = 5;
+        let rows: CellCountInt = 150;
+        assert!(adjust(cols).rows >= rows);
+        let mut s = init_opts(Options {
+            cols,
+            rows,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Then we need to resize our cols so that our rows per page shrinks.
+        // This will force our resize to split our rows across two pages.
+        {
+            let new_cols = {
+                let mut new_cols: CellCountInt = 50;
+                let mut cap = adjust(new_cols);
+                while cap.rows >= rows {
+                    new_cols += 50;
+                    cap = adjust(new_cols);
+                }
+                new_cols
+            };
+            s.resize(no_reflow(Some(new_cols), None)).unwrap();
+            assert_eq!(new_cols, s.cols);
+            assert_eq!(rows as usize, s.total_rows());
+        }
+
+        // Every page except the last should be full
+        let check_full = |s: &PageList| {
+            let mut it = s.pages.first;
+            while let Some(page) = it {
+                if page == last(s) {
+                    break;
+                }
+                assert_eq!(n(page).capacity().rows, n(page).rows());
+                it = n(page).next;
+            }
+        };
+        check_full(&s);
+
+        // Now we need to resize again to a col size that further shrinks
+        // our last capacity.
+        {
+            let page = pg(first(&s));
+            assert!(page.size.rows == page.capacity.rows);
+            let new_cols = {
+                let mut new_cols = page.size.cols + 50;
+                let mut cap = adjust(new_cols);
+                while cap.rows >= page.size.rows {
+                    new_cols += 50;
+                    cap = adjust(new_cols);
+                }
+                new_cols
+            };
+
+            s.resize(no_reflow(Some(new_cols), None)).unwrap();
+            assert_eq!(new_cols, s.cols);
+            assert_eq!(rows as usize, s.total_rows());
+        }
+
+        // Every page except the last should be full
+        check_full(&s);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_cols_then_more_cols() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize less
+        s.resize(no_reflow(Some(2), None)).unwrap();
+        assert_eq!(2, s.cols);
+
+        // Resize
+        s.resize(no_reflow(Some(5), None)).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(3, s.total_rows());
+
+        check_row_widths(&s, 5);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_less_rows_and_cols() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize less
+        s.resize(no_reflow(Some(5), Some(7))).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(7, s.rows);
+
+        check_row_widths(&s, 5);
+    }
+
+    #[test]
+    fn page_list_resize_less_rows_and_cols_cursor_at_bottom() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let cursor_pin = s
+            .track_pin(s.pin(pt_active(0, s.rows as u32 - 1)).unwrap())
+            .unwrap();
+
+        // Shrink both axes such that the original cursor.y is strictly past the
+        // new row count, so resizeWithoutReflow leaves self.rows < c.y + 1.
+        s.resize(Resize {
+            cols: Some(79),
+            rows: Some(20),
+            reflow: true,
+            cursor: Some(ResizeCursor {
+                x: 0,
+                y: 23,
+                pin: Some(cursor_pin),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(79, s.cols);
+        assert_eq!(20, s.rows);
+
+        // remaining_rows saturates to 0, so the cursor lands on the new bottom row.
+        assert_eq!(
+            pt_active(0, s.rows as u32 - 1),
+            s.point_from_pin(Tag::Active, *tp(cursor_pin)).unwrap()
+        );
+
+        s.untrack_pin(cursor_pin);
+    }
+
+    #[test]
+    fn page_list_resize_less_rows_and_cols_cursor_near_top_pushed_to_scrollback() {
+        let mut s = init(80, 24);
+
+        // Fill every active row with non-blank content so that shrinking rows
+        // can't trim trailing blank lines and instead pushes the top rows into
+        // scrollback.
+        {
+            let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+            while let Some(p) = it.next() {
+                let (row, _) = pin_rac(p);
+                let cells = cells_of(pg(p.node), row);
+                for (x, cell) in cells.iter_mut().enumerate() {
+                    *cell = cpu('A' as u32 + (x % 26) as u32);
+                }
+            }
+        }
+
+        // Cursor near the top of the active area. After we shrink rows the active
+        // area top moves down past this pin, so it ends up in scrollback.
+        let cursor_pin = s.track_pin(s.pin(pt_active(0, 0)).unwrap()).unwrap();
+
+        // Shrink both axes with reflow. resizeWithoutReflow shrinks self.rows
+        // first, leaving the cursor pin above the new active area, then resizeCols
+        // walks .left_up from the cursor pin toward the active-area top.
+        s.resize(Resize {
+            cols: Some(79),
+            rows: Some(20),
+            reflow: true,
+            cursor: Some(ResizeCursor {
+                x: 0,
+                y: 0,
+                pin: Some(cursor_pin),
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(79, s.cols);
+        assert_eq!(20, s.rows);
+
+        // The active area is anchored to the bottom, so shrinking rows pushed the
+        // top-of-screen cursor into scrollback: it no longer resolves to an
+        // active-area coordinate, but it remains a valid screen pin.
+        assert!(s.point_from_pin(Tag::Active, *tp(cursor_pin)).is_none());
+        assert!(s.point_from_pin(Tag::Screen, *tp(cursor_pin)).is_some());
+
+        // Integrity must hold after the resize.
+        s.assert_integrity();
+
+        s.untrack_pin(cursor_pin);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows_and_less_cols() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize less
+        s.resize(no_reflow(Some(5), Some(20))).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(20, s.rows);
+        assert_eq!(20, s.total_rows());
+
+        check_row_widths(&s, 5);
+    }
+
+    #[test]
+    fn page_list_resize_more_rows_and_cols_doesn_t_fit_in_single_std_page() {
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize to a size that requires more than one page to fit our rows.
+        let new_cols = 600;
+        let new_rows = 600;
+        let cap = STD_CAPACITY
+            .adjust(pagepkg::Adjustment { cols: Some(new_cols) })
+            .unwrap();
+        assert!(cap.rows < new_rows);
+
+        s.resize(Resize {
+            cols: Some(new_cols),
+            rows: Some(new_rows),
+            reflow: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(new_cols, s.cols);
+        assert_eq!(new_rows, s.rows);
+        assert_eq!(new_rows as usize, s.total_rows());
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_empty_screen() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 5,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Resize
+        s.resize(no_reflow(Some(10), Some(10))).unwrap();
+        assert_eq!(10, s.cols);
+        assert_eq!(10, s.rows);
+        assert_eq!(10, s.total_rows());
+
+        check_row_widths(&s, 10);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_cols_forces_smaller_cap() {
+        // We want a cap that forces us to have less rows
+        let cap = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(100) }).unwrap();
+        let cap2 = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(500) }).unwrap();
+        assert_eq!(500, cap2.cols);
+        assert!(cap2.rows < cap.rows);
+
+        // Create initial cap, fits in one page
+        let mut s = init(cap.cols, cap.rows);
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        for y in 0..s.rows as usize {
+            for x in 0..s.cols as usize {
+                *cell_at(page, x, y) = cp('A');
+            }
+        }
+
+        // Resize to our large cap
+        let rows = s.total_rows();
+        s.resize(no_reflow(Some(cap2.cols), None)).unwrap();
+
+        // Our total rows should be the same, and contents should be the same.
+        assert_eq!(rows, s.total_rows());
+        let mut it = s.row_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        while let Some(offset) = it.next() {
+            let (row, _) = pin_rac(offset);
+            let cells = cells_of(pg(offset.node), row);
+            assert_eq!(cap2.cols as usize, cells.len());
+            assert_eq!('A' as u32, cells[0].content_codepoint());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_rows_adds_blank_rows_if_cursor_at_bottom() {
+        let mut s = init(5, 3);
+
+        // Grow to 5 total rows, simulating 3 active + 2 scrollback
+        s.grow_rows(2).unwrap();
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        for y in 0..s.total_rows() {
+            *cell_at(page, 0, y) = cpu(y as u32);
+        }
+
+        // Active should be on row 3
+        assert_eq!(pt_screen(0, 2), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, s.rows as u32 - 2)).unwrap()).unwrap();
+        let original_cursor = s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord();
+        {
+            let get = s.get_cell(pt_active(original_cursor.x, original_cursor.y)).unwrap();
+            assert_eq!(3, unsafe { (*get.cell).content_codepoint() });
+        }
+
+        // Resize
+        s.resize_without_reflow(Resize {
+            rows: Some(10),
+            reflow: false,
+            cursor: Some(ResizeCursor::new(0, s.rows - 2)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(10, s.rows);
+
+        // Our cursor should not change
+        assert_eq!(original_cursor, s.point_from_pin(Tag::Active, *tp(p)).unwrap().coord());
+
+        // 12 because we have our 10 rows in the active + 2 in the scrollback
+        // because we're preserving the cursor.
+        assert_eq!(12, s.total_rows());
+
+        // Active should be at the same place it was.
+        assert_eq!(pt_screen(0, 2), s.get_cell(pt_active(0, 0)).unwrap().screen_point());
+
+        // Go through our active, we should get only 3,4,5
+        for y in 0..3u32 {
+            let get = s.get_cell(pt_active(0, y)).unwrap();
+            let expected = y + 2;
+            assert_eq!(expected, unsafe { (*get.cell).content_codepoint() });
+        }
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_reflow_from_max_cols_to_narrow() {
+        // A max-width page is large enough that narrowing it to 2 columns
+        // frees memory for more rows than a page can hold. The resize must
+        // cap the row count instead of overflowing it.
+        let mut s = init_opts(Options {
+            cols: CellCountInt::MAX,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        s.resize(Resize {
+            cols: Some(2),
+            reflow: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(2, s.cols);
+        s.assert_integrity();
+    }
 }
