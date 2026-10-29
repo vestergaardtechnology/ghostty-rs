@@ -6,6 +6,9 @@ description = "Rust port of the Ghostty terminal emulator"
 license = "MIT"
 autobins = false
 
+# Each checkout (including agent worktrees nested under .claude/) is its own workspace root.
+[workspace]
+
 [lib]
 name = "ghostty"
 path = "src/root.rs"
@@ -19,8 +22,10 @@ default = []
 
 [dependencies]
 log = "0.4"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
+png = "0.18"
 
 [profile.dev]
 opt-level = 1

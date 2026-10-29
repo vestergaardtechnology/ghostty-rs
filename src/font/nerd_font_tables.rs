@@ -3284,68 +3284,9 @@ pub(crate) use stage3;
 mod tests {
     use super::*;
 
-    // TODO(port-dedupe): replace with crate::font::glyph::Constraint
-    // (and its Size/Align/Height enums) once Glyph.zig is ported.
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Size {
-        None,
-        Fit,
-        Cover,
-        FitCover1,
-        Stretch,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Align {
-        None,
-        Start,
-        End,
-        Center,
-        Center1,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    enum Height {
-        Cell,
-        Icon,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq)]
-    struct Constraint {
-        size: Size,
-        align_vertical: Align,
-        align_horizontal: Align,
-        pad_top: f64,
-        pad_left: f64,
-        pad_right: f64,
-        pad_bottom: f64,
-        relative_width: f64,
-        relative_height: f64,
-        relative_x: f64,
-        relative_y: f64,
-        max_xy_ratio: Option<f64>,
-        max_constraint_width: u8,
-        height: Height,
-    }
-
-    impl Constraint {
-        const NONE: Constraint = Constraint {
-            size: Size::None,
-            align_vertical: Align::None,
-            align_horizontal: Align::None,
-            pad_top: 0.0,
-            pad_left: 0.0,
-            pad_right: 0.0,
-            pad_bottom: 0.0,
-            relative_width: 1.0,
-            relative_height: 1.0,
-            relative_x: 0.0,
-            relative_y: 0.0,
-            max_xy_ratio: None,
-            max_constraint_width: 2,
-            height: Height::Cell,
-        };
-    }
+    use crate::font::glyph::{
+        Constraint, ConstraintAlign as Align, ConstraintHeight as Height, ConstraintSize as Size,
+    };
 
     static STAGE3: [Option<Constraint>; STAGE3_LEN] = stage3!(Constraint, Size, Align, Height);
 

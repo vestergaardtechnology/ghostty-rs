@@ -1,6 +1,6 @@
 //! Port of `src/font/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: partial — re-exports of ported modules, `OPTIONS`, `Style`, `Presentation`; `sprite_index`, `default_fallback_adjustment` and remaining re-exports missing.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "atlas.rs"]
@@ -48,3 +48,43 @@ pub mod shared_grid_set;
 #[path = "sprite.rs"]
 pub mod sprite;
 // @generated-mods-end
+
+pub use self::atlas::Atlas;
+pub use self::backend::Backend;
+pub use self::codepoint_map::CodepointMap;
+pub use self::glyph::Glyph;
+pub use self::library::Library;
+pub use self::metrics::Metrics;
+pub use self::sprite::Face as SpriteFace;
+pub use self::sprite::Sprite;
+
+/// Build options (Zig `options`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    pub backend: Backend,
+}
+
+/// Build options. The backend is the default backend for the target
+/// (the Ghostty application build).
+// TODO(port-dedupe): use crate::build_config font_backend once ported.
+pub const OPTIONS: Options = Options {
+    backend: Backend::default(backend::Target::current(), backend::WasmTarget::Browser),
+};
+
+/// The styles that a family can take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Style {
+    Regular = 0,
+    Bold = 1,
+    Italic = 2,
+    BoldItalic = 3,
+}
+
+/// The presentation for an emoji.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Presentation {
+    Text = 0,  // U+FE0E
+    Emoji = 1, // U+FEOF
+}
