@@ -1,6 +1,9 @@
 //! Port of `src/datastruct/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
+//!
+//! The datastruct package contains data structures or anything closely
+//! related to data structures.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "blocking_queue.rs"]
@@ -28,3 +31,15 @@ pub mod untouched_pool;
 #[path = "wasm_page_pool.rs"]
 pub mod wasm_page_pool;
 // @generated-mods-end
+
+pub use blocking_queue::BlockingQueue;
+pub use cache_table::CacheTable;
+pub use circ_buf::CircBuf;
+pub use comptime_int_set::ComptimeIntSet;
+pub use intrusive_linked_list::DoublyLinkedList as IntrusiveDoublyLinkedList;
+pub use limited_allocator::LimitedAllocator;
+pub use message_data::MessageData;
+pub use split_tree::SplitTree;
+pub use untouched_pool::UntouchedPool;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use wasm_page_pool::WasmPagePool;
