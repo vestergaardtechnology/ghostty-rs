@@ -83,6 +83,12 @@ macro_rules! opaque_type {
             _marker: ::std::marker::PhantomData<(*mut u8, ::std::marker::PhantomPinned)>,
         }
 
+        impl ::std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, "{}({:p})", stringify!($name), self as *const Self)
+            }
+        }
+
         impl $crate::pkg::macos::CFType for $name {
             #[inline]
             fn as_ptr(&self) -> *mut ::std::ffi::c_void {
@@ -230,6 +236,7 @@ pub mod c {
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         pub static kCFAllocatorNull: CFAllocatorRef;
+        pub static kCFNull: CFTypeRef;
         pub static kCFTypeArrayCallBacks: CFArrayCallBacks;
         pub static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
         pub static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
@@ -685,6 +692,11 @@ pub mod c {
         pub static kCTFontAttributeName: CFStringRef;
         pub static kCTParagraphStyleAttributeName: CFStringRef;
         pub static kCTWritingDirectionAttributeName: CFStringRef;
+
+        pub static kCTFontOpenTypeFeatureTag: CFStringRef;
+        pub static kCTFontOpenTypeFeatureValue: CFStringRef;
+
+        pub static kCTTypesetterOptionForcedEmbeddingLevel: CFStringRef;
 
         pub fn CTFontCreateWithFontDescriptor(
             descriptor: CTFontDescriptorRef,

@@ -160,7 +160,13 @@ impl Shaper {
                 DEFAULT_FEATURES.len()
             };
 
-            hb::shape(face.hb_font, self.hb_buf, Some(&self.hb_feats[i..]));
+            // The CoreText face only has a HarfBuzz font when built for
+            // the HarfBuzz shaper (Zig: `if (harfbuzz_shaper) ... else void`).
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let hb_font = face.hb_font.expect("CoreText face has no HarfBuzz font");
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let hb_font = face.hb_font;
+            hb::shape(hb_font, self.hb_buf, Some(&self.hb_feats[i..]));
         }
 
         // If our buffer is empty, we short-circuit the rest of the work
