@@ -1420,7 +1420,10 @@ macro_rules! cli_struct {
     ) => {
         $($sattr)*
         $svis struct $Name {
-            $( $(#[$($fattr)*])* $fvis $field: $fty, )*
+            // Field attributes (mostly doc comments) are dropped while rustdoc
+            // collects doctests: config docs use indented (Markdown) code
+            // blocks for config examples, which are not Rust.
+            $( $(#[cfg_attr(not(doctest), $($fattr)*)])* $fvis $field: $fty, )*
             $( $($pattr)* $pvis $pfield: $pty, )*
         }
 

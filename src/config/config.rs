@@ -186,7 +186,7 @@ use crate::font::face::{Variation, VariationId};
 const LOG_TARGET: &str = "config";
 
 /// Zig: `pub const compatibility = std.StaticStringMap(...)`.
-fn compatibility(key: &str) -> Option<CompatibilityHandler<Config>> {
+pub fn compatibility(key: &str) -> Option<CompatibilityHandler<Config>> {
     match key {
         // Ghostty 1.1 introduced background-blur support for Linux which
         // doesn't support a specific radius value. The renaming is to let
@@ -10990,5 +10990,96 @@ mod tests {
         assert_eq!(2, cmd.len());
         assert_eq!(cmd[0], "echo");
         assert_eq!(cmd[1], "hi");
+    }
+
+    #[test]
+    fn load_recursive_files_with_cycle() {
+        let td = crate::os::TempDir::init().unwrap();
+        let dir = std::fs::canonicalize(td.path()).unwrap();
+        let a = dir.join("a.ghostty");
+        let b = dir.join("b.ghostty");
+        std::fs::write(&a, "font-size = 20\nconfig-file = b.ghostty\n").unwrap();
+        std::fs::write(&b, "background = #010203\nconfig-file = a.ghostty\nconfig-file = ?missing\n")
+            .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.load_file(a.to_str().unwrap()).unwrap();
+        cfg.load_recursive_files().unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(20.0, cfg.font_size);
+        assert_eq!(Color { r: 1, g: 2, b: 3 }, cfg.background);
+
+        // a.ghostty loads b.ghostty, which loads a.ghostty again (it was
+        // loaded directly, not through config-file), which then lists
+        // b.ghostty a second time: a cycle. The optional missing file is
+        // silently skipped.
+        let messages: Vec<String> = cfg
+            ._diagnostics
+            .items()
+            .iter()
+            .map(|d| d.message.as_str().to_owned())
+            .collect();
+        assert_eq!(1, messages.len(), "{messages:?}");
+        assert!(messages[0].ends_with("b.ghostty: cycle detected"), "{messages:?}");
+        td.deinit();
+    }
+
+    #[test]
+    fn load_optional_file_not_found() {
+        let td = crate::os::TempDir::init().unwrap();
+        let dir = std::fs::canonicalize(td.path()).unwrap();
+        let missing = dir.join("missing.ghostty");
+        let present = dir.join("present.ghostty");
+        std::fs::write(&present, "font-thicken = true\n").unwrap();
+
+        let mut cfg = Config::default();
+        assert_eq!(OptionalFileAction::NotFound, cfg.load_optional_file(missing.to_str().unwrap()));
+        assert_eq!(OptionalFileAction::Loaded, cfg.load_optional_file(present.to_str().unwrap()));
+        assert!(cfg.font_thicken);
+        td.deinit();
+    }
+
+    #[test]
+    fn load_cli_args_config_default_files_discards_files() {
+        let td = crate::os::TempDir::init().unwrap();
+        let dir = std::fs::canonicalize(td.path()).unwrap();
+        let file = dir.join("config.ghostty");
+        std::fs::write(&file, "font-size = 20\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.load_file(file.to_str().unwrap()).unwrap();
+        assert_eq!(20.0, cfg.font_size);
+
+        let argv: Vec<std::ffi::CString> = ["ghostty", "--config-default-files=false", "--font-thicken"]
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        cfg.load_cli_args_from(&argv).unwrap();
+
+        // The file's values were discarded, the CLI's were kept.
+        assert!(!cfg.config_default_files);
+        assert!(cfg.font_thicken);
+        assert_eq!(<Config as Default>::default().font_size, cfg.font_size);
+        td.deinit();
+    }
+
+    #[test]
+    fn load_cli_args_font_family_overwrites() {
+        let mut cfg = Config::default();
+        let data = ["--font-family=A"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+
+        let argv: Vec<std::ffi::CString> = ["ghostty", "--font-family=B", "--font-family=C", "-e", "echo"]
+            .iter()
+            .map(|s| std::ffi::CString::new(*s).unwrap())
+            .collect();
+        cfg.load_cli_args_from(&argv).unwrap();
+
+        let families: Vec<&str> = cfg.font_family.list.iter().map(|s| s.as_str()).collect();
+        assert_eq!(vec!["B", "C"], families);
+        assert!(!cfg.font_family.overwrite_next);
+        assert!(matches!(&cfg.initial_command, Some(Command::Direct(cmd)) if cmd.len() == 1));
     }
 }
