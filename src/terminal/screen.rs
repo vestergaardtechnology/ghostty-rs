@@ -4255,3 +4255,3920 @@ fn select_word_codepoint(pin: Pin) -> Option<u32> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(unused_imports)]
+    use super::*;
+    use crate::terminal::color::Rgb;
+    use crate::terminal::page::{ContentTag, SemanticPrompt as RowSemanticPrompt};
+    use crate::terminal::selection_codepoints::DEFAULT_WORD_BOUNDARIES;
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    fn init(cols: CellCountInt, rows: CellCountInt, max_scrollback_bytes: Option<usize>) -> Screen {
+        Screen::init(Options {
+            cols,
+            rows,
+            max_scrollback_bytes,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn coord(x: CellCountInt, y: u32) -> Coordinate {
+        Coordinate { x, y }
+    }
+    fn act(x: CellCountInt, y: u32) -> Point {
+        Point::Active(coord(x, y))
+    }
+    fn scr(x: CellCountInt, y: u32) -> Point {
+        Point::Screen(coord(x, y))
+    }
+    fn vp(x: CellCountInt, y: u32) -> Point {
+        Point::Viewport(coord(x, y))
+    }
+    #[allow(dead_code)]
+    fn hist(x: CellCountInt, y: u32) -> Point {
+        Point::History(coord(x, y))
+    }
+
+    fn pt0(tag: Tag) -> Point {
+        let c = Coordinate::default();
+        match tag {
+            Tag::Active => Point::Active(c),
+            Tag::Viewport => Point::Viewport(c),
+            Tag::Screen => Point::Screen(c),
+            Tag::History => Point::History(c),
+        }
+    }
+
+    /// `dumpStringAlloc` with an x/y of zero.
+    fn dump(s: &Screen, tag: Tag) -> String {
+        s.dump_string_alloc(pt0(tag)).unwrap()
+    }
+
+    #[allow(dead_code)]
+    fn dump_unwrapped(s: &Screen, tag: Tag) -> String {
+        s.dump_string_alloc_unwrapped(pt0(tag)).unwrap()
+    }
+
+    fn pg<'a>(n: NodePtr) -> &'a mut Page {
+        node_page(n)
+    }
+
+    fn first(s: &Screen) -> NodePtr {
+        s.pages.pages.first.unwrap()
+    }
+
+    fn last(s: &Screen) -> NodePtr {
+        s.pages.pages.last.unwrap()
+    }
+
+    /// The cursor pin (Zig: `s.cursor.page_pin.*`).
+    fn cp(s: &Screen) -> Pin {
+        *tp(s.cursor.page_pin)
+    }
+
+    /// The page the cursor is on (Zig: `s.cursor.page_pin.node.page()`).
+    fn cpage<'a>(s: &Screen) -> &'a mut Page {
+        pg(cp(s).node)
+    }
+
+    fn pin(s: &Screen, pt: Point) -> Pin {
+        s.pages.pin(pt).unwrap()
+    }
+
+    fn pfp(s: &Screen, tag: Tag, p: Pin) -> Option<Point> {
+        s.pages.point_from_pin(tag, p)
+    }
+
+    #[allow(dead_code)]
+    fn sel_init(s: &Screen, a: Point, b: Point, rect: bool) -> Selection {
+        Selection::init(pin(s, a), pin(s, b), rect)
+    }
+
+    fn get_cell(s: &Screen, pt: Point) -> Cell {
+        unsafe { *s.pages.get_cell(pt).unwrap().cell }
+    }
+
+    #[allow(dead_code)]
+    fn get_row(s: &Screen, pt: Point) -> Row {
+        unsafe { *s.pages.get_cell(pt).unwrap().row }
+    }
+
+    fn style_of<'a>(page: &Page, id: style::Id) -> &'a Style {
+        unsafe { &*page.styles.get(page.memory, id) }
+    }
+
+    fn bold() -> sgr::Attribute<'static> {
+        sgr::Attribute::Bold
+    }
+
+    fn bg_rgb(r: u8, g: u8, b: u8) -> sgr::Attribute<'static> {
+        sgr::Attribute::DirectColorBg(Rgb { r, g, b })
+    }
+
+    fn rgb(r: u8, g: u8, b: u8) -> Rgb {
+        Rgb { r, g, b }
+    }
+
+    /// Fill the scrollback of the first page with blank lines until
+    /// there are only `left` rows left on it.
+    fn fill_first_page(s: &mut Screen, left: usize) {
+        let first_page_size = nd(first(s)).capacity().rows as usize;
+        pg(first(s)).pause_integrity_checks(true);
+        for _ in 0..first_page_size - left {
+            s.test_write_string("\n").unwrap();
+        }
+        pg(first(s)).pause_integrity_checks(false);
+    }
+
+    #[allow(dead_code)]
+    fn resize(s: &mut Screen, cols: CellCountInt, rows: CellCountInt, reflow: bool) {
+        s.resize(Resize {
+            cols,
+            rows,
+            reflow,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn screen_forwards_optional_scrollback_limits() {
+        let max_lines: usize = 123;
+        let s = Screen::init(Options {
+            cols: 80,
+            rows: 24,
+            max_scrollback_bytes: None,
+            max_scrollback_lines: Some(max_lines),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(usize::MAX, s.pages.limits.bytes.explicit);
+        assert_eq!(max_lines, s.pages.limits.lines.explicit);
+        assert!(!s.no_scrollback);
+    }
+
+    #[test]
+    fn screen_reset_cursor_pin_is_not_garbage() {
+        let mut s = init(80, 24, Some(1000));
+        s.test_write_string("hello, world").unwrap();
+
+        // The page reset marks every tracked pin garbage but the screen
+        // keeps using the cursor pin, so it must come back clean: anything
+        // that copies it (e.g. Kitty image placements) would otherwise be
+        // born garbage and reaped.
+        s.reset();
+        assert!(!cp(&s).garbage);
+    }
+
+    #[test]
+    fn screen_read_and_write() {
+        let mut s = init(80, 24, Some(1000));
+        assert_eq!(0 as style::Id, s.cursor.style_id);
+
+        s.test_write_string("hello, world").unwrap();
+        assert_eq!("hello, world", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_read_and_write_newline() {
+        let mut s = init(80, 24, Some(1000));
+        assert_eq!(0 as style::Id, s.cursor.style_id);
+
+        s.test_write_string("hello\nworld").unwrap();
+        assert_eq!("hello\nworld", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_read_and_write_scrollback() {
+        let mut s = init(80, 2, Some(1000));
+
+        s.test_write_string("hello\nworld\ntest").unwrap();
+        assert_eq!("hello\nworld\ntest", dump(&s, Tag::Screen));
+        assert_eq!("world\ntest", dump(&s, Tag::Active));
+    }
+
+    #[test]
+    fn screen_read_and_write_no_scrollback_small() {
+        let mut s = init(80, 2, Some(0));
+
+        s.test_write_string("hello\nworld\ntest").unwrap();
+        assert_eq!("world\ntest", dump(&s, Tag::Screen));
+        assert_eq!("world\ntest", dump(&s, Tag::Active));
+    }
+
+    #[test]
+    fn screen_read_and_write_no_scrollback_large() {
+        let mut s = init(80, 2, Some(0));
+
+        for i in 0..1_000 {
+            s.test_write_string(&format!("{i}\n")).unwrap();
+        }
+        s.test_write_string("1000").unwrap();
+
+        assert_eq!("999\n1000", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_cursor_copy_x_y() {
+        let mut s = init(10, 10, Some(0));
+        s.cursor_absolute(2, 3);
+        assert!(s.cursor.x == 2);
+        assert!(s.cursor.y == 3);
+
+        let mut s2 = init(10, 10, Some(0));
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert!(s2.cursor.x == 2);
+        assert!(s2.cursor.y == 3);
+        s2.test_write_string("Hello").unwrap();
+
+        assert_eq!("\n\n\n  Hello", dump(&s2, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_cursor_copy_style_deref() {
+        let s = init(10, 10, Some(0));
+
+        let mut s2 = init(10, 10, Some(0));
+        let page = cpage(&s2);
+
+        // Bold should create our style
+        s2.set_attribute(bold()).unwrap();
+        assert_eq!(1, page.styles.count());
+        assert!(s2.cursor.style.flags.bold);
+
+        // Copy default style, should release our style
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert!(!s2.cursor.style.flags.bold);
+        assert_eq!(0, page.styles.count());
+    }
+
+    #[test]
+    fn screen_cursor_copy_style_deref_new_page() {
+        let s = init(10, 10, Some(0));
+
+        let mut s2 = init(10, 10, Some(2048));
+
+        // We need to get the cursor on a new page.
+        // Fill the scrollback with blank lines until
+        // there are only 5 rows left on the first page.
+        fill_first_page(&mut s2, 5);
+
+        s2.test_write_string("1\n2\n3\n4\n5\n6\n7\n8\n9\n10").unwrap();
+
+        // This should be PAGE 1
+        let page: *mut Page = cpage(&s2);
+
+        // It should be the last page in the list.
+        assert_eq!(pg(last(&s2)) as *mut Page, page);
+        // It should have a previous page.
+        assert!(nd(cp(&s2).node).prev.is_some());
+
+        // The cursor should be at 2, 9
+        assert!(s2.cursor.x == 2);
+        assert!(s2.cursor.y == 9);
+
+        // Bold should create our style in page 1.
+        s2.set_attribute(bold()).unwrap();
+        assert_eq!(1, unsafe { (*page).styles.count() });
+        assert!(s2.cursor.style.flags.bold);
+
+        // Copy the cursor for the first screen. This should release
+        // the style from page 1 and move the cursor back to page 0.
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert!(!s2.cursor.style.flags.bold);
+        assert_eq!(0, unsafe { (*page).styles.count() });
+        // The page after the page the cursor is now in should be page 1.
+        assert_eq!(page, pg(nd(cp(&s2).node).next.unwrap()) as *mut Page);
+        // The cursor should be at 0, 0
+        assert!(s2.cursor.x == 0);
+        assert!(s2.cursor.y == 0);
+    }
+
+    #[test]
+    fn screen_cursor_copy_style_copy() {
+        let mut s = init(10, 10, Some(0));
+        s.set_attribute(bold()).unwrap();
+
+        let mut s2 = init(10, 10, Some(0));
+        let page = cpage(&s2);
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert!(s2.cursor.style.flags.bold);
+        assert_eq!(1, page.styles.count());
+    }
+
+    #[test]
+    fn screen_cursor_copy_hyperlink_deref() {
+        let s = init(10, 10, Some(0));
+
+        let mut s2 = init(10, 10, Some(0));
+        let page = cpage(&s2);
+
+        // Create a hyperlink for the cursor.
+        s2.start_hyperlink(b"https://example.com/", None).unwrap();
+        assert_eq!(1, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id != 0);
+
+        // Copy a cursor with no hyperlink, should release our hyperlink.
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert_eq!(0, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id == 0);
+    }
+
+    #[test]
+    fn screen_write_regrows_compacted_page_capacity() {
+        let mut s = init(80, 24, Some(0));
+
+        // Compact the active page so every managed capacity dimension is
+        // zero, then reload the cursor since its cached row/cell pointers
+        // point into the replaced page.
+        {
+            let node = s.pages.compact(cp(&s).node).unwrap().unwrap();
+            assert_eq!(0, nd(node).capacity().styles);
+            assert_eq!(0, nd(node).capacity().grapheme_bytes);
+            assert_eq!(0, nd(node).capacity().string_bytes);
+            assert_eq!(0, nd(node).capacity().hyperlink_bytes);
+            s.cursor_reload();
+        }
+
+        // Styled write: exercises the manualStyleUpdate single-retry
+        // path. Prior to increaseCapacity handling zero dimensions, the
+        // retry would fail and the style would be dropped.
+        s.set_attribute(bold()).unwrap();
+        s.test_write_string("A").unwrap();
+
+        // Grapheme write: exercises the appendGrapheme single-retry path.
+        // We can't use testWriteString here because it appends graphemes
+        // directly on the page without the capacity retry.
+        s.test_write_string("a").unwrap();
+        s.append_grapheme(s.cursor_cell_left(1), 0x0301).unwrap();
+
+        // Hyperlink: exercises the startHyperlink retry loop, which used
+        // to loop forever when capacity growth from zero didn't grow.
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        s.test_write_string("B").unwrap();
+        s.end_hyperlink();
+
+        // Verify the content landed on the page.
+        let page = cpage(&s);
+        assert!(page.styles.count() >= 1);
+        assert!(page.hyperlink_set.count() >= 1);
+        assert!(page.grapheme_count() >= 1);
+    }
+
+    // The cursor style and hyperlink IDs are only meaningful within the page
+    // the cursor pin points at. scrollClear can move the active area onto a
+    // later page while the cursor pin stays with its content on an earlier
+    // page (now scrollback), so the reset in cursorReload must migrate both
+    // references to the destination page. It previously replaced the pin
+    // directly and then released the old style ID on the new page.
+    #[test]
+    fn screen_scroll_clear_across_pages_migrates_cursor_style_and_hyperlink() {
+        let mut s = init(10, 10, Some(usize::MAX));
+
+        // Fill the first page so the active area spans two pages.
+        fill_first_page(&mut s, 5);
+        s.test_write_string("1\n2\n3\n4\n5\n6\n7\n8\n9\n10").unwrap();
+        assert!(s.pages.pages.first != s.pages.pages.last);
+
+        // Move the cursor to the top of the active area, which is on the
+        // first page, and give it a style and a hyperlink there.
+        s.cursor_absolute(0, 0);
+        assert!(cp(&s).node == first(&s));
+        s.set_attribute(bold()).unwrap();
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+
+        let old_page: *mut Page = cpage(&s);
+        let old_style_id = s.cursor.style_id;
+        let old_hyperlink_id = s.cursor.hyperlink_id;
+        assert!(old_style_id != style::DEFAULT_ID);
+        assert!(old_hyperlink_id != 0);
+
+        // All ten active rows are non-empty, so this moves the active area
+        // fully onto the second page while the cursor pin stays with its
+        // old row, which is now scrollback.
+        s.scroll_clear().unwrap();
+
+        // The cursor was moved to the new active top-left on the second
+        // page with its style and hyperlink references rebuilt there.
+        let new_page = cpage(&s);
+        assert!(new_page as *mut Page != old_page);
+        assert!(s.cursor.style_id != style::DEFAULT_ID);
+        assert!(s.cursor.hyperlink_id != 0);
+        unsafe {
+            assert!(new_page.styles.ref_count(new_page.memory, s.cursor.style_id) > 0);
+            assert!(new_page.hyperlink_set.ref_count(new_page.memory, s.cursor.hyperlink_id) > 0);
+
+            // The cursor's references on the old page were released. Nothing
+            // else referenced either entry, so both are dead there now.
+            assert_eq!(0, (*old_page).styles.ref_count((*old_page).memory, old_style_id));
+            assert_eq!(0, (*old_page).hyperlink_set.ref_count((*old_page).memory, old_hyperlink_id));
+        }
+
+        // Printing attaches the migrated style and hyperlink to a cell.
+        s.test_write_string("B").unwrap();
+    }
+
+    #[test]
+    fn screen_cursor_copy_hyperlink_deref_new_page() {
+        let s = init(10, 10, Some(0));
+
+        let mut s2 = init(10, 10, Some(2048));
+
+        // We need to get the cursor on a new page.
+        fill_first_page(&mut s2, 5);
+
+        s2.test_write_string("1\n2\n3\n4\n5\n6\n7\n8\n9\n10").unwrap();
+
+        // This should be PAGE 1
+        let page: *mut Page = cpage(&s2);
+
+        // It should be the last page in the list.
+        assert_eq!(pg(last(&s2)) as *mut Page, page);
+        // It should have a previous page.
+        assert!(nd(cp(&s2).node).prev.is_some());
+
+        // The cursor should be at 2, 9
+        assert!(s2.cursor.x == 2);
+        assert!(s2.cursor.y == 9);
+
+        // Create a hyperlink for the cursor, should be in page 1.
+        s2.start_hyperlink(b"https://example.com/", None).unwrap();
+        assert_eq!(1, unsafe { (*page).hyperlink_set.count() });
+        assert!(s2.cursor.hyperlink_id != 0);
+
+        // Copy the cursor for the first screen. This should release
+        // the hyperlink from page 1 and move the cursor back to page 0.
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert_eq!(0, unsafe { (*page).hyperlink_set.count() });
+        assert!(s2.cursor.hyperlink_id == 0);
+        // The page after the page the cursor is now in should be page 1.
+        assert_eq!(page, pg(nd(cp(&s2).node).next.unwrap()) as *mut Page);
+        // The cursor should be at 0, 0
+        assert!(s2.cursor.x == 0);
+        assert!(s2.cursor.y == 0);
+    }
+
+    #[test]
+    fn screen_cursor_copy_hyperlink_copy() {
+        let mut s = init(10, 10, Some(0));
+
+        // Create a hyperlink for the cursor.
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+        assert!(s.cursor.hyperlink_id != 0);
+
+        let mut s2 = init(10, 10, Some(0));
+        let page = cpage(&s2);
+
+        assert_eq!(0, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id == 0);
+
+        // Copy the cursor with the hyperlink.
+        s2.cursor_copy(&s.cursor, CursorCopy::default()).unwrap();
+        assert_eq!(1, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id != 0);
+    }
+
+    #[test]
+    fn screen_cursor_copy_hyperlink_copy_disabled() {
+        let mut s = init(10, 10, Some(0));
+
+        // Create a hyperlink for the cursor.
+        s.start_hyperlink(b"https://example.com/", None).unwrap();
+        assert_eq!(1, cpage(&s).hyperlink_set.count());
+        assert!(s.cursor.hyperlink_id != 0);
+
+        let mut s2 = init(10, 10, Some(0));
+        let page = cpage(&s2);
+
+        assert_eq!(0, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id == 0);
+
+        // Copy the cursor with the hyperlink.
+        s2.cursor_copy(&s.cursor, CursorCopy { hyperlink: false }).unwrap();
+        assert_eq!(0, page.hyperlink_set.count());
+        assert!(s2.cursor.hyperlink_id == 0);
+    }
+
+    #[test]
+    fn screen_style_basics() {
+        let mut s = init(80, 24, Some(1000));
+        let page = cpage(&s);
+        assert_eq!(0, page.styles.count());
+
+        // Set a new style
+        s.set_attribute(bold()).unwrap();
+        assert!(s.cursor.style_id != 0);
+        assert_eq!(1, page.styles.count());
+        assert!(s.cursor.style.flags.bold);
+
+        // Set another style, we should still only have one since it was unused
+        s.set_attribute(sgr::Attribute::Italic).unwrap();
+        assert!(s.cursor.style_id != 0);
+        assert_eq!(1, page.styles.count());
+        assert!(s.cursor.style.flags.italic);
+    }
+
+    #[test]
+    fn screen_style_reset_to_default() {
+        let mut s = init(80, 24, Some(1000));
+        let page = cpage(&s);
+        assert_eq!(0, page.styles.count());
+
+        // Set a new style
+        s.set_attribute(bold()).unwrap();
+        assert!(s.cursor.style_id != 0);
+        assert_eq!(1, page.styles.count());
+
+        // Reset to default
+        s.set_attribute(sgr::Attribute::ResetBold).unwrap();
+        assert!(s.cursor.style_id == 0);
+        assert_eq!(0, page.styles.count());
+    }
+
+    #[test]
+    fn screen_style_reset_with_unset() {
+        let mut s = init(80, 24, Some(1000));
+        let page = cpage(&s);
+        assert_eq!(0, page.styles.count());
+
+        // Set a new style
+        s.set_attribute(bold()).unwrap();
+        assert!(s.cursor.style_id != 0);
+        assert_eq!(1, page.styles.count());
+
+        // Reset to default
+        s.set_attribute(sgr::Attribute::Unset).unwrap();
+        assert!(s.cursor.style_id == 0);
+        assert_eq!(0, page.styles.count());
+    }
+
+    #[test]
+    fn screen_clear_rows_active_one_line() {
+        let mut s = init(80, 24, Some(1000));
+
+        s.test_write_string("hello, world").unwrap();
+        s.clear_rows(act(0, 0), None, false);
+        assert!(s.pages.is_dirty(act(0, 0)));
+        assert_eq!("", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_clear_rows_active_multi_line() {
+        let mut s = init(80, 24, Some(1000));
+
+        s.test_write_string("hello\nworld").unwrap();
+        s.clear_rows(act(0, 0), None, false);
+        assert!(s.pages.is_dirty(act(0, 0)));
+        assert!(s.pages.is_dirty(act(0, 1)));
+        assert_eq!("", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_clear_rows_active_styled_line() {
+        let mut s = init(80, 24, Some(1000));
+
+        s.set_attribute(bold()).unwrap();
+        s.test_write_string("hello world").unwrap();
+        s.set_attribute(sgr::Attribute::Unset).unwrap();
+
+        // We should have one style
+        let page = cpage(&s);
+        assert_eq!(1, page.styles.count());
+
+        s.clear_rows(act(0, 0), None, false);
+
+        // We should have none because active cleared it
+        assert_eq!(0, page.styles.count());
+
+        assert_eq!("", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_clear_cells_empty_range() {
+        let mut s = Screen::init(Options::default_value()).unwrap();
+
+        let page = cpage(&s);
+        let row = rw(s.cursor.page_row);
+        let cells = row_cells(page, row);
+        s.clear_cells(page, row, &mut cells[0..0]);
+    }
+
+    #[test]
+    fn screen_clear_rows_uses_stored_page_width() {
+        let mut s = init(2, 1, Some(0));
+
+        s.test_write_string("AB").unwrap();
+        let node = first(&s);
+        s.pages.cols = 4;
+
+        s.clear_rows(scr(0, 0), None, false);
+        let page = pg(node);
+        let cells = row_cells(page, rw(page.get_row(0)));
+        assert_eq!(2, cells.len());
+        for cell in cells.iter() {
+            assert!(cell.is_empty());
+        }
+    }
+
+    #[test]
+    fn screen_clear_rows_protected() {
+        let mut s = init(80, 24, Some(1000));
+
+        s.test_write_string("UNPROTECTED").unwrap();
+        s.cursor.protected = true;
+        s.test_write_string("PROTECTED").unwrap();
+        s.cursor.protected = false;
+        s.test_write_string("UNPROTECTED").unwrap();
+        s.test_write_string("\n").unwrap();
+        s.cursor.protected = true;
+        s.test_write_string("PROTECTED").unwrap();
+        s.cursor.protected = false;
+        s.test_write_string("UNPROTECTED").unwrap();
+        s.cursor.protected = true;
+        s.test_write_string("PROTECTED").unwrap();
+        s.cursor.protected = false;
+
+        s.clear_rows(act(0, 0), None, true);
+
+        assert_eq!("           PROTECTED\nPROTECTED           PROTECTED", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_erase_rows_history() {
+        let mut s = init(5, 5, Some(1000));
+
+        s.test_write_string("1\n2\n3\n4\n5\n6").unwrap();
+
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Active));
+        assert_eq!("1\n2\n3\n4\n5\n6", dump(&s, Tag::Screen));
+
+        s.erase_history(None);
+
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Active));
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_erase_rows_history_with_more_lines() {
+        let mut s = init(5, 5, Some(1000));
+
+        s.test_write_string("A\nB\nC\n1\n2\n3\n4\n5\n6").unwrap();
+
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Active));
+        assert_eq!("A\nB\nC\n1\n2\n3\n4\n5\n6", dump(&s, Tag::Screen));
+
+        s.erase_history(None);
+
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Active));
+        assert_eq!("2\n3\n4\n5\n6", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_erase_rows_active_partial() {
+        let mut s = init(5, 5, Some(0));
+
+        s.test_write_string("1\n2\n3").unwrap();
+
+        assert_eq!("1\n2\n3", dump(&s, Tag::Active));
+
+        s.erase_active(1);
+
+        assert_eq!("3", dump(&s, Tag::Active));
+        assert_eq!("3", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_cursor_cell_end_of_prev_across_mixed_width_pages() {
+        let mut s = init(4, 2, Some(0));
+
+        s.test_write_string("ABCDE").unwrap();
+        let f = first(&s);
+        let mut p = Pin::new(f);
+        p.y = 1;
+        s.pages.split(p).unwrap();
+        s.cursor_reload();
+        let second = nd(f).next.unwrap();
+        pg(f).size.cols = 2;
+
+        assert_eq!(second, cp(&s).node);
+        let mut ep = Pin::new(f);
+        ep.x = 1;
+        let expected = ep.row_and_cell().cell;
+        assert_eq!(expected, s.cursor_cell_end_of_prev());
+    }
+
+    /// Scroll down enough to go to another page (shared setup).
+    fn scroll_to_new_page(s: &mut Screen) -> *mut Page {
+        let start_page = pg(last(s));
+        let rem = start_page.capacity.rows;
+        start_page.pause_integrity_checks(true);
+        for _ in 0..rem {
+            s.cursor_down_or_scroll().unwrap();
+        }
+        start_page.pause_integrity_checks(false);
+        start_page
+    }
+
+    #[test]
+    fn screen_cursor_down_across_pages_preserves_style() {
+        let mut s = init(10, 3, Some(1));
+
+        // Scroll down enough to go to another page
+        let start_page = scroll_to_new_page(&mut s);
+
+        // We need our page to change for this test o make sense. If this
+        // assertion fails then the bug is in the test: we should be scrolling
+        // above enough for a new page to show up.
+        assert!(start_page != cpage(&s) as *mut Page);
+
+        // Scroll back to the previous page
+        s.cursor_up(1);
+        assert!(start_page == cpage(&s) as *mut Page);
+
+        // Go back up, set a style
+        s.set_attribute(bold()).unwrap();
+        {
+            let page = cpage(&s);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+
+        // Go back down into the next page and we should have that style
+        s.cursor_down(1);
+        {
+            let page = cpage(&s);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+    }
+
+    #[test]
+    fn screen_cursor_up_across_pages_preserves_style() {
+        let mut s = init(10, 3, Some(1));
+
+        // Scroll down enough to go to another page
+        let start_page = scroll_to_new_page(&mut s);
+
+        assert!(start_page != cpage(&s) as *mut Page);
+
+        // Go back up, set a style
+        s.set_attribute(bold()).unwrap();
+        {
+            let page = cpage(&s);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+
+        // Go back down into the prev page and we should have that style
+        s.cursor_up(1);
+        {
+            let page = cpage(&s);
+            assert!(start_page == page as *mut Page);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+    }
+
+    #[test]
+    fn screen_cursor_absolute_across_pages_preserves_style() {
+        let mut s = init(10, 3, Some(1));
+
+        // Scroll down enough to go to another page
+        let start_page = scroll_to_new_page(&mut s);
+
+        assert!(start_page != cpage(&s) as *mut Page);
+
+        // Go back up, set a style
+        s.set_attribute(bold()).unwrap();
+        {
+            let page = cpage(&s);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+
+        // Go back down into the prev page and we should have that style
+        s.cursor_absolute(1, 1);
+        {
+            let page = cpage(&s);
+            assert!(start_page == page as *mut Page);
+            assert!(style_of(page, s.cursor.style_id).flags.bold);
+        }
+    }
+
+    #[test]
+    fn screen_cursor_absolute_to_page_with_insufficient_capacity() {
+        // This test checks for a very specific edge case
+        // which previously resulted in memory corruption.
+        //
+        // The conditions for this edge case are as such:
+        // - The cursor has an associated style or other managed memory.
+        // - The cursor moves to a different page.
+        // - The new page is at capacity and must have its capacity adjusted.
+
+        let mut s = init(10, 3, Some(1));
+
+        // Scroll down enough to go to another page
+        let start_page = scroll_to_new_page(&mut s);
+
+        let new_page: *mut Page = cpage(&s);
+
+        // We need our page to change for this test to make sense. If this
+        // assertion fails then the bug is in the test: we should be scrolling
+        // above enough for a new page to show up.
+        assert!(start_page != new_page);
+
+        // Add styles to the start page until it reaches capacity.
+        unsafe {
+            // Pause integrity checks because they're slow and
+            // we're not testing this, this is just setup.
+            let sp = &mut *start_page;
+            sp.pause_integrity_checks(true);
+
+            let mut n: u32 = 1;
+            loop {
+                let st = Style {
+                    bg_color: style::Color::Rgb(rgb(n as u8, (n >> 8) as u8, (n >> 16) as u8)),
+                    ..Style::default()
+                };
+                if sp.styles.add(sp.memory, st).is_err() {
+                    break;
+                }
+                n += 1;
+            }
+            sp.assert_integrity();
+            sp.pause_integrity_checks(false);
+        }
+
+        // Set a style on the cursor.
+        s.set_attribute(bold()).unwrap();
+        assert!(style_of(unsafe { &*new_page }, s.cursor.style_id).flags.bold);
+
+        // Go back up into the start page and we should still have that style.
+        s.cursor_absolute(1, 1);
+        {
+            let cur_page = cpage(&s);
+            // The page we're on now should NOT equal start_page, since its
+            // capacity should have been adjusted, which invalidates our ptr.
+            assert!(start_page != cur_page as *mut Page);
+            // To make sure we DID change pages we check we're not on new_page.
+            assert!(new_page != cur_page as *mut Page);
+
+            assert!(style_of(cur_page, s.cursor.style_id).flags.bold);
+        }
+
+        cpage(&s).assert_integrity();
+        unsafe { (*new_page).assert_integrity() };
+    }
+
+    #[test]
+    fn screen_scrolling() {
+        let mut s = init(10, 3, Some(0));
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Scroll down, should still be bottom
+        s.cursor_down_scroll().unwrap();
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+        {
+            let cell = get_cell(&s, act(0, 2));
+            assert!(cell.content_tag() == ContentTag::BgColorRgb);
+            assert_eq!(rgb(155, 0, 0), cell.content_color_rgb());
+        }
+
+        // Everything is dirty because we have no scrollback
+        assert!(s.pages.is_dirty(act(0, 0)));
+        assert!(s.pages.is_dirty(act(0, 1)));
+        assert!(s.pages.is_dirty(act(0, 2)));
+
+        // Scrolling to the bottom does nothing
+        s.scroll(Scroll::Active);
+
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrolling_with_a_single_row_screen_no_scrollback() {
+        let mut s = init(10, 1, Some(0));
+        s.test_write_string("1ABCD").unwrap();
+
+        // Scroll down, should still be bottom
+        s.cursor_down_scroll().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+
+        // Screen should be dirty
+        assert!(s.pages.is_dirty(act(0, 0)));
+    }
+
+    #[test]
+    fn screen_scrolling_with_a_single_row_screen_with_scrollback() {
+        let mut s = init(10, 1, Some(1));
+        s.test_write_string("1ABCD").unwrap();
+
+        // Scroll down, should still be bottom
+        s.cursor_down_scroll().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+
+        // Active should be dirty
+        assert!(s.pages.is_dirty(act(0, 0)));
+
+        // Scrollback also dirty because cursor moved from there
+        assert!(s.pages.is_dirty(scr(0, 0)));
+
+        s.scroll(Scroll::DeltaRow(-1));
+        assert_eq!("1ABCD", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrolling_across_pages_preserves_style() {
+        let mut s = init(10, 3, Some(1));
+        s.set_attribute(bold()).unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        let start_page: *mut Page = pg(last(&s));
+
+        // Scroll down enough to go to another page
+        let sp = unsafe { &mut *start_page };
+        let rem = sp.capacity.rows - sp.size.rows + 1;
+        sp.pause_integrity_checks(true);
+        for _ in 0..rem {
+            s.cursor_down_or_scroll().unwrap();
+        }
+        sp.pause_integrity_checks(false);
+
+        // We need our page to change for this test o make sense. If this
+        // assertion fails then the bug is in the test: we should be scrolling
+        // above enough for a new page to show up.
+        let page = pg(last(&s));
+        assert!(start_page != page as *mut Page);
+
+        assert!(style_of(page, s.cursor.style_id).flags.bold);
+    }
+
+    #[test]
+    fn screen_scroll_down_from_0() {
+        let mut s = init(10, 3, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Scrolling up does nothing, but allows it
+        s.scroll(Scroll::DeltaRow(-1));
+        assert!(s.pages.viewport == Viewport::Active);
+
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrollback_various_cases() {
+        let mut s = init(10, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.cursor_down_scroll().unwrap();
+
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling to the bottom
+        s.scroll(Scroll::Active);
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling back should make it visible again
+        s.scroll(Scroll::DeltaRow(-1));
+        assert!(s.pages.viewport != Viewport::Active);
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling back again should do nothing
+        s.scroll(Scroll::DeltaRow(-1));
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling to the bottom
+        s.scroll(Scroll::Active);
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling forward with no grow should do nothing
+        s.scroll(Scroll::DeltaRow(1));
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling to the top should work
+        s.scroll(Scroll::Top);
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Should be able to easily clear active area only
+        s.clear_rows(act(0, 0), None, false);
+        assert_eq!("1ABCD", dump(&s, Tag::Viewport));
+
+        // Scrolling to the bottom
+        s.scroll(Scroll::Active);
+        assert_eq!("", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrollback_with_multi_row_delta() {
+        let mut s = init(10, 3, Some(3));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH\n6IJKL").unwrap();
+
+        // Scroll to top
+        s.scroll(Scroll::Top);
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scroll down multiple
+        s.scroll(Scroll::DeltaRow(5));
+        assert!(s.pages.viewport == Viewport::Active);
+        assert_eq!("4ABCD\n5EFGH\n6IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrollback_empty() {
+        let mut s = init(10, 3, Some(50));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.scroll(Scroll::DeltaRow(1));
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrollback_doesnt_move_viewport_if_not_at_bottom() {
+        let mut s = init(10, 3, Some(3));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH").unwrap();
+
+        // First test: we scroll up by 1, so we're not at the bottom anymore.
+        s.scroll(Scroll::DeltaRow(-1));
+        assert_eq!("2EFGH\n3IJKL\n4ABCD", dump(&s, Tag::Viewport));
+
+        // Next, we scroll back down by 1, this grows the scrollback but we
+        // shouldn't move.
+        s.cursor_down_scroll().unwrap();
+        assert_eq!("2EFGH\n3IJKL\n4ABCD", dump(&s, Tag::Viewport));
+
+        // Scroll again, this clears scrollback so we should move viewports
+        // but still see the same thing since our original view fits.
+        s.cursor_down_scroll().unwrap();
+        assert_eq!("2EFGH\n3IJKL\n4ABCD", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_scrolling_moves_selection() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let cols = s.pages.cols;
+        let sel = Selection::init(pin(&s, act(0, 1)), pin(&s, act(cols - 1, 1)), false);
+        s.select(Some(sel)).unwrap();
+
+        // Scroll down, should still be bottom
+        s.cursor_down_scroll().unwrap();
+
+        // Our selection should've moved up
+        {
+            let sel = s.selection.unwrap();
+            assert_eq!(act(0, 0), pfp(&s, Tag::Active, sel.start()).unwrap());
+            assert_eq!(act(cols - 1, 0), pfp(&s, Tag::Active, sel.end()).unwrap());
+        }
+
+        // Test our contents rotated
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scrolling to the bottom does nothing
+        s.scroll(Scroll::Active);
+
+        // Our selection should've stayed the same
+        {
+            let sel = s.selection.unwrap();
+            assert_eq!(act(0, 0), pfp(&s, Tag::Active, sel.start()).unwrap());
+            assert_eq!(act(cols - 1, 0), pfp(&s, Tag::Active, sel.end()).unwrap());
+        }
+
+        // Test our contents rotated
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Scroll up again
+        s.cursor_down_scroll().unwrap();
+
+        // Test our contents rotated
+        assert_eq!("3IJKL", dump(&s, Tag::Viewport));
+
+        // Our selection should be null because it left the screen.
+        {
+            let sel = s.selection.unwrap();
+            assert!(pfp(&s, Tag::Active, sel.start()).is_none());
+            assert!(pfp(&s, Tag::Active, sel.end()).is_none());
+        }
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_simple() {
+        let mut s = init(5, 5, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST").unwrap();
+
+        // Scroll a region ending at row 2 (zero-indexed) up by one. This
+        // emulates a scroll region of rows 0-2 with the cursor at the
+        // region bottom.
+        s.cursor_absolute(1, 2);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        // The cursor stays in place, on the new blank row.
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        // Rows in the region scrolled, rows below are unchanged, and
+        // nothing was moved into scrollback.
+        assert_eq!("2EFGH\n3IJKL\n\n4MNOP\n5QRST", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_renews_page_generation() {
+        let mut s = init(5, 5, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST").unwrap();
+        s.cursor_absolute(0, 2);
+
+        let node = cp(&s).node;
+        let serial = nd(node).serial;
+        s.cursor_scroll_region_up(2).unwrap();
+
+        assert!(!s.pages.node_is_valid(node, serial));
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_moves_selection() {
+        let mut s = init(5, 5, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4MNOP\n5QRST").unwrap();
+
+        // Select the second row.
+        let cols = s.pages.cols;
+        let sel = Selection::init(pin(&s, act(0, 1)), pin(&s, act(cols - 1, 1)), false);
+        s.select(Some(sel)).unwrap();
+
+        s.cursor_absolute(0, 2);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        // Our selection should've moved up with its row.
+        {
+            let sel = s.selection.unwrap();
+            assert_eq!(act(0, 0), pfp(&s, Tag::Active, sel.start()).unwrap());
+            assert_eq!(act(cols - 1, 0), pfp(&s, Tag::Active, sel.end()).unwrap());
+        }
+
+        assert_eq!("2EFGH\n3IJKL\n\n4MNOP\n5QRST", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_region_spans_pages() {
+        let mut s = init(10, 5, Some(10));
+
+        // We need to get the cursor to a new page
+        fill_first_page(&mut s, 3);
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+
+        // Move the cursor to the first row of the second page and give it
+        // a non-default style. This is important: it verifies that the
+        // cursor's style ref stays accounted on the correct page even
+        // though eraseRowBounded moves the cursor's tracked pin across
+        // the page boundary.
+        s.cursor_absolute(0, 3);
+        s.set_attribute(bold()).unwrap();
+        assert!(cp(&s).node == last(&s));
+        assert_eq!(0, cp(&s).y);
+
+        // Scroll a region of active rows 1-3 with the cursor at the region
+        // bottom. The region spans the page boundary so this exercises the
+        // slow path.
+        s.cursor_scroll_region_up(2).unwrap();
+
+        // The cursor stays in place, on the new blank row.
+        assert_eq!(0, s.cursor.x);
+        assert_eq!(3, s.cursor.y);
+
+        assert_eq!("1A\n3C\n4D\n\n5E", dump(&s, Tag::Viewport));
+
+        // Our cursor style must remain usable: write a styled cell and
+        // verify the style ref counting is intact on the cursor's page.
+        s.test_write_string("X").unwrap();
+        assert_eq!(1, cpage(&s).styles.count());
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_region_spans_pages_with_background_sgr() {
+        let mut s = init(10, 5, Some(10));
+
+        // We need to get the cursor to a new page. See the previous test
+        // for a diagram of the page layout.
+        fill_first_page(&mut s, 3);
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+
+        s.cursor_absolute(0, 3);
+        s.set_attribute(bg_rgb(0xFF, 0, 0)).unwrap();
+        assert!(cp(&s).node == last(&s));
+        assert_eq!(0, cp(&s).y);
+
+        s.cursor_scroll_region_up(2).unwrap();
+
+        assert_eq!("1A\n3C\n4D\n\n5E", dump(&s, Tag::Viewport));
+
+        // The new blank row must be filled with our background color.
+        for x in 0..s.pages.cols {
+            let cell = get_cell(&s, act(x, 3));
+            assert!(cell.content_tag() == ContentTag::BgColorRgb);
+            assert_eq!(rgb(0xFF, 0, 0), cell.content_color_rgb());
+        }
+    }
+
+    #[test]
+    fn screen_cursor_scroll_region_up_with_styled_erased_row() {
+        let mut s = init(5, 3, Some(0));
+
+        // Write a styled row at the top so the erased row has managed
+        // memory that must be released.
+        s.set_attribute(bold()).unwrap();
+        s.test_write_string("1ABCD").unwrap();
+        s.set_attribute(sgr::Attribute::Unset).unwrap();
+        s.test_write_string("\n2EFGH\n3IJKL").unwrap();
+
+        s.cursor_absolute(0, 2);
+        s.cursor_scroll_region_up(2).unwrap();
+
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Screen));
+
+        // The style should be gone from the page since the only user
+        // was the erased row.
+        assert_eq!(0, cpage(&s).styles.count());
+    }
+
+    #[test]
+    fn screen_scrolling_moves_viewport() {
+        let mut s = init(10, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n").unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.scroll(Scroll::DeltaRow(-2));
+
+        // Test our contents rotated
+        assert_eq!("2EFGH\n3IJKL\n1ABCD", dump(&s, Tag::Viewport));
+
+        assert_eq!(
+            Some(scr(0, 1)),
+            pfp(&s, Tag::Screen, s.pages.get_top_left(Tag::Viewport))
+        );
+    }
+
+    #[test]
+    fn screen_scrolling_when_viewport_is_pruned() {
+        let mut s = init(215, 3, Some(1));
+
+        // Write some to create scrollback and move back into our scrollback.
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n").unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.scroll(Scroll::DeltaRow(-2));
+
+        // Our viewport is now somewhere pinned. Create so much scrollback
+        // that we prune it.
+        s.test_write_string("\n").unwrap();
+        for _ in 0..1000 {
+            s.test_write_string("1ABCD\n2EFGH\n3IJKL\n").unwrap();
+        }
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        assert_eq!(
+            Some(scr(0, 0)),
+            pfp(&s, Tag::Screen, s.pages.get_top_left(Tag::Viewport))
+        );
+    }
+
+    #[test]
+    fn screen_scroll_and_clear_full_screen() {
+        let mut s = init(10, 3, Some(5));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        s.scroll_clear().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_scroll_and_clear_partial_screen() {
+        let mut s = init(10, 3, Some(5));
+        s.test_write_string("1ABCD\n2EFGH").unwrap();
+
+        assert_eq!("1ABCD\n2EFGH", dump(&s, Tag::Viewport));
+
+        s.scroll_clear().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+        assert_eq!("1ABCD\n2EFGH", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_scroll_and_clear_empty_screen() {
+        let mut s = init(10, 3, Some(5));
+        s.scroll_clear().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+        assert_eq!("", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_scroll_and_clear_ignore_blank_lines() {
+        let mut s = init(10, 3, Some(10));
+        s.test_write_string("1ABCD\n2EFGH").unwrap();
+        s.scroll_clear().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+
+        // Move back to top-left
+        s.cursor_absolute(0, 0);
+
+        // Write and clear
+        s.test_write_string("3ABCD\n").unwrap();
+        assert_eq!("3ABCD", dump(&s, Tag::Active));
+
+        s.scroll_clear().unwrap();
+        assert_eq!("", dump(&s, Tag::Viewport));
+
+        // Move back to top-left
+        s.cursor_absolute(0, 0);
+        s.test_write_string("X").unwrap();
+
+        assert_eq!("1ABCD\n2EFGH\n3ABCD\nX", dump(&s, Tag::Screen));
+    }
+
+    fn assert_bg155(s: &Screen, pt: Point) {
+        let cell = get_cell(s, pt);
+        assert!(cell.content_tag() == ContentTag::BgColorRgb);
+        assert_eq!(rgb(155, 0, 0), cell.content_color_rgb());
+    }
+
+    #[test]
+    fn screen_scroll_above_same_page() {
+        let mut s = init(10, 3, Some(10));
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        // At this point:
+        //  +-------------+ ACTIVE
+        //   +----------+ : = PAGE 0
+        // 0 |1ABCD00000| | 0
+        // 1 |2EFGH00000| | 1
+        //   :^         : : = PIN 0
+        // 2 |3IJKL00000| | 2
+        //   +----------+ :
+        //  +-------------+
+
+        let node = cp(&s).node;
+        let serial = nd(node).serial;
+        s.cursor_scroll_above().unwrap();
+        assert!(!s.pages.node_is_valid(node, serial));
+
+        //   +----------+ = PAGE 0
+        // 0 |1ABCD00000|
+        //  +-------------+ ACTIVE
+        // 1 |2EFGH00000| | 0
+        // 2 |          | | 1
+        //   :^         : : = PIN 0
+        // 3 |3IJKL00000| | 2
+        //   +----------+ :
+        //  +-------------+
+
+        assert_eq!("2EFGH\n\n3IJKL", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0 row 1 (active row 0) is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // Page 0 row 2 (active row 1) is dirty because it was cleared.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        // Page 0 row 3 (active row 2) is dirty because it's new.
+        assert!(s.pages.is_dirty(act(0, 2)));
+    }
+
+    #[test]
+    fn screen_scroll_above_same_page_but_cursor_on_previous_page() {
+        let mut s = init(10, 5, Some(10));
+
+        // We need to get the cursor to a new page
+        fill_first_page(&mut s, 3);
+
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        // Ensure we're still on the first page and have a second
+        assert!(cp(&s).node == first(&s));
+        assert!(nd(first(&s)).next.is_some());
+
+        let first_node = first(&s);
+        let second_node = nd(first_node).next.unwrap();
+        let first_serial = nd(first_node).serial;
+        let second_serial = nd(second_node).serial;
+        s.cursor_scroll_above().unwrap();
+        assert!(!s.pages.node_is_valid(first_node, first_serial));
+        assert!(!s.pages.node_is_valid(second_node, second_serial));
+
+        assert_eq!("2B\n\n3C\n4D\n5E", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0's penultimate row is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // The rest of the rows are dirty because they've been modified or are new.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        assert!(s.pages.is_dirty(act(0, 2)));
+        assert!(s.pages.is_dirty(act(0, 3)));
+        assert!(s.pages.is_dirty(act(0, 4)));
+    }
+
+    #[test]
+    fn screen_scroll_above_same_page_but_cursor_on_previous_page_last_row() {
+        let mut s = init(10, 5, Some(10));
+
+        // We need to get the cursor to a new page
+        fill_first_page(&mut s, 2);
+
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        // Ensure we're still on the first page and have a second
+        assert!(cp(&s).node == first(&s));
+        assert!(nd(first(&s)).next.is_some());
+
+        s.cursor_scroll_above().unwrap();
+
+        assert_eq!("2B\n\n3C\n4D\n5E", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0's final row is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // Page 1's rows are all dirty because every row was moved.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        assert!(s.pages.is_dirty(act(0, 2)));
+        assert!(s.pages.is_dirty(act(0, 3)));
+        assert!(s.pages.is_dirty(act(0, 4)));
+
+        // Attempt to clear the style from the cursor and
+        // then assert the integrity of both of our pages.
+        //
+        // This catches a case of memory corruption where the cursor
+        // is moved between pages without accounting for style refs.
+        s.set_attribute(sgr::Attribute::ResetBg).unwrap();
+        pg(first(&s)).assert_integrity();
+        pg(last(&s)).assert_integrity();
+    }
+
+    #[test]
+    fn screen_scroll_above_creates_new_page() {
+        let mut s = init(10, 3, Some(10));
+
+        // We need to get the cursor to a new page
+        fill_first_page(&mut s, 3);
+
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        // Ensure we're still on the first page
+        assert!(cp(&s).node == first(&s));
+
+        let node = first(&s);
+        let serial = nd(node).serial;
+        s.cursor_scroll_above().unwrap();
+        assert!(!s.pages.node_is_valid(node, serial));
+
+        assert_eq!("2EFGH\n\n3IJKL", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0's penultimate row is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // Page 0's final row is dirty because it was cleared.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        // Page 1's row is dirty because it's new.
+        assert!(s.pages.is_dirty(act(0, 2)));
+    }
+
+    #[test]
+    fn screen_scroll_above_with_cursor_on_non_final_row() {
+        let mut s = init(10, 4, Some(10));
+
+        // Get the cursor to be 2 rows above a new page
+        fill_first_page(&mut s, 3);
+
+        // Write 3 lines of text, forcing the last line into the first
+        // row of a new page. Move our cursor onto the previous page.
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1AB\n2BC\n3DE\n4FG").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        // Ensure we're still on the first page. So our cursor is on the first
+        // page but we have two pages of data.
+        assert!(cp(&s).node == first(&s));
+
+        s.cursor_scroll_above().unwrap();
+
+        assert_eq!("2BC\n\n3DE\n4FG", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0's penultimate row is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // Page 0's final row is dirty because it was cleared.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        // Page 1's row is dirty because it's new.
+        assert!(s.pages.is_dirty(act(0, 2)));
+    }
+
+    #[test]
+    fn screen_scroll_above_no_scrollback_bottom_of_page() {
+        let mut s = init(10, 3, Some(0));
+
+        fill_first_page(&mut s, 3);
+
+        s.set_attribute(bg_rgb(155, 0, 0)).unwrap();
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+        s.cursor_absolute(0, 1);
+        s.pages.clear_dirty();
+
+        s.cursor_scroll_above().unwrap();
+
+        assert_eq!("2EFGH\n\n3IJKL", dump(&s, Tag::Viewport));
+        assert_bg155(&s, act(0, 1));
+
+        // Page 0 row 1 (active row 0) is dirty because the cursor moved off of it.
+        assert!(s.pages.is_dirty(act(0, 0)));
+        // Page 0 row 2 (active row 1) is dirty because it was cleared.
+        assert!(s.pages.is_dirty(act(0, 1)));
+        // Page 0 row 3 (active row 2) is dirty because it is new.
+        assert!(s.pages.is_dirty(act(0, 2)));
+    }
+
+    /// Check that every hyperlink-flagged cell resolves to a map entry.
+    fn assert_hyperlinks_resolve(s: &Screen) {
+        let mut node_ = s.pages.pages.first;
+        while let Some(node) = node_ {
+            let page = pg(node);
+            page.assert_integrity();
+            for y in 0..page.size.rows as usize {
+                let row = rw(page.get_row(y));
+                if !row.hyperlink() {
+                    continue;
+                }
+                for cell in row_cells(page, row).iter() {
+                    if !cell.hyperlink() {
+                        continue;
+                    }
+                    assert!(page.lookup_hyperlink(cell).is_some());
+                }
+            }
+            node_ = nd(node).next;
+        }
+    }
+
+    #[test]
+    fn screen_scroll_above_hyperlink_dense_row_to_fresh_page() {
+        // Regression test for https://github.com/ghostty-org/ghostty/discussions/13160
+        //
+        // When a scroll-above operation pushes a row carrying more unique
+        // hyperlinks than a fresh page's default hyperlink capacity across
+        // a page boundary, the cross-page row clone must increase the
+        // destination page's capacity (like insertLines/deleteLines do)
+        // rather than error out mid-operation, which leaves the page list
+        // half-mutated and aborts later (e.g. in clearCells).
+        let mut s = init(10, 5, Some(10000));
+
+        // Fill the first page so it is exactly full and the cursor is on
+        // its last row (which is also the bottom row of the active area).
+        // The next grow() will then allocate a fresh page.
+        fill_first_page(&mut s, 1);
+        assert!(s.pages.pages.first == s.pages.pages.last);
+        assert_eq!(nd(first(&s)).capacity().rows, pg(first(&s)).size.rows);
+        assert_eq!(s.pages.rows - 1, s.cursor.y);
+
+        // Fill the bottom row with unique hyperlinks: more than a fresh
+        // page can hold with default hyperlink capacity.
+        for i in 0..s.pages.cols {
+            let uri = format!("http://example.com/{i}");
+            s.start_hyperlink(uri.as_bytes(), None).unwrap();
+            s.test_write_string("A").unwrap();
+            s.end_hyperlink();
+        }
+        assert_eq!(s.pages.cols as usize, cpage(&s).hyperlink_set.count());
+
+        // Move the cursor above the bottom row and scroll. The dense row is
+        // pushed across the page boundary into the freshly allocated page.
+        s.cursor_absolute(0, 1);
+        s.cursor_scroll_above().unwrap();
+
+        // We must have created a second page and the dense row must now be
+        // the top row of that page.
+        assert!(s.pages.pages.first != s.pages.pages.last);
+
+        // All hyperlinks must have survived the scroll intact: every cell
+        // flagged as a hyperlink must resolve to a real entry in its page's
+        // hyperlink map. A half-applied scroll leaves cells whose hyperlink
+        // flag is set but that have no map entry, which aborts in
+        // clearCells later.
+        assert_hyperlinks_resolve(&s);
+        assert_eq!(s.pages.cols as usize, pg(last(&s)).hyperlink_set.count());
+
+        // The dense row is still the bottom row of the active area.
+        for x in 0..s.pages.cols {
+            let list_cell = s.pages.get_cell(act(x, 4)).unwrap();
+            let cell = unsafe { &*list_cell.cell };
+            assert!(cell.hyperlink());
+            let page = pg(list_cell.node);
+            let id = page.lookup_hyperlink(cell).unwrap();
+            let link = unsafe { *page.hyperlink_set.get(page.memory, id) };
+            let expected = format!("http://example.com/{x}");
+            assert_eq!(expected.as_bytes(), unsafe { link.uri.slice(page.memory) });
+        }
+    }
+
+    #[test]
+    fn screen_scroll_above_hyperlink_dense_row_to_existing_page() {
+        // Same as the fresh page variant above but the destination page
+        // already exists (fresh_node == null path in cursorScrollAboveRotate).
+        let mut s = init(10, 5, Some(10000));
+
+        // Fill the first page so it is exactly full and the cursor is on
+        // its last row.
+        fill_first_page(&mut s, 1);
+        assert_eq!(s.pages.rows - 1, s.cursor.y);
+
+        // Fill the last row of the first page with unique hyperlinks:
+        // more than a page can hold with default hyperlink capacity.
+        for i in 0..s.pages.cols {
+            let uri = format!("http://example.com/{i}");
+            s.start_hyperlink(uri.as_bytes(), None).unwrap();
+            s.test_write_string("A").unwrap();
+            s.end_hyperlink();
+        }
+
+        // Scroll twice so the active area straddles the page boundary:
+        // the last two active rows are on a second page while the dense
+        // row remains the last row of the first page.
+        s.test_write_string("\n\n").unwrap();
+        assert!(s.pages.pages.first != s.pages.pages.last);
+        assert!(cp(&s).node == last(&s));
+
+        // Move the cursor to an active row that is still on the first page
+        // and above the dense row, then scroll. grow() has capacity in the
+        // last page so no fresh page is allocated, but the dense row still
+        // crosses the page boundary during the rotate.
+        s.cursor_absolute(0, 0);
+        assert!(cp(&s).node == first(&s));
+        s.cursor_scroll_above().unwrap();
+
+        // All hyperlinks must have survived the scroll intact: every cell
+        // flagged as a hyperlink must resolve to a real entry in its page's
+        // hyperlink map.
+        assert_hyperlinks_resolve(&s);
+        assert_eq!(s.pages.cols as usize, pg(last(&s)).hyperlink_set.count());
+    }
+
+    fn act_y(y: u32) -> Point {
+        act(0, y)
+    }
+
+    #[test]
+    fn screen_clone() {
+        let mut s = init(10, 3, Some(10));
+        s.test_write_string("1ABCD\n2EFGH").unwrap();
+        assert_eq!("1ABCD\n2EFGH", dump(&s, Tag::Active));
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        // Clone
+        let s2 = s.clone(act(0, 0), None).unwrap();
+        assert_eq!("1ABCD\n2EFGH", dump(&s2, Tag::Active));
+        assert_eq!(5, s2.cursor.x);
+        assert_eq!(1, s2.cursor.y);
+
+        // Write to s1, should not be in s2
+        s.test_write_string("\n34567").unwrap();
+        assert_eq!("1ABCD\n2EFGH\n34567", dump(&s, Tag::Active));
+        assert_eq!("1ABCD\n2EFGH", dump(&s2, Tag::Active));
+        assert_eq!(5, s2.cursor.x);
+        assert_eq!(1, s2.cursor.y);
+    }
+
+    #[test]
+    fn screen_clone_partial() {
+        let mut s = init(10, 3, Some(10));
+        s.test_write_string("1ABCD\n2EFGH").unwrap();
+        assert_eq!("1ABCD\n2EFGH", dump(&s, Tag::Active));
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        // Clone
+        let s2 = s.clone(act_y(1), None).unwrap();
+        assert_eq!("2EFGH", dump(&s2, Tag::Active));
+
+        // Cursor is shifted since we cloned partial
+        assert_eq!(5, s2.cursor.x);
+        assert_eq!(0, s2.cursor.y);
+    }
+
+    #[test]
+    fn screen_clone_partial_cursor_out_of_bounds() {
+        let mut s = init(10, 3, Some(10));
+        s.test_write_string("1ABCD\n2EFGH").unwrap();
+        assert_eq!("1ABCD\n2EFGH", dump(&s, Tag::Active));
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        // Clone
+        let s2 = s.clone(act_y(0), Some(act_y(0))).unwrap();
+        assert_eq!("1ABCD", dump(&s2, Tag::Active));
+
+        // Cursor is shifted since we cloned partial
+        assert_eq!(0, s2.cursor.x);
+        assert_eq!(0, s2.cursor.y);
+    }
+
+    #[test]
+    fn screen_clone_contains_full_selection() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let cols = s.pages.cols;
+        let sel = sel_init(&s, act(0, 1), act(cols - 1, 1), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act(0, 0), None).unwrap();
+
+        // Our selection should remain valid
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(0, 1), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(s2.pages.cols - 1, 1), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_contains_none_of_selection() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let cols = s.pages.cols;
+        let sel = sel_init(&s, act(0, 0), act(cols - 1, 0), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(1), None).unwrap();
+
+        // Our selection should be null
+        assert!(s2.selection.is_none());
+    }
+
+    #[test]
+    fn screen_clone_contains_selection_start_cutoff() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let cols = s.pages.cols;
+        let sel = sel_init(&s, act(0, 0), act(cols - 1, 1), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(1), None).unwrap();
+
+        // Our selection should remain valid
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(0, 0), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(s2.pages.cols - 1, 0), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_contains_selection_end_cutoff() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let sel = sel_init(&s, act(0, 1), act(2, 2), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(0), Some(act_y(1))).unwrap();
+
+        // Our selection should remain valid
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(0, 1), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(s2.pages.cols - 1, 2), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_contains_selection_end_cutoff_reversed() {
+        let mut s = init(5, 3, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        // Select a single line
+        let sel = sel_init(&s, act(2, 2), act(0, 1), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(0), Some(act_y(1))).unwrap();
+
+        // Our selection should remain valid
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(0, 1), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(s2.pages.cols - 1, 2), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_contains_subset_of_selection() {
+        let mut s = init(5, 4, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4ABCD").unwrap();
+
+        // Select the full screen
+        let sel = sel_init(&s, act(0, 0), act(0, 3), false);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(1), Some(act_y(2))).unwrap();
+
+        // Our selection should remain valid
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(0, 0), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(s2.pages.cols - 1, 3), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_clamps_clipped_selections_to_mixed_width_pages() {
+        let mut s = init(4, 3, Some(0));
+
+        let f = first(&s);
+        let mut p = Pin::new(f);
+        p.y = 2;
+        s.pages.split(p).unwrap();
+        p.y = 1;
+        s.pages.split(p).unwrap();
+        let middle = nd(f).next.unwrap();
+        let l = nd(middle).next.unwrap();
+        pg(middle).size.cols = 2;
+
+        let mut end = Pin::new(l);
+        end.x = 3;
+        s.select(Some(Selection::init(Pin::new(f), end, false))).unwrap();
+        let linear = s.clone(scr(0, 0), Some(scr(0, 1))).unwrap();
+        let linear_end = linear.selection.unwrap().end();
+        let _ = linear_end.row_and_cell();
+        assert_eq!(1, linear_end.x);
+
+        let mut start = Pin::new(f);
+        start.x = 3;
+        s.select(Some(Selection::init(start, end, true))).unwrap();
+        let rectangle = s.clone(scr(0, 1), None).unwrap();
+        let rectangle_start = rectangle.selection.unwrap().start();
+        let _ = rectangle_start.row_and_cell();
+        assert_eq!(1, rectangle_start.x);
+    }
+
+    #[test]
+    fn screen_clone_contains_subset_of_rectangle_selection() {
+        let mut s = init(5, 4, Some(1));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4ABCD").unwrap();
+
+        // Select the full screen from x=1 to x=3
+        let sel = sel_init(&s, act(1, 0), act(3, 3), true);
+        s.select(Some(sel)).unwrap();
+
+        // Clone
+        let s2 = s.clone(act_y(1), Some(act_y(2))).unwrap();
+
+        // Our selection should remain valid and be properly clipped
+        // preserving the columns of the start and end points of the
+        // selection.
+        let sel = s2.selection.unwrap();
+        assert_eq!(act(1, 0), pfp(&s2, Tag::Active, sel.start()).unwrap());
+        assert_eq!(act(3, 3), pfp(&s2, Tag::Active, sel.end()).unwrap());
+    }
+
+    #[test]
+    fn screen_clone_basic() {
+        let mut s = init(10, 3, Some(0));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL").unwrap();
+
+        {
+            let s2 = s.clone(act_y(1), Some(act_y(1))).unwrap();
+
+            // Test our contents rotated
+            assert_eq!("2EFGH", dump(&s2, Tag::Active));
+        }
+
+        {
+            let s2 = s.clone(act_y(1), Some(act_y(2))).unwrap();
+
+            // Test our contents rotated
+            assert_eq!("2EFGH\n3IJKL", dump(&s2, Tag::Active));
+        }
+    }
+
+    #[test]
+    fn screen_clone_empty_viewport() {
+        let s = init(10, 3, Some(0));
+
+        let s2 = s.clone(vp(0, 0), Some(vp(0, 0))).unwrap();
+
+        // Test our contents rotated
+        assert_eq!("", dump(&s2, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_clone_one_line_viewport() {
+        let mut s = init(10, 3, Some(0));
+        s.test_write_string("1ABC").unwrap();
+
+        let s2 = s.clone(vp(0, 0), Some(vp(0, 0))).unwrap();
+
+        // Test our contents
+        assert_eq!("1ABC", dump(&s2, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_clone_empty_active() {
+        let s = init(10, 3, Some(0));
+
+        let s2 = s.clone(act_y(0), Some(act_y(0))).unwrap();
+
+        // Test our contents rotated
+        assert_eq!("", dump(&s2, Tag::Active));
+    }
+
+    #[test]
+    fn screen_clone_one_line_active_with_extra_space() {
+        let mut s = init(10, 3, Some(0));
+        s.test_write_string("1ABC").unwrap();
+
+        let s2 = s.clone(act_y(0), None).unwrap();
+
+        // Test our contents rotated
+        assert_eq!("1ABC", dump(&s2, Tag::Active));
+    }
+
+    #[test]
+    fn screen_clear_history_with_no_history() {
+        let mut s = init(10, 3, Some(3));
+        s.test_write_string("4ABCD\n5EFGH\n6IJKL").unwrap();
+        assert!(s.pages.viewport == Viewport::Active);
+        s.erase_history(None);
+        assert!(s.pages.viewport == Viewport::Active);
+        assert_eq!("4ABCD\n5EFGH\n6IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("4ABCD\n5EFGH\n6IJKL", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_clear_history() {
+        let mut s = init(10, 3, Some(3));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH\n6IJKL").unwrap();
+        assert!(s.pages.viewport == Viewport::Active);
+
+        // Scroll to top
+        s.scroll(Scroll::Top);
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        s.erase_history(None);
+        assert!(s.pages.viewport == Viewport::Active);
+        assert_eq!("4ABCD\n5EFGH\n6IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("4ABCD\n5EFGH\n6IJKL", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_clear_above_cursor() {
+        let mut s = init(10, 10, Some(3));
+        s.test_write_string("4ABCD\n5EFGH\n6IJKL").unwrap();
+        let y = s.cursor.y as u32 - 1;
+        s.clear_rows(act_y(0), Some(act_y(y)), false);
+        assert_eq!("\n\n6IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("\n\n6IJKL", dump(&s, Tag::Screen));
+
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_clear_above_cursor_with_history() {
+        let mut s = init(10, 3, Some(3));
+        s.test_write_string("1ABCD\n2EFGH\n3IJKL\n").unwrap();
+        s.test_write_string("4ABCD\n5EFGH\n6IJKL").unwrap();
+        let y = s.cursor.y as u32 - 1;
+        s.clear_rows(act_y(0), Some(act_y(y)), false);
+        assert_eq!("\n\n6IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("1ABCD\n2EFGH\n3IJKL\n\n\n6IJKL", dump(&s, Tag::Screen));
+
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+    }
+
+    fn resize_opts(s: &mut Screen, cols: CellCountInt, rows: CellCountInt, reflow: bool, pull_scrollback: bool) {
+        s.resize(Resize {
+            cols,
+            rows,
+            reflow,
+            pull_scrollback,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    /// Write only a background color into the remaining rows.
+    fn write_bg_rows(s: &mut Screen) {
+        for y in 1..s.pages.rows as u32 {
+            let list_cell = s.pages.get_cell(act(0, y)).unwrap();
+            let mut c = Cell::default();
+            c.set_content_tag(ContentTag::BgColorRgb);
+            c.set_content_color_rgb(rgb(0xFF, 0, 0));
+            unsafe { *list_cell.cell = c };
+        }
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_rows() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Resize
+        resize(&mut s, 10, 10, false);
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_less_rows() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+        resize(&mut s, 10, 2, false);
+
+        // Since we shrunk, we should adjust our cursor
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!("2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_less_rows_trims_blank_lines() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD";
+        s.test_write_string(str_).unwrap();
+
+        // Write only a background color into the remaining rows
+        write_bg_rows(&mut s);
+
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 6, 2, false);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!("1ABCD", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_rows_trims_blank_lines() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD";
+        s.test_write_string(str_).unwrap();
+
+        // Write only a background color into the remaining rows
+        write_bg_rows(&mut s);
+
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 10, 7, false);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!("1ABCD", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_cols() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 20, 3, false);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_less_cols() {
+        let mut s = init(10, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 4, 3, false);
+
+        assert_eq!("1ABC\n2EFG\n3IJK", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_rows_with_scrollback_cursor_end() {
+        let mut s = init(7, 3, Some(2));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 7, 10, false);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_rows_no_scrollback_pull() {
+        let mut s = init(7, 3, Some(2));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+
+        // Cursor is at the bottom so this would normally pull scrollback.
+        assert_eq!(2, s.cursor.y);
+        resize_opts(&mut s, 7, 10, false, false);
+        assert_eq!(2, s.cursor.y);
+
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Active));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_no_scrollback_pull() {
+        let mut s = init(5, 3, Some(2));
+        s.test_write_string("1AAAA\n2BBBB\n3CCCCDD\n4E").unwrap();
+        assert_eq!("3CCCC\nDD\n4E", dump(&s, Tag::Active));
+
+        // The wrapped line in the active area unwraps, freeing up a row. This
+        // would normally pull "2BBBB" back but we should get a blank row at
+        // the bottom instead.
+        resize_opts(&mut s, 10, 3, true, false);
+        assert_eq!(2, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!("3CCCCDD\n4E", dump(&s, Tag::Active));
+        assert_eq!("1AAAA\n2BBBB\n3CCCCDD\n4E", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_no_scrollback_pull_wrap_straddles_scrollback() {
+        let mut s = init(5, 3, Some(2));
+        s.test_write_string("1AAAA\n2BBBBXX\n3C\n4D").unwrap();
+        assert_eq!("XX\n3C\n4D", dump(&s, Tag::Active));
+
+        // The line isn't fully in scrollback so it is allowed to unwrap
+        // back into view, but nothing above it is.
+        resize_opts(&mut s, 10, 3, true, false);
+        assert_eq!(2, s.cursor.y);
+
+        assert_eq!("2BBBBXX\n3C\n4D", dump(&s, Tag::Active));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_and_rows_no_scrollback_pull() {
+        let mut s = init(5, 3, Some(2));
+        s.test_write_string("1AAAA\n2BBBB\n3CCCCDD\n4E").unwrap();
+
+        resize_opts(&mut s, 10, 5, true, false);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!("3CCCCDD\n4E", dump(&s, Tag::Active));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_no_scrollback_pull() {
+        let mut s = init(10, 3, Some(2));
+        s.test_write_string("0Z\n1AAAA\n2BBBBXX\n3C").unwrap();
+
+        // Wrapping needs more rows than we have so the top of the active
+        // area still scrolls off as usual.
+        resize_opts(&mut s, 5, 3, true, false);
+        assert_eq!(2, s.cursor.y);
+
+        assert_eq!("2BBBB\nXX\n3C", dump(&s, Tag::Active));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_less_rows_with_scrollback() {
+        let mut s = init(7, 3, Some(2));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 7, 2, false);
+
+        assert_eq!("4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1030
+    #[test]
+    fn screen_resize_no_reflow_less_rows_with_empty_trailing() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1\n2\n3\n4\n5\n6\n7\n8";
+        s.test_write_string(str_).unwrap();
+        s.scroll_clear().unwrap();
+        s.cursor_absolute(0, 0);
+        s.test_write_string("A\nB").unwrap();
+
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 5, 2, false);
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!("A\nB", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_no_reflow_more_rows_with_soft_wrapping() {
+        let mut s = init(2, 3, Some(3));
+        let str_ = "1A2B\n3C4E\n5F6G";
+        s.test_write_string(str_).unwrap();
+
+        // Every second row should be wrapped
+        for y in 0..6u32 {
+            let row = get_row(&s, scr(0, y));
+            let wrapped = y % 2 == 0;
+            assert_eq!(wrapped, row.wrap());
+        }
+
+        // Resize
+        resize(&mut s, 2, 10, false);
+        assert_eq!("1A\n2B\n3C\n4E\n5F\n6G", dump(&s, Tag::Viewport));
+
+        // Every second row should be wrapped
+        for y in 0..6u32 {
+            let row = get_row(&s, scr(0, y));
+            let wrapped = y % 2 == 0;
+            assert_eq!(wrapped, row.wrap());
+        }
+    }
+
+    #[test]
+    fn screen_resize_more_rows_no_scrollback() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 5, 10, true);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_more_rows_with_empty_scrollback() {
+        let mut s = init(5, 3, Some(10));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 5, 10, true);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    fn cursor_cp(s: &Screen) -> u32 {
+        get_cell(s, act(s.cursor.x, s.cursor.y as u32)).content_codepoint()
+    }
+
+    #[test]
+    fn screen_resize_more_rows_with_populated_scrollback() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+
+        // Set our cursor to be on the "4"
+        s.cursor_absolute(0, 1);
+        s.cursor.pending_wrap = false;
+        assert_eq!('4' as u32, cursor_cp(&s));
+
+        // Resize
+        resize(&mut s, 5, 10, true);
+
+        // Cursor should still be on the "4"
+        assert_eq!('4' as u32, cursor_cp(&s));
+
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_no_reflow() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 10, 3, true);
+
+        // Pending wrap becomes the next insertion position.
+        assert!(!s.cursor.pending_wrap);
+        assert_eq!(cx + 1, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/272#issuecomment-1676038963
+    #[test]
+    fn screen_resize_more_cols_perfect_split() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD2EFGH3IJKL";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 10, 3, true);
+
+        assert_eq!("1ABCD2EFGH\n3IJKL", dump(&s, Tag::Screen));
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1159
+    #[test]
+    fn screen_resize_no_reflow_more_cols_with_scrollback_scrolled_up() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1\n2\n3\n4\n5\n6\n7\n8";
+        s.test_write_string(str_).unwrap();
+
+        // Cursor at bottom
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        s.scroll(Scroll::DeltaRow(-4));
+        assert_eq!("2\n3\n4", dump(&s, Tag::Viewport));
+
+        resize(&mut s, 8, 3, true);
+        assert_eq!(str_, dump(&s, Tag::Screen));
+
+        // Cursor remains at bottom
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1159
+    #[test]
+    fn screen_resize_no_reflow_less_cols_with_scrollback_scrolled_up() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1\n2\n3\n4\n5\n6\n7\n8";
+        s.test_write_string(str_).unwrap();
+
+        // Cursor at bottom
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        s.scroll(Scroll::DeltaRow(-4));
+        assert_eq!("2\n3\n4", dump(&s, Tag::Viewport));
+
+        resize(&mut s, 4, 3, true);
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        assert_eq!("6\n7\n8", dump(&s, Tag::Active));
+
+        // Cursor remains at bottom
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        // Old implementation doesn't do this but it makes sense to me:
+        // assert_eq!("2\n3\n4", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_no_reflow_preserves_semantic_prompt() {
+        let mut s = init(5, 3, Some(0));
+
+        // Set one of the rows to be a prompt
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("1ABCD\n").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("2EFGH").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("\n3IJKL").unwrap();
+
+        resize(&mut s, 10, 3, false);
+
+        let expected = "1ABCD\n2EFGH\n3IJKL";
+        assert_eq!(expected, dump(&s, Tag::Viewport));
+        assert_eq!(expected, dump(&s, Tag::Screen));
+
+        // Our one row should still be a semantic prompt, the others should not.
+        assert!(get_row(&s, act(0, 0)).semantic_prompt() == RowSemanticPrompt::None);
+        assert!(get_row(&s, act(0, 1)).semantic_prompt() == RowSemanticPrompt::Prompt);
+        assert!(get_row(&s, act(0, 2)).semantic_prompt() == RowSemanticPrompt::None);
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_reflow_that_fits_full_width() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Verify we soft wrapped
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Let's put our cursor on row 2, where the soft wrap is
+        s.cursor_absolute(0, 1);
+        s.cursor.pending_wrap = false;
+        assert_eq!('2' as u32, cursor_cp(&s));
+
+        // Resize and verify we undid the soft wrap because we have space now
+        resize(&mut s, 10, 3, true);
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+
+        // Our cursor should've moved
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(0, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_reflow_that_ends_in_newline() {
+        let mut s = init(6, 3, Some(0));
+        let str_ = "1ABCD2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Verify we soft wrapped
+        assert_eq!("1ABCD2\nEFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Let's put our cursor on the last row
+        s.cursor_absolute(0, 2);
+        assert_eq!('3' as u32, cursor_cp(&s));
+
+        // Resize and verify we undid the soft wrap because we have space now
+        resize(&mut s, 10, 3, true);
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+
+        // Our cursor should still be on the 3
+        assert_eq!('3' as u32, cursor_cp(&s));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_reflow_that_forces_more_wrapping() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Let's put our cursor on row 2, where the soft wrap is
+        s.cursor_absolute(0, 1);
+        s.cursor.pending_wrap = false;
+        assert_eq!('2' as u32, cursor_cp(&s));
+
+        // Verify we soft wrapped
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Resize and verify we undid the soft wrap because we have space now
+        resize(&mut s, 7, 3, true);
+        assert_eq!("1ABCD2E\nFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Our cursor should've moved
+        assert_eq!(5, s.cursor.x);
+        assert_eq!(0, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_reflow_that_unwraps_multiple_times() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD2EFGH3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Let's put our cursor on row 2, where the soft wrap is
+        s.cursor_absolute(0, 2);
+        s.cursor.pending_wrap = false;
+        assert_eq!('3' as u32, cursor_cp(&s));
+
+        // Verify we soft wrapped
+        assert_eq!("1ABCD\n2EFGH\n3IJKL", dump(&s, Tag::Viewport));
+
+        // Resize and verify we undid the soft wrap because we have space now
+        resize(&mut s, 15, 3, true);
+        assert_eq!("1ABCD2EFGH3IJKL", dump(&s, Tag::Viewport));
+
+        // Our cursor should've moved
+        assert_eq!(10, s.cursor.x);
+        assert_eq!(0, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_populated_scrollback() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD5EFGH";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+
+        // // Set our cursor to be on the "5"
+        s.cursor_absolute(0, 2);
+        s.cursor.pending_wrap = false;
+        assert_eq!('5' as u32, cursor_cp(&s));
+
+        // Resize
+        resize(&mut s, 10, 3, true);
+        assert_eq!("2EFGH\n3IJKL\n4ABCD5EFGH", dump(&s, Tag::Viewport));
+
+        // Cursor should still be on the "5"
+        assert_eq!('5' as u32, cursor_cp(&s));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_bounded_scrollback_keeps_viewport_valid() {
+        // Regression test for issue #12298.
+        //
+        // This needs to live at the Screen layer rather than PageList because the
+        // bad state only appears once Screen forwards the active cursor into the
+        // resize path. A direct PageList resize repro does not hit the same bug.
+        let mut s = init(2, 10, Some(10_000));
+
+        // Build 30 rows of scrollback on top of our 10-row viewport so we have a
+        // 40-row screen with history above the active area.
+        for _ in 0..30 {
+            let _ = s.pages.grow().unwrap();
+        }
+        s.cursor_reload();
+        assert_eq!(40, s.pages.scrollbar().total);
+
+        // Fill the entire screen with two-row wrapped runs:
+        // - even rows mark the end of a wrapped line
+        // - odd rows mark the continuation
+        //
+        // With 2 columns, each logical line occupies two rows. When we grow to 4
+        // columns with reflow enabled, those pairs unwrap back into single rows.
+        // That cuts the total row count down and is what stresses the viewport pin.
+        let it = s.pages.page_iterator(Direction::RightDown, scr(0, 0), None);
+        for chunk in it {
+            let page = pg(chunk.node);
+            for y in chunk.start as usize..chunk.end as usize {
+                let rac = page.get_row_and_cell(0, y);
+                if y % 2 == 0 {
+                    rw(rac.row).set_wrap(true);
+                } else {
+                    rw(rac.row).set_wrap_continuation(true);
+                }
+
+                for x in 0..s.pages.cols as usize {
+                    *cl(page.get_row_and_cell(x, y).cell) = Cell::init('A' as u32);
+                }
+            }
+        }
+
+        // Pin the viewport to a history row just above the active area.
+        //
+        // Before resize:
+        // - total rows = 40
+        // - active area starts at row 30
+        // - viewport is pinned at row 28
+        //
+        // After unwrap during resize:
+        // - total rows shrinks to 20
+        // - the old row 28 remaps into what is now the active area
+        //
+        // The bug was that resize/grow would temporarily keep the viewport as a
+        // history pin even after reflow had moved it into the active area, leaving
+        // fewer than `rows` visible rows beneath the pin and tripping integrity
+        // checks.
+        let p = pin(&s, scr(0, 28));
+        s.pages.scroll(page_list::Scroll::Pin(p));
+        assert!(s.pages.viewport == Viewport::Pin);
+        assert!(s.pages.get_bottom_right(Tag::Viewport).is_some());
+
+        // Growing columns triggers reflow, which unwraps the synthetic wrapped
+        // rows above. This used to panic during the resize path.
+        let rows = s.pages.rows;
+        resize(&mut s, 4, rows, true);
+
+        // After the fix, the viewport is normalized back to the active area as
+        // soon as the pinned row lands there, so viewport queries remain valid.
+        assert_eq!(4, s.pages.cols);
+        assert!(s.pages.scrollbar().total < 40);
+        assert!(s.pages.viewport == Viewport::Active);
+        assert!(s.pages.get_bottom_right(Tag::Viewport).is_some());
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_reflow() {
+        let mut s = init(2, 3, Some(5));
+        let str_ = "1ABC\n2DEF\n3ABC\n4DEF";
+        s.test_write_string(str_).unwrap();
+
+        // Let's put our cursor on row 2, where the soft wrap is
+        s.cursor_absolute(0, 2);
+        s.cursor.pending_wrap = false;
+        assert_eq!('E' as u32, cursor_cp(&s));
+
+        // Verify we soft wrapped
+        assert_eq!("BC\n4D\nEF", dump(&s, Tag::Viewport));
+
+        // Resize and verify we undid the soft wrap because we have space now
+        resize(&mut s, 7, 3, true);
+        assert_eq!("1ABC\n2DEF\n3ABC\n4DEF", dump(&s, Tag::Screen));
+
+        // Our cursor should've moved
+        assert_eq!(2, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+    }
+
+    fn cursor_eql(a: &Cursor, b: &Cursor) -> bool {
+        a.x == b.x
+            && a.y == b.y
+            && a.cursor_style == b.cursor_style
+            && a.pending_wrap == b.pending_wrap
+            && a.protected == b.protected
+            && a.style == b.style
+            && a.style_id == b.style_id
+            && a.hyperlink_id == b.hyperlink_id
+            && a.hyperlink_implicit_id == b.hyperlink_implicit_id
+            && a.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
+                == b.hyperlink.as_ref().map(|h| &**h as *const Hyperlink<'static>)
+            && a.semantic_content == b.semantic_content
+            && a.semantic_content_clear_eol == b.semantic_content_clear_eol
+            && a.page_pin == b.page_pin
+            && a.page_row == b.page_row
+            && a.page_cell == b.page_cell
+    }
+
+    #[test]
+    fn screen_resize_errors_preserve_state() {
+        for tag in [ResizeFailPoint::SavedCursorPin, ResizeFailPoint::Pages] {
+            let tw = &RESIZE_TW;
+
+            let mut s = init(10, 3, Some(0));
+
+            s.cursor_set_semantic_content(SemanticContentUpdate::Prompt(osc_sp::PromptKind::Initial));
+            s.test_write_string("> ").unwrap();
+            s.cursor_set_semantic_content(SemanticContentUpdate::Input(InputClear::ClearExplicit));
+            s.test_write_string("echo").unwrap();
+            s.set_attribute(bold()).unwrap();
+            s.start_hyperlink(b"https://example.com", Some(b"resize")).unwrap();
+            s.saved_cursor = Some(SavedCursor {
+                x: 1,
+                y: 0,
+                style: s.cursor.style,
+                protected: s.cursor.protected,
+                pending_wrap: s.cursor.pending_wrap,
+                origin: false,
+                charset: s.charset,
+            });
+
+            // Keep a shallow copy for all non-page state and a byte-for-byte
+            // copy of the sole page so reference counts and prompt contents are
+            // covered as well.
+            assert_eq!(s.pages.pages.first, s.pages.pages.last);
+            let before_cursor = s.cursor.clone();
+            let before_saved_cursor = s.saved_cursor;
+            let before_selection = s.selection.map(|v| (v.bounds, v.rectangle));
+            let before_charset = s.charset;
+            let before_protected_mode = s.protected_mode;
+            let before_kitty_keyboard = s.kitty_keyboard;
+            let before_semantic_prompt = s.semantic_prompt;
+            let before_dirty = s.dirty;
+            let before_first = s.pages.pages.first;
+            let before_last = s.pages.pages.last;
+            let before_cols = s.pages.cols;
+            let before_rows = s.pages.rows;
+            let before_total_rows = s.pages.total_rows;
+            let before_viewport = s.pages.viewport;
+            let before_viewport_pin = *tp(s.pages.viewport_pin);
+            let before_tracked_pins = s.pages.count_tracked_pins();
+            let before_page: Vec<u8> = unsafe { pg(first(&s)).memory.as_slice() }.to_vec();
+            let before_kitty_dirty = s.kitty_images.dirty;
+
+            tw.error_always(tag, AllocError::OutOfMemory);
+            assert_eq!(
+                Err(AllocError::OutOfMemory),
+                s.resize(Resize {
+                    cols: 20,
+                    rows: 4,
+                    prompt_redraw: osc_sp::Redraw::True,
+                    ..Default::default()
+                })
+            );
+
+            assert!(cursor_eql(&before_cursor, &s.cursor));
+            assert_eq!(before_saved_cursor, s.saved_cursor);
+            assert_eq!(before_selection, s.selection.map(|v| (v.bounds, v.rectangle)));
+            assert_eq!(before_charset, s.charset);
+            assert_eq!(before_protected_mode, s.protected_mode);
+            assert_eq!(before_kitty_keyboard, s.kitty_keyboard);
+            assert_eq!(before_semantic_prompt, s.semantic_prompt);
+            assert_eq!(before_dirty, s.dirty);
+            assert_eq!(before_first, s.pages.pages.first);
+            assert_eq!(before_last, s.pages.pages.last);
+            assert_eq!(before_cols, s.pages.cols);
+            assert_eq!(before_rows, s.pages.rows);
+            assert_eq!(before_total_rows, s.pages.total_rows);
+            assert_eq!(before_viewport, s.pages.viewport);
+            assert_eq!(before_viewport_pin, *tp(s.pages.viewport_pin));
+            assert_eq!(before_tracked_pins, s.pages.count_tracked_pins());
+            assert!(before_page.as_slice() == unsafe { pg(first(&s)).memory.as_slice() });
+            if build_options::KITTY_GRAPHICS {
+                assert_eq!(before_kitty_dirty, s.kitty_images.dirty);
+            }
+
+            tw.end(tripwire::ResetMode::Reset).unwrap();
+        }
+    }
+
+    #[test]
+    fn screen_resize_cursor_references_when_node_survives() {
+        let mut s = init(5, 3, Some(1000));
+
+        s.set_attribute(bold()).unwrap();
+        s.start_hyperlink(b"https://example.com/", Some(b"resize")).unwrap();
+        s.test_write_string("abc").unwrap();
+
+        let original_node = cp(&s).node;
+        let original_serial = nd(original_node).serial;
+        unsafe {
+            let page = pg(original_node);
+            assert_eq!(4, page.styles.ref_count(page.memory, s.cursor.style_id));
+            assert_eq!(4, page.hyperlink_set.ref_count(page.memory, s.cursor.hyperlink_id));
+        }
+
+        // A row-only resize grows the existing page without replacing the
+        // cursor's node. The temporary resize references must be released from
+        // this page after the cursor state is restored.
+        resize(&mut s, 5, 4, true);
+
+        assert_eq!(original_node, cp(&s).node);
+        assert_eq!(original_serial, nd(cp(&s).node).serial);
+        unsafe {
+            let page = cpage(&s);
+            assert_eq!(4, page.styles.ref_count(page.memory, s.cursor.style_id));
+            assert_eq!(4, page.hyperlink_set.ref_count(page.memory, s.cursor.hyperlink_id));
+        }
+    }
+
+    #[test]
+    fn screen_resize_cursor_references_when_node_is_replaced() {
+        let mut s = init(5, 3, Some(1000));
+
+        s.set_attribute(bold()).unwrap();
+        s.start_hyperlink(b"https://example.com/", Some(b"resize")).unwrap();
+        s.test_write_string("abc").unwrap();
+
+        let original_node = cp(&s).node;
+        let original_serial = nd(original_node).serial;
+        unsafe {
+            let page = pg(original_node);
+            assert_eq!(4, page.styles.ref_count(page.memory, s.cursor.style_id));
+            assert_eq!(4, page.hyperlink_set.ref_count(page.memory, s.cursor.hyperlink_id));
+        }
+
+        // A column resize with reflow replaces the page and remaps the tracked
+        // cursor pin. The old page owns the temporary references, so destroying
+        // it must account for them without attempting to release them afterward.
+        resize(&mut s, 10, 3, true);
+
+        assert!(cp(&s).node != original_node || nd(cp(&s).node).serial != original_serial);
+        unsafe {
+            let page = cpage(&s);
+            assert_eq!(4, page.styles.ref_count(page.memory, s.cursor.style_id));
+            assert_eq!(4, page.hyperlink_set.ref_count(page.memory, s.cursor.hyperlink_id));
+        }
+    }
+
+    #[test]
+    fn screen_resize_more_rows_and_cols_with_wrapping() {
+        let mut s = init(2, 4, Some(0));
+        let str_ = "1A2B\n3C4D";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("1A\n2B\n3C\n4D", dump(&s, Tag::Viewport));
+
+        resize(&mut s, 5, 10, true);
+
+        // Reflow leaves room after the last printed cell.
+        assert!(!s.cursor.pending_wrap);
+        assert_eq!(4, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_rows_no_scrollback() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        s.cursor_absolute(0, 0);
+        s.cursor.pending_wrap = false;
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 5, 1, true);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!("3IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("3IJKL", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_rows_moving_cursor() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+
+        // Put our cursor on the last line
+        s.cursor_absolute(1, 2);
+        s.cursor.pending_wrap = false;
+        assert_eq!('I' as u32, cursor_cp(&s));
+
+        // Resize
+        resize(&mut s, 5, 1, true);
+
+        assert_eq!("3IJKL", dump(&s, Tag::Viewport));
+        assert_eq!("3IJKL", dump(&s, Tag::Screen));
+
+        // Cursor should be on the last line
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(0, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_less_rows_with_empty_scrollback() {
+        let mut s = init(5, 3, Some(10));
+        let str_ = "1ABCD\n2EFGH\n3IJKL";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 5, 1, true);
+
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        assert_eq!("3IJKL", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_less_rows_with_populated_scrollback() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+
+        // Resize
+        resize(&mut s, 5, 1, true);
+
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        assert_eq!("5EFGH", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_less_rows_with_full_scrollback() {
+        let mut s = init(5, 3, Some(3));
+        let str_ = "00000\n1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+
+        assert_eq!(4, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        // Resize
+        resize(&mut s, 5, 2, true);
+
+        // Cursor should stay in the same relative place (bottom of the
+        // screen, same character).
+        assert_eq!(4, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!("00000\n1ABCD\n2EFGH\n3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Screen));
+        assert_eq!("4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_no_reflow() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "1AB\n2EF\n3IJ";
+        s.test_write_string(str_).unwrap();
+
+        s.cursor_absolute(0, 0);
+        let (cx, cy) = (s.cursor.x, s.cursor.y);
+        resize(&mut s, 3, 3, true);
+
+        // Cursor should not move
+        assert_eq!(cx, s.cursor.x);
+        assert_eq!(cy, s.cursor.y);
+
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_but_row_space() {
+        let mut s = init(5, 3, Some(1));
+        let str_ = "1ABCD";
+        s.test_write_string(str_).unwrap();
+
+        // Put our cursor on the end
+        s.cursor_absolute(4, 0);
+        s.cursor.pending_wrap = false;
+        assert_eq!('D' as u32, cursor_cp(&s));
+
+        resize(&mut s, 3, 3, true);
+        assert_eq!("1AB\nCD", dump(&s, Tag::Viewport));
+        assert_eq!("1AB\nCD", dump(&s, Tag::Screen));
+
+        // Cursor should be on the last line
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_with_trimmed_rows() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 3, 3, true);
+
+        assert_eq!("CD\n5EF\nGH", dump(&s, Tag::Viewport));
+        assert_eq!("CD\n5EF\nGH", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_with_trimmed_rows_and_scrollback() {
+        let mut s = init(5, 3, Some(1));
+        let str_ = "3IJKL\n4ABCD\n5EFGH";
+        s.test_write_string(str_).unwrap();
+        resize(&mut s, 3, 3, true);
+
+        assert_eq!("CD\n5EF\nGH", dump(&s, Tag::Viewport));
+        assert_eq!("3IJ\nKL\n4AB\nCD\n5EF\nGH", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_previously_wrapped() {
+        let mut s = init(5, 3, Some(0));
+        let str_ = "3IJKL4ABCD5EFGH";
+        s.test_write_string(str_).unwrap();
+
+        // Check
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Screen));
+
+        resize(&mut s, 3, 3, true);
+
+        // {
+        //     const contents = try s.testString(alloc, .viewport);
+        //     defer alloc.free(contents);
+        //     const expected = "CD\n5EF\nGH";
+        //     try testing.expectEqualStrings(expected, contents);
+        // }
+        assert_eq!("ABC\nD5E\nFGH", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_and_scrollback() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1A\n2B\n3C\n4D\n5E";
+        s.test_write_string(str_).unwrap();
+
+        // Put our cursor on the end
+        let rows = s.pages.rows;
+        s.cursor_absolute(1, rows - 1);
+        assert_eq!('E' as u32, cursor_cp(&s));
+
+        resize(&mut s, 3, 3, true);
+
+        assert_eq!("3C\n4D\n5E", dump(&s, Tag::Viewport));
+
+        // Cursor should be on the last line
+        assert_eq!(1, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_reflow_previously_wrapped_and_scrollback() {
+        let mut s = init(5, 3, Some(2));
+        let str_ = "1ABCD2EFGH3IJKL4ABCD5EFGH";
+        s.test_write_string(str_).unwrap();
+
+        // Check
+        assert_eq!("3IJKL\n4ABCD\n5EFGH", dump(&s, Tag::Viewport));
+
+        // Put our cursor on the end
+        let (cols, rows) = (s.pages.cols, s.pages.rows);
+        s.cursor_absolute(cols - 1, rows - 1);
+        s.cursor.pending_wrap = false;
+        assert_eq!('H' as u32, cursor_cp(&s));
+
+        resize(&mut s, 3, 3, true);
+
+        assert_eq!("CD5\nEFG\nH", dump(&s, Tag::Viewport));
+        assert_eq!("1AB\nCD2\nEFG\nH3I\nJKL\n4AB\nCD5\nEFG\nH", dump(&s, Tag::Screen));
+
+        // Cursor should be on the last line
+        assert_eq!(0, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+        assert_eq!('H' as u32, cursor_cp(&s));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_with_scrollback_keeps_cursor_row() {
+        let mut s = init(5, 3, Some(5));
+        let str_ = "1A\n2B\n3C\n4D\n5E";
+        s.test_write_string(str_).unwrap();
+
+        // Lets do a scroll and clear operation
+        s.scroll_clear().unwrap();
+
+        // Move our cursor to the beginning
+        s.cursor_absolute(0, 0);
+
+        resize(&mut s, 3, 3, true);
+
+        assert_eq!("", dump(&s, Tag::Viewport));
+
+        // Cursor should be on the last line
+        assert_eq!(0, s.cursor.x);
+        assert_eq!(0, s.cursor.y);
+    }
+
+    #[test]
+    fn screen_resize_more_rows_less_cols_with_reflow_with_scrollback() {
+        let mut s = init(5, 3, Some(3));
+        let str_ = "1ABCD\n2EFGH3IJKL\n4MNOP";
+        s.test_write_string(str_).unwrap();
+
+        assert_eq!("1ABCD\n2EFGH\n3IJKL\n4MNOP", dump(&s, Tag::Screen));
+        assert_eq!("2EFGH\n3IJKL\n4MNOP", dump(&s, Tag::Viewport));
+
+        resize(&mut s, 2, 10, true);
+
+        assert_eq!("BC\nD\n2E\nFG\nH3\nIJ\nKL\n4M\nNO\nP", dump(&s, Tag::Viewport));
+        assert_eq!("1A\nBC\nD\n2E\nFG\nH3\nIJ\nKL\n4M\nNO\nP", dump(&s, Tag::Screen));
+    }
+
+    // This seems like it should work fine but for some reason in practice
+    // in the initial implementation I found this bug! This is a regression
+    // test for that.
+    #[test]
+    fn screen_resize_more_rows_then_shrink_again() {
+        let mut s = init(5, 3, Some(10));
+        let str_ = "1ABC";
+        s.test_write_string(str_).unwrap();
+
+        // Grow
+        resize(&mut s, 5, 10, true);
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+
+        // Shrink
+        resize(&mut s, 5, 3, true);
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+
+        // Grow again
+        resize(&mut s, 5, 10, true);
+        assert_eq!(str_, dump(&s, Tag::Viewport));
+        assert_eq!(str_, dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_to_eliminate_wide_char() {
+        let mut s = init(2, 1, Some(0));
+        let str_ = "😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(0, 0));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+
+        // Resize to 1 column can't fit a wide char. So it should be deleted.
+        resize(&mut s, 1, 1, true);
+        assert_eq!("", dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(0, 0));
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+    }
+
+    #[test]
+    fn screen_resize_less_cols_to_wrap_wide_char() {
+        let mut s = init(3, 3, Some(0));
+        let str_ = "x😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(1, 0));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(2, 0)).wide());
+
+        resize(&mut s, 2, 3, true);
+        assert_eq!("x\n😀", dump(&s, Tag::Screen));
+        {
+            assert_eq!(Wide::SpacerHead, get_cell(&s, scr(1, 0)).wide());
+            assert!(get_row(&s, scr(1, 0)).wrap());
+        }
+    }
+
+    #[test]
+    fn screen_resize_less_cols_to_eliminate_wide_char_with_row_space() {
+        let mut s = init(2, 2, Some(0));
+        let str_ = "😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(0, 0));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(1, 0)).wide());
+
+        resize(&mut s, 1, 2, true);
+        assert_eq!("", dump(&s, Tag::Screen));
+    }
+
+    #[test]
+    fn screen_resize_less_cols_reflows_cursor_after_wrapped_text() {
+        let mut s = init(50, 7, Some(0));
+
+        for _ in 0..30 {
+            s.test_write_string("a").unwrap();
+        }
+
+        assert_eq!(0, s.cursor.y);
+        assert_eq!(30, s.cursor.x);
+
+        resize(&mut s, 25, 7, true);
+
+        assert_eq!(1, s.cursor.y);
+        assert_eq!(5, s.cursor.x);
+    }
+
+    #[test]
+    fn screen_resize_less_cols_reflows_cursor_after_empty_cells() {
+        let mut s = init(10, 3, Some(0));
+
+        s.test_write_string("abc").unwrap();
+        s.cursor_right(6);
+
+        assert_eq!(0, s.cursor.y);
+        assert_eq!(9, s.cursor.x);
+
+        resize(&mut s, 5, 3, true);
+
+        assert_eq!(1, s.cursor.y);
+        assert_eq!(4, s.cursor.x);
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_wide_spacer_head() {
+        let mut s = init(3, 2, Some(0));
+        let str_ = "  😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("  \n😀", dump(&s, Tag::Screen));
+
+        // So this is the key point: we end up with a wide spacer head at
+        // the end of row 1, then the emoji, then a wide spacer tail on row 2.
+        // We should expect that if we resize to more cols, the wide spacer
+        // head is replaced with the emoji.
+        assert_eq!(Wide::SpacerHead, get_cell(&s, scr(2, 0)).wide());
+        assert_eq!(Wide::Wide, get_cell(&s, scr(0, 1)).wide());
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(1, 1)).wide());
+
+        resize(&mut s, 4, 2, true);
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(2, 0));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(3, 0)).wide());
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_wide_spacer_head_multiple_lines() {
+        let mut s = init(3, 3, Some(0));
+        let str_ = "xxxyy😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("xxx\nyy\n😀", dump(&s, Tag::Screen));
+
+        // Similar to the "wide spacer head" test, but this time we'er going
+        // to increase our columns such that multiple rows are unwrapped.
+        assert_eq!(Wide::SpacerHead, get_cell(&s, scr(2, 1)).wide());
+        assert_eq!(Wide::Wide, get_cell(&s, scr(0, 2)).wide());
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(1, 2)).wide());
+
+        resize(&mut s, 8, 2, true);
+        assert_eq!(str_, dump(&s, Tag::Screen));
+        {
+            let cell = get_cell(&s, scr(5, 0));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(6, 0)).wide());
+    }
+
+    #[test]
+    fn screen_resize_more_cols_requiring_a_wide_spacer_head() {
+        let mut s = init(2, 2, Some(0));
+        let str_ = "xx😀";
+        s.test_write_string(str_).unwrap();
+        assert_eq!("xx\n😀", dump(&s, Tag::Screen));
+        assert_eq!(Wide::Wide, get_cell(&s, scr(0, 1)).wide());
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(1, 1)).wide());
+
+        // This resizes to 3 columns, which isn't enough space for our wide
+        // char to enter row 1. But we need to mark the wide spacer head on the
+        // end of the first row since we're wrapping to the next row.
+        resize(&mut s, 3, 2, true);
+        assert_eq!("xx\n😀", dump(&s, Tag::Screen));
+        assert_eq!(Wide::SpacerHead, get_cell(&s, scr(2, 0)).wide());
+        {
+            let cell = get_cell(&s, scr(0, 1));
+            assert_eq!(Wide::Wide, cell.wide());
+            assert_eq!('😀' as u32, cell.content_codepoint());
+        }
+        assert_eq!(Wide::SpacerTail, get_cell(&s, scr(1, 1)).wide());
+    }
+
+    fn resize_redraw(s: &mut Screen, cols: CellCountInt, rows: CellCountInt, redraw: osc_sp::Redraw) {
+        s.resize(Resize {
+            cols,
+            rows,
+            prompt_redraw: redraw,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    fn prompt(kind: osc_sp::PromptKind) -> SemanticContentUpdate {
+        SemanticContentUpdate::Prompt(kind)
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_cursor_at_prompt() {
+        let mut s = init(10, 3, Some(5));
+
+        s.test_write_string("ABCDE\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("> ").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Input(InputClear::ClearEol));
+        s.test_write_string("echo").unwrap();
+
+        assert_eq!("ABCDE\n> echo", dump(&s, Tag::Viewport));
+
+        resize_redraw(&mut s, 20, 3, osc_sp::Redraw::True);
+
+        // Cursor should not move
+        assert_eq!(6, s.cursor.x);
+        assert_eq!(1, s.cursor.y);
+
+        assert_eq!("ABCDE", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_more_cols_with_cursor_not_at_prompt() {
+        let mut s = init(10, 3, Some(5));
+
+        s.test_write_string("ABCDE\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("> ").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Input(InputClear::ClearEol));
+        s.test_write_string("echo\n").unwrap();
+        s.test_write_string("output").unwrap();
+
+        assert_eq!("ABCDE\n> echo\noutput", dump(&s, Tag::Viewport));
+
+        resize_redraw(&mut s, 20, 3, osc_sp::Redraw::True);
+
+        // Cursor should not move
+        assert_eq!(6, s.cursor.x);
+        assert_eq!(2, s.cursor.y);
+
+        assert_eq!("ABCDE\n> echo\noutput", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_with_prompt_redraw_last_clears_only_one_line() {
+        let mut s = init(10, 4, Some(5));
+
+        s.test_write_string("ABCDE\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("> ").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Input(InputClear::ClearExplicit));
+        s.test_write_string("hello\n").unwrap();
+        s.test_write_string("world").unwrap();
+
+        assert_eq!("ABCDE\n> hello\nworld", dump(&s, Tag::Viewport));
+
+        // Cursor is at end of "world" line with semantic_content = .input
+        resize_redraw(&mut s, 20, 4, osc_sp::Redraw::Last);
+
+        // With .last, only the current line where cursor is should be cleared
+        assert_eq!("ABCDE\n> hello", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_resize_with_prompt_redraw_last_multiline_prompt_clears_only_last_line() {
+        let mut s = init(20, 5, Some(5));
+
+        // Create a 3-line prompt: 1 initial + 2 continuation lines
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("line1\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Continuation));
+        s.test_write_string("line2\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Continuation));
+        s.test_write_string("line3").unwrap();
+
+        assert_eq!("line1\nline2\nline3", dump(&s, Tag::Viewport));
+
+        // Cursor is at end of line3 (the last continuation line)
+        resize_redraw(&mut s, 30, 5, osc_sp::Redraw::Last);
+
+        // With .last, only line3 (where cursor is) should be cleared
+        assert_eq!("line1\nline2", dump(&s, Tag::Viewport));
+    }
+
+    #[test]
+    fn screen_select_untracked() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("ABC  DEF\n 123\n456").unwrap();
+
+        assert!(s.selection.is_none());
+        let tracked = s.pages.count_tracked_pins();
+        let sel = sel_init(&s, act(0, 0), act(3, 0), false);
+        s.select(Some(sel)).unwrap();
+        assert_eq!(tracked + 2, s.pages.count_tracked_pins());
+        s.select(None).unwrap();
+        assert_eq!(tracked, s.pages.count_tracked_pins());
+    }
+
+    #[test]
+    fn screen_select_replaces_existing_pins() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("ABC  DEF\n 123\n456").unwrap();
+
+        let tracked = s.pages.count_tracked_pins();
+        let sel = sel_init(&s, act(0, 0), act(3, 0), false);
+        s.select(Some(sel)).unwrap();
+        assert_eq!(tracked + 2, s.pages.count_tracked_pins());
+
+        // Replacing the selection must untrack the prior selection's pins
+        // rather than leak them.
+        let sel = sel_init(&s, act(0, 1), act(2, 1), false);
+        s.select(Some(sel)).unwrap();
+        assert_eq!(tracked + 2, s.pages.count_tracked_pins());
+    }
+
+    #[test]
+    fn screen_reselecting_tracked_selection_preserves_its_pins() {
+        let mut s = init(10, 2, Some(0));
+
+        let sel = sel_init(&s, act(1, 0), act(3, 0), false);
+        s.select(Some(sel)).unwrap();
+
+        let cur = s.selection;
+        s.select(cur).unwrap();
+        assert_eq!(Order::Forward, s.selection.unwrap().order(&s));
+    }
+
+    /// Assert the start/end of a selection as points of the given tag.
+    fn assert_sel(s: &Screen, sel: &Selection, tag: Tag, start: (u16, u32), end: (u16, u32)) {
+        let mk = |c: (u16, u32)| match tag {
+            Tag::Active => act(c.0, c.1),
+            Tag::Viewport => vp(c.0, c.1),
+            Tag::Screen => scr(c.0, c.1),
+            Tag::History => hist(c.0, c.1),
+        };
+        assert_eq!(mk(start), pfp(s, tag, sel.start()).unwrap(), "start");
+        assert_eq!(mk(end), pfp(s, tag, sel.end()).unwrap(), "end");
+    }
+
+    fn select_line_at(s: &Screen, pt: Point) -> Option<Selection> {
+        s.select_line(SelectLine::new(pin(s, pt)))
+    }
+
+    #[test]
+    fn screen_select_all() {
+        let mut s = init(10, 10, Some(0));
+
+        {
+            s.test_write_string("ABC  DEF\n 123\n456").unwrap();
+            let sel = s.select_all().unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (0, 0), (2, 2));
+            sel.deinit(&mut s);
+        }
+
+        {
+            s.test_write_string("\nFOO\n BAR\n BAZ\n QWERTY\n 12345678").unwrap();
+            let sel = s.select_all().unwrap();
+            assert_sel(&s, &sel, Tag::Screen, (0, 0), (8, 7));
+            sel.deinit(&mut s);
+        }
+    }
+
+    #[test]
+    fn screen_select_line() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("ABC  DEF\n 123\n456").unwrap();
+
+        // Outside of active area
+        // try testing.expect(s.selectLine(.{ .x = 13, .y = 0 }) == null);
+        // try testing.expect(s.selectLine(.{ .x = 0, .y = 5 }) == null);
+
+        // Going forward
+        let sel = select_line_at(&s, act(0, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (7, 0));
+
+        // Going backward
+        let sel = select_line_at(&s, act(7, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (7, 0));
+
+        // Going forward and backward
+        let sel = select_line_at(&s, act(3, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (7, 0));
+
+        // Outside active area
+        let sel = select_line_at(&s, act(9, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (7, 0));
+    }
+
+    #[test]
+    fn screen_select_line_across_soft_wrap() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string(" 12 34012   \n 123").unwrap();
+
+        // Going forward
+        let sel = select_line_at(&s, act(1, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (3, 1));
+    }
+
+    #[test]
+    fn screen_select_line_across_full_soft_wrap() {
+        let mut s = init(5, 5, Some(0));
+        s.test_write_string("1ABCD2EFGH\n3IJKL").unwrap();
+
+        let sel = select_line_at(&s, act(2, 1)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (4, 1));
+    }
+
+    #[test]
+    fn screen_select_line_across_soft_wrap_ignores_blank_lines() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string(" 12 34012             \n 123").unwrap();
+
+        // Going forward
+        let sel = select_line_at(&s, act(1, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (3, 1));
+
+        // Going backward
+        let sel = select_line_at(&s, act(1, 1)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (3, 1));
+
+        // Going forward and backward
+        let sel = select_line_at(&s, act(3, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (1, 0), (3, 1));
+    }
+
+    #[test]
+    fn screen_select_line_disabled_whitespace_trimming() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string(" 12 34012   \n 123").unwrap();
+
+        // Going forward
+        let sel = s
+            .select_line(SelectLine {
+                whitespace: None,
+                ..SelectLine::new(pin(&s, act(1, 0)))
+            })
+            .unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (4, 2));
+
+        // Non-wrapped
+        let sel = s
+            .select_line(SelectLine {
+                whitespace: None,
+                ..SelectLine::new(pin(&s, act(1, 3)))
+            })
+            .unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 3), (4, 3));
+    }
+
+    #[test]
+    fn screen_select_line_with_scrollback() {
+        let mut s = init(2, 3, Some(5));
+        s.test_write_string("1A\n2B\n3C\n4D\n5E").unwrap();
+
+        // Selecting first line
+        let sel = select_line_at(&s, act(0, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 0), (1, 0));
+
+        // Selecting last line
+        let sel = select_line_at(&s, act(0, 2)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 2), (1, 2));
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1329
+    #[test]
+    fn screen_select_line_semantic_prompt_boundary() {
+        let mut s = init(5, 10, Some(0));
+        s.test_write_string("ABCDE\n").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("A    ").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("> ").unwrap();
+
+        assert_eq!("ABCDE\nA    \n> ", dump(&s, Tag::Screen));
+
+        // Selecting output stops at the prompt even if soft-wrapped
+        {
+            let sel = select_line_at(&s, act(1, 1)).unwrap();
+            let contents = s.selection_string(SelectionString { sel, trim: false });
+            assert_eq!("A", contents);
+        }
+        {
+            let sel = select_line_at(&s, act(1, 2)).unwrap();
+            assert_sel(&s, &sel, Tag::Active, (0, 2), (0, 2));
+        }
+    }
+
+    #[test]
+    fn screen_select_line_semantic_boundary_around_unwritten_cells() {
+        let mut s = init(5, 1, Some(0));
+
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("x").unwrap();
+        s.cursor_right(2);
+        s.test_write_string("m").unwrap();
+
+        for x in 1..3 {
+            let p = pin(&s, act(x, 0));
+            assert!(s.select_line(SelectLine::new(p)).is_none());
+        }
+    }
+
+    fn input_explicit() -> SemanticContentUpdate {
+        SemanticContentUpdate::Input(InputClear::ClearExplicit)
+    }
+
+    fn sel_str(s: &Screen, sel: Selection) -> String {
+        s.selection_string(SelectionString { sel, trim: false })
+    }
+
+    #[test]
+    fn screen_select_line_semantic_prompt_to_input_boundary() {
+        let mut s = init(10, 5, Some(0));
+
+        // Write prompt followed by user input on same row: "$>command"
+        // Using non-whitespace to avoid whitespace trimming affecting the test
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("$>").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("command").unwrap();
+
+        // Selecting from prompt should only select prompt
+        let sel = select_line_at(&s, act(0, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 0), (1, 0));
+
+        // Selecting from input should only select input
+        let sel = select_line_at(&s, act(5, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (2, 0), (8, 0));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_input_to_output_boundary() {
+        let mut s = init(10, 5, Some(0));
+
+        // Row 0: user input
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("ls -la\n").unwrap();
+        // Row 1: command output
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("file.txt").unwrap();
+
+        // Selecting from input should only select input
+        let sel = select_line_at(&s, act(2, 0)).unwrap();
+        assert_eq!("ls -la", sel_str(&s, sel));
+
+        // Selecting from output should only select output
+        let sel = select_line_at(&s, act(2, 1)).unwrap();
+        assert_eq!("file.txt", sel_str(&s, sel));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_mid_row_boundary() {
+        let mut s = init(10, 5, Some(0));
+
+        // Single row with output then prompt then input: "out$>cmd"
+        // Using non-whitespace to avoid whitespace trimming affecting the test
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("out").unwrap();
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("$>").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("cmd").unwrap();
+
+        // Selecting from output should stop at prompt
+        let sel = select_line_at(&s, act(1, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 0), (2, 0));
+
+        // Selecting from prompt should only select prompt
+        let sel = select_line_at(&s, act(3, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (3, 0), (4, 0));
+
+        // Selecting from input should only select input
+        let sel = select_line_at(&s, act(6, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (5, 0), (7, 0));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_boundary_soft_wrap_with_mid_row_transition() {
+        let mut s = init(5, 5, Some(0));
+
+        // Row 0: prompt "$ " + input "cmd" (soft-wraps)
+        // Row 1: input continues "12" + output "out"
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("$ ").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("cmd12").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("out").unwrap();
+
+        // Verify layout
+        assert_eq!("$ cmd\n12out", dump(&s, Tag::Screen));
+
+        // Selecting from input on row 0 should get all input across soft-wrap
+        let sel = select_line_at(&s, act(3, 0)).unwrap();
+        assert_eq!("cmd12", sel_str(&s, sel));
+
+        // Selecting from input on row 1 should get all input across soft-wrap
+        let sel = select_line_at(&s, act(0, 1)).unwrap();
+        assert_eq!("cmd12", sel_str(&s, sel));
+
+        // Selecting from output should only get output
+        let sel = select_line_at(&s, act(3, 1)).unwrap();
+        assert_eq!("out", sel_str(&s, sel));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_boundary_disabled() {
+        let mut s = init(10, 5, Some(0));
+
+        // Write prompt followed by input
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("$ ").unwrap();
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("command").unwrap();
+
+        // With semantic_prompt_boundary = false, should select entire line
+        let sel = s
+            .select_line(SelectLine {
+                semantic_prompt_boundary: false,
+                ..SelectLine::new(pin(&s, act(0, 0)))
+            })
+            .unwrap();
+        assert_eq!("$ command", sel_str(&s, sel));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_boundary_first_cell_of_row() {
+        let mut s = init(5, 5, Some(0));
+
+        // Row 0: input that soft-wraps
+        // Row 1: output starts at first cell
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("12345").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("ABCDE").unwrap();
+
+        // Verify soft-wrap happened
+        {
+            let p = pin(&s, act(0, 0));
+            assert!(rw(p.row_and_cell().row).wrap());
+        }
+
+        // Selecting from input should stop before output on row 1
+        let sel = select_line_at(&s, act(2, 0)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 0), (4, 0));
+
+        // Selecting from output should only get output
+        let sel = select_line_at(&s, act(2, 1)).unwrap();
+        assert_sel(&s, &sel, Tag::Active, (0, 1), (4, 1));
+    }
+
+    #[test]
+    fn screen_select_line_semantic_boundary_across_mixed_width_pages() {
+        let mut s = init(4, 2, Some(0));
+
+        s.cursor_set_semantic_content(input_explicit());
+        s.test_write_string("ABCD").unwrap();
+        s.cursor_set_semantic_content(SemanticContentUpdate::Output);
+        s.test_write_string("E").unwrap();
+
+        let f = first(&s);
+        let mut p = Pin::new(f);
+        p.y = 1;
+        s.pages.split(p).unwrap();
+        let second = nd(f).next.unwrap();
+        pg(f).size.cols = 2;
+        s.pages.pause_integrity_checks(true);
+
+        assert_eq!(2, nd(f).cols());
+        assert_eq!(4, nd(second).cols());
+
+        let mut at = Pin::new(f);
+        at.x = 1;
+        let sel = s.select_line(SelectLine::new(at)).unwrap();
+        let mut e0 = Pin::new(f);
+        e0.x = 0;
+        assert!(e0.eql(sel.start()));
+        let mut e1 = Pin::new(f);
+        e1.x = 1;
+        assert!(e1.eql(sel.end()));
+        s.pages.pause_integrity_checks(false);
+    }
+
+    #[test]
+    fn screen_select_line_semantic_all_same_content() {
+        let mut s = init(5, 5, Some(0));
+
+        // All prompt content that soft-wraps
+        s.cursor_set_semantic_content(prompt(osc_sp::PromptKind::Initial));
+        s.test_write_string("prompt text").unwrap();
+
+        // Verify soft-wrap
+        assert_eq!("promp\nt tex\nt", dump(&s, Tag::Screen));
+
+        // Should select all prompt content across soft-wraps
+        let sel = select_line_at(&s, act(2, 1)).unwrap();
+        assert_eq!("prompt text", sel_str(&s, sel));
+    }
+
+    #[test]
+    fn screen_select_word() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("ABC  DEF\n 123\n456").unwrap();
+
+        // Default boundary codepoints for word selection
+        let boundary_codepoints: &[u32] = &[
+            0, ' ' as u32, '\t' as u32, '\'' as u32, '"' as u32, '│' as u32, '`' as u32, '|' as u32, ':' as u32,
+            ';' as u32, ',' as u32, '(' as u32, ')' as u32, '[' as u32, ']' as u32, '{' as u32, '}' as u32,
+            '<' as u32, '>' as u32, '$' as u32,
+        ];
+
+        // Outside of active area
+        // try testing.expect(s.selectWord(.{ .x = 9, .y = 0 }) == null);
+        // try testing.expect(s.selectWord(.{ .x = 0, .y = 5 }) == null);
+
+        // Going forward
+        let sel = s.select_word(pin(&s, act(0, 0)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (2, 0));
+
+        // Going backward
+        let sel = s.select_word(pin(&s, act(2, 0)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (2, 0));
+
+        // Going forward and backward
+        let sel = s.select_word(pin(&s, act(1, 0)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 0), (2, 0));
+
+        // Whitespace
+        let sel = s.select_word(pin(&s, act(3, 0)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (3, 0), (4, 0));
+
+        // Whitespace single char
+        let sel = s.select_word(pin(&s, act(0, 1)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 1), (0, 1));
+
+        // End of screen
+        let sel = s.select_word(pin(&s, act(1, 2)), boundary_codepoints).unwrap();
+        assert_sel(&s, &sel, Tag::Screen, (0, 2), (2, 2));
+    }
+
+    const SPACE_BOUNDARY: &[u32] = &[0, ' ' as u32];
+
+    #[test]
+    fn screen_select_word_at_hard_line_breaks() {
+        let cases: [(CellCountInt, &str); 4] = [(5, "abcde\nfghij"), (5, "     \n     "), (1, "a\nb"), (1, " \n ")];
+        for (cols, text) in cases {
+            let mut s = init(cols, 2, Some(0));
+            s.test_write_string(text).unwrap();
+
+            for y in 0..2u32 {
+                for x in 0..cols {
+                    let sel = s.select_word(pin(&s, act(x, y)), SPACE_BOUNDARY).unwrap();
+                    assert_sel(&s, &sel, Tag::Screen, (0, y), (cols - 1, y));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_select_word_across_soft_wrap_at_right_edge() {
+        let mut s = init(5, 3, Some(0));
+        s.test_write_string("abcdefghij\nklmno").unwrap();
+
+        for y in 0..2u32 {
+            for x in 0..5 {
+                let sel = s.select_word(pin(&s, act(x, y)), SPACE_BOUNDARY).unwrap();
+                assert_sel(&s, &sel, Tag::Screen, (0, 0), (4, 1));
+            }
+        }
+    }
+
+    #[test]
+    fn screen_select_word_wide_characters() {
+        struct Case {
+            text: &'static str,
+            cols: CellCountInt,
+            boundary_codepoints: &'static [u32],
+            start: usize,
+            end: usize,
+            expected: &'static str,
+        }
+        const fn case(text: &'static str, end: usize, expected: &'static str) -> Case {
+            Case {
+                text,
+                cols: 10,
+                boundary_codepoints: SPACE_BOUNDARY,
+                start: 0,
+                end,
+                expected,
+            }
+        }
+        const YU: &[u32] = &[0, '語' as u32];
+        let cases = [
+            case("日本語", 5, "日本語"),
+            Case {
+                boundary_codepoints: &[' ' as u32],
+                ..case("日本語", 5, "日本語")
+            },
+            case("a日b語c", 6, "a日b語c"),
+            Case {
+                start: 1,
+                ..case(" 日本語 ", 6, "日本語")
+            },
+            Case {
+                cols: 4,
+                ..case("日本語", 5, "日本語")
+            },
+            Case {
+                cols: 5,
+                ..case("日本語", 6, "日本語")
+            },
+            Case {
+                cols: 4,
+                ..case("日本\n語文", 3, "日本")
+            },
+            Case {
+                cols: 4,
+                start: 4,
+                ..case("日本\n語文", 7, "語文")
+            },
+            Case {
+                boundary_codepoints: YU,
+                ..case("a語b", 0, "a")
+            },
+            Case {
+                boundary_codepoints: YU,
+                start: 1,
+                ..case("a語b", 2, "語")
+            },
+            Case {
+                boundary_codepoints: YU,
+                start: 3,
+                ..case("a語b", 3, "b")
+            },
+            Case {
+                cols: 5,
+                boundary_codepoints: YU,
+                ..case("abcd語ef", 3, "abcd")
+            },
+            Case {
+                cols: 5,
+                boundary_codepoints: YU,
+                start: 4,
+                ..case("abcd語ef", 6, "語")
+            },
+            Case {
+                cols: 5,
+                boundary_codepoints: YU,
+                start: 7,
+                ..case("abcd語ef", 8, "ef")
+            },
+        ];
+
+        for c in cases {
+            let mut s = init(c.cols, 4, Some(0));
+            s.test_write_string(c.text).unwrap();
+            let cols = c.cols as usize;
+
+            // Selecting any cell in the word should select the whole word.
+            for offset in c.start..c.end + 1 {
+                let p = pin(&s, act((offset % cols) as u16, (offset / cols) as u32));
+                let sel = s.select_word(p, c.boundary_codepoints).unwrap();
+                assert_sel(
+                    &s,
+                    &sel,
+                    Tag::Screen,
+                    ((c.start % cols) as u16, (c.start / cols) as u32),
+                    ((c.end % cols) as u16, (c.end / cols) as u32),
+                );
+
+                let contents = s.selection_string(SelectionString::new(sel));
+                assert_eq!(c.expected, contents);
+            }
+        }
+    }
+
+    // @tests-end
+}
