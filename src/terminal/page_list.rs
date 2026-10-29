@@ -9335,3 +9335,1855 @@ pub(crate) mod testing {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::bool_assert_comparison)]
+    use super::testing::*;
+    use super::*;
+    use crate::terminal::compress::lz4::test_rng::Prng;
+    #[allow(unused_imports)]
+    use crate::terminal::page::{Cell as PCell, ContentTag, SemanticContent, SemanticPrompt, Wide};
+    use crate::terminal::point::{Coordinate, Point, Tag};
+
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
+    fn init(cols: CellCountInt, rows: CellCountInt) -> PageList {
+        PageList::init(Options {
+            cols,
+            rows,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn init_opts(opts: Options) -> PageList {
+        PageList::init(opts).unwrap()
+    }
+
+    /// Dereference a node (test-only; unbounded lifetime).
+    fn n<'a>(p: NodePtr) -> &'a mut Node {
+        unsafe { nd(p) }
+    }
+
+    /// The (restored) page of a node.
+    fn pg<'a>(p: NodePtr) -> &'a mut Page {
+        unsafe { nd(p).page() }
+    }
+
+    /// Dereference a tracked pin.
+    fn tp<'a>(p: PinPtr) -> &'a mut Pin {
+        unsafe { pinr(p) }
+    }
+
+    fn rac<'a>(page: &Page, x: usize, y: usize) -> (&'a mut Row, &'a mut PCell) {
+        let r = page.get_row_and_cell(x, y);
+        unsafe { (&mut *r.row, &mut *r.cell) }
+    }
+
+    fn cell_at<'a>(page: &Page, x: usize, y: usize) -> &'a mut PCell {
+        rac(page, x, y).1
+    }
+
+    #[allow(dead_code)]
+    fn row_at<'a>(page: &Page, y: usize) -> &'a mut Row {
+        unsafe { &mut *page.get_row(y) }
+    }
+
+    #[allow(dead_code)]
+    fn cells_of<'a>(page: &Page, row: &Row) -> &'a mut [PCell] {
+        unsafe { &mut *page.get_cells(row) }
+    }
+
+    #[allow(dead_code)]
+    fn pin_rac<'a>(p: Pin) -> (&'a mut Row, &'a mut PCell) {
+        let r = p.row_and_cell();
+        unsafe { (&mut *r.row, &mut *r.cell) }
+    }
+
+    #[allow(dead_code)]
+    fn pin_cells<'a>(p: Pin, subset: CellSubset) -> &'a mut [PCell] {
+        unsafe { &mut *p.cells(subset) }
+    }
+
+    fn mem<'a>(page: &Page) -> &'a mut [u8] {
+        unsafe { page.memory.as_mut_slice() }
+    }
+
+    fn cp(c: char) -> PCell {
+        PCell::init(c as u32)
+    }
+
+    #[allow(dead_code)]
+    fn cpu(c: u32) -> PCell {
+        PCell::init(c)
+    }
+
+    #[allow(dead_code)]
+    fn wide_cell(c: char, wide: Wide) -> PCell {
+        let mut cell = PCell::init(c as u32);
+        cell.set_wide(wide);
+        cell
+    }
+
+    fn coord(x: CellCountInt, y: u32) -> Coordinate {
+        Coordinate { x, y }
+    }
+
+    fn pt_active(x: CellCountInt, y: u32) -> Point {
+        Point::Active(coord(x, y))
+    }
+
+    fn pt_screen(x: CellCountInt, y: u32) -> Point {
+        Point::Screen(coord(x, y))
+    }
+
+    #[allow(dead_code)]
+    fn pt_viewport(x: CellCountInt, y: u32) -> Point {
+        Point::Viewport(coord(x, y))
+    }
+
+    fn pt_history(x: CellCountInt, y: u32) -> Point {
+        Point::History(coord(x, y))
+    }
+
+    fn pin_at(node: NodePtr, x: CellCountInt, y: CellCountInt) -> Pin {
+        Pin { x, y, ..Pin::new(node) }
+    }
+
+    fn first(s: &PageList) -> NodePtr {
+        s.pages.first.unwrap()
+    }
+
+    fn last(s: &PageList) -> NodePtr {
+        s.pages.last.unwrap()
+    }
+
+    fn next(p: NodePtr) -> NodePtr {
+        n(p).next.unwrap()
+    }
+
+    #[allow(dead_code)]
+    fn prev(p: NodePtr) -> NodePtr {
+        n(p).prev.unwrap()
+    }
+
+    fn encoded<'a>(p: NodePtr) -> &'a mut [u8] {
+        match &n(p).data {
+            NodeData::Compressed(c) => unsafe { &mut *c.encoded },
+            NodeData::Resident(_) => panic!("node is resident"),
+        }
+    }
+
+    fn clone_opts<'a>(top: Point, bot: Option<Point>) -> Clone<'a> {
+        Clone {
+            top,
+            bot,
+            tracked_pins: None,
+        }
+    }
+
+    fn vp(s: &PageList) -> Pin {
+        *tp(s.viewport_pin)
+    }
+
+    fn append_node(s: &mut PageList, node: NodePtr) {
+        unsafe { s.pages.append(node) };
+    }
+
+    fn random_bytes(seed: u64, buf: &mut [u8]) {
+        Prng::init(seed).bytes(buf);
+    }
+
+    fn mixed_width_pin_list_for_test() -> PageList {
+        let mut result = init(2, 1);
+
+        // This deliberately constructs a layout that normal PageList operations
+        // do not expose yet. Keep integrity checks paused through deinit so the
+        // fixture can exercise mixed-width traversal in isolation.
+        result.pause_integrity_checks(true);
+
+        for cols in [4, 3] {
+            let node = result.create_page(CreatePage::cap(Capacity::new(cols, 1))).unwrap();
+            pg(node).size.rows = 1;
+            append_node(&mut result, node);
+            result.total_rows += 1;
+        }
+
+        // Desired geometry is wider than the first and last stored pages.
+        result.cols = 4;
+        result
+    }
+
+    impl PageList {
+        /// Grow a test PageList until it contains at least `count` complete history
+        /// pages. The production cold-page boundary is intentionally reused here so
+        /// tests do not duplicate the row-to-page arithmetic.
+        fn grow_cold_pages_for_test(&mut self, count: usize) {
+            loop {
+                let active_node = self.get_top_left(Tag::Active).node;
+                let mut cold_count: usize = 0;
+                let mut current = self.pages.first;
+                while let Some(node) = current {
+                    if node == active_node {
+                        break;
+                    }
+                    cold_count += 1;
+                    current = n(node).next;
+                }
+
+                if cold_count >= count {
+                    return;
+                }
+                self.grow().unwrap();
+            }
+        }
+
+        /// Fill the current tail page to capacity without allocating a successor.
+        /// Capturing the tail before the loop makes this stop at the allocation
+        /// boundary needed by bounded-pruning tests.
+        fn fill_last_page_for_test(&mut self) {
+            let last = self.pages.last.unwrap();
+            while n(last).rows() < n(last).capacity().rows {
+                self.grow().unwrap();
+            }
+        }
+
+        /// Verify every live page belongs to the current validity epoch, has an
+        /// allocated generation below the next serial, and validates through the same
+        /// pointer-plus-generation lookup used by external references.
+        fn expect_live_page_serials_valid_for_test(&self) {
+            let mut node = self.pages.first;
+            while let Some(live) = node {
+                assert!(n(live).serial >= self.page_serial_epoch);
+                assert!(n(live).serial < self.page_serial);
+                assert!(self.node_is_valid(live, n(live).serial));
+                node = n(live).next;
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_builder_transfers_mixed_width_pages() {
+        // Build two populated pages whose widths differ from each other and from
+        // the final active-area width. The first page also includes one row of
+        // incidental history above the three-row active area.
+        let result = {
+            let mut builder = Builder::init(Options {
+                cols: 4,
+                rows: 3,
+                max_size: None,
+                max_lines: None,
+            })
+            .unwrap();
+
+            let first = builder.allocate_page(Capacity::new(2, 2)).unwrap();
+            first.size.rows = 2;
+            *cell_at(first, 0, 0) = cp('A');
+
+            let second = builder.allocate_page(Capacity::new(4, 2)).unwrap();
+            second.size.rows = 2;
+            *cell_at(second, 0, 0) = cp('B');
+
+            builder.finish().unwrap()
+        };
+
+        // Successful finish transfers ownership and initializes the PageList's
+        // desired geometry, viewport, and required tracked viewport pin.
+        assert_eq!(4, result.cols);
+        assert_eq!(3, result.rows);
+        assert_eq!(2, result.total_pages());
+        assert_eq!(1, result.count_tracked_pins());
+        assert_eq!(Viewport::Active, result.viewport);
+
+        // Complete pages and their contents are preserved in insertion order,
+        // including widths which have not yet been reflowed.
+        let screen_top = result.get_top_left(Tag::Screen);
+        assert_eq!(2, n(screen_top.node).cols());
+        assert_eq!('A' as u32, cell_at(pg(screen_top.node), 0, 0).codepoint());
+
+        // The active area is calculated backward from the newest page, so it
+        // begins at row one of the oldest page and leaves row zero as history.
+        let active_top = result.get_top_left(Tag::Active);
+        assert_eq!(screen_top.node, active_top.node);
+        assert_eq!(1, active_top.y);
+        assert_eq!(4, n(next(active_top.node)).cols());
+        assert_eq!('B' as u32, cell_at(pg(next(active_top.node)), 0, 0).codepoint());
+
+        result.assert_integrity();
+    }
+
+    #[test]
+    fn page_list_builder_validates_the_finished_list() {
+        // The desired PageList geometry must describe a non-empty screen.
+        {
+            let mut builder = Builder::init(Options {
+                cols: 0,
+                rows: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(FinishError::InvalidDimensions, builder.finish().unwrap_err());
+        }
+
+        // A PageList cannot be finished without any backing pages.
+        {
+            let mut builder = Builder::init(Options {
+                cols: 1,
+                rows: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(FinishError::NoPages, builder.finish().unwrap_err());
+        }
+
+        // Allocated capacity alone is insufficient: callers must populate a
+        // nonzero logical page size before transferring ownership.
+        {
+            let mut builder = Builder::init(Options {
+                cols: 1,
+                rows: 1,
+                ..Default::default()
+            })
+            .unwrap();
+            let page = builder.allocate_page(Capacity::new(1, 1)).unwrap();
+            page.size.rows = 0;
+            assert_eq!(FinishError::InvalidPageDimensions, builder.finish().unwrap_err());
+        }
+
+        // The populated pages must contain enough rows to cover the active area.
+        {
+            let mut builder = Builder::init(Options {
+                cols: 1,
+                rows: 2,
+                ..Default::default()
+            })
+            .unwrap();
+            let page = builder.allocate_page(Capacity::new(1, 1)).unwrap();
+            page.size.rows = 1;
+            assert_eq!(FinishError::InsufficientRows, builder.finish().unwrap_err());
+        }
+    }
+
+    #[test]
+    fn page_list_builder_finish_is_transactional_on_allocation_failure() {
+        // Construct a valid builder so finish reaches its fallible bookkeeping
+        // allocations after all page and geometry validation succeeds.
+        let failing = FailingAllocator::leak(usize::MAX);
+        let mut builder = Builder::init_alloc(
+            failing.allocator(),
+            Options {
+                cols: 1,
+                rows: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let page = builder.allocate_page(Capacity::new(1, 1)).unwrap();
+        page.size.rows = 1;
+
+        // The pools are preheated, so the next general allocation is the tracked
+        // viewport pin map created by finish.
+        failing.set_fail_index(failing.alloc_index());
+        assert_eq!(FinishError::OutOfMemory, builder.finish().unwrap_err());
+        assert!(failing.has_induced_failure());
+
+        // Failed finish leaves page ownership with the builder so its normal
+        // deinit path can release the still-linked page.
+        assert!(builder.pages.first.is_some());
+        assert_eq!(builder.pages.first, builder.pages.last);
+    }
+
+    #[test]
+    fn page_list_page_allocation_finalizes_pages_and_preserves_live_state() {
+        // Build an existing list with history, a two-row active area, an external
+        // active pin, and a pinned viewport whose absolute offset is cached.
+        let mut result = {
+            let mut builder = Builder::init(Options {
+                cols: 4,
+                rows: 2,
+                max_size: None,
+                max_lines: None,
+            })
+            .unwrap();
+
+            let first = builder.allocate_page(Capacity::new(3, 2)).unwrap();
+            first.size.rows = 2;
+            *cell_at(first, 0, 0) = cp('C');
+
+            let second = builder.allocate_page(Capacity::new(4, 2)).unwrap();
+            second.size.rows = 2;
+            *cell_at(second, 0, 0) = cp('D');
+
+            builder.finish().unwrap()
+        };
+
+        let old_first = first(&result);
+        let old_last = last(&result);
+        let active_top = result.get_top_left(Tag::Active);
+        let tracked_active = result.track_pin(active_top).unwrap();
+        result.scroll(Scroll::Row(1));
+        assert_eq!(Viewport::Pin, result.viewport);
+        assert_eq!(1, result.scrollbar().offset);
+
+        // Prepend differently sized historical pages newest-first. Each page is
+        // populated while detached and joins the live list only on success.
+        {
+            let mut allocation = result.allocate_page(Capacity::new(4, 1)).unwrap();
+            let page = allocation.page();
+            page.size.rows = 1;
+            *cell_at(page, 0, 0) = cp('B');
+            allocation.finalize(Location::Prepend, FinalizeOptions::default()).unwrap();
+        }
+        {
+            let mut allocation = result.allocate_page(Capacity::new(2, 2)).unwrap();
+            let page = allocation.page();
+            page.size.rows = 2;
+            *cell_at(page, 0, 0) = cp('A');
+            allocation.finalize(Location::Prepend, FinalizeOptions::default()).unwrap();
+        }
+
+        // Repeated prepends reconstruct oldest-to-newest order without replacing
+        // any existing nodes or tracked pins.
+        assert_eq!(4, result.total_pages());
+        assert_eq!(7, result.total_rows);
+        assert_eq!(old_last, last(&result));
+        assert_eq!(old_first, next(next(first(&result))));
+        assert_eq!('A' as u32, cell_at(pg(first(&result)), 0, 0).codepoint());
+        assert_eq!('B' as u32, cell_at(pg(next(first(&result))), 0, 0).codepoint());
+        assert!(active_top.eql(result.get_top_left(Tag::Active)));
+        assert!(active_top.eql(*tp(tracked_active)));
+
+        // The viewport remains pinned to the same content, while its cached row
+        // offset and the scrollbar total include the three new historical rows.
+        assert_eq!(Viewport::Pin, result.viewport);
+        assert_eq!(old_first, vp(&result).node);
+        assert_eq!(1, vp(&result).y);
+        let scrollbar_state = result.scrollbar();
+        assert_eq!(7, scrollbar_state.total);
+        assert_eq!(4, scrollbar_state.offset);
+        assert_eq!(2, scrollbar_state.len);
+
+        result.assert_integrity();
+    }
+
+    #[test]
+    fn page_list_page_allocation_compresses_prepended_pages_unless_visible() {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Vp {
+            Active,
+            Pin,
+            Top,
+        }
+        struct Case {
+            /// How to position the viewport before prepending.
+            viewport: Vp,
+            /// Whether the prepended page should end up compressed.
+            compressed: bool,
+        }
+        let cases = [
+            // The viewport shows the active area, far below the new page.
+            Case {
+                viewport: Vp::Active,
+                compressed: true,
+            },
+            // The viewport is pinned to existing history, which is still below
+            // the new page.
+            Case {
+                viewport: Vp::Pin,
+                compressed: true,
+            },
+            // The viewport follows the top of the scrollback, so the new page
+            // becomes the first visible page.
+            Case {
+                viewport: Vp::Top,
+                compressed: false,
+            },
+        ];
+
+        for case in cases {
+            let mut s = init(80, 24);
+            s.grow_cold_pages_for_test(1);
+            match case.viewport {
+                Vp::Active => {}
+                Vp::Pin => s.scroll(Scroll::Row(1)),
+                Vp::Top => s.scroll(Scroll::Top),
+            }
+            assert_eq!(
+                match case.viewport {
+                    Vp::Active => Viewport::Active,
+                    Vp::Pin => Viewport::Pin,
+                    Vp::Top => Viewport::Top,
+                },
+                s.viewport
+            );
+
+            // A full-size page so compression is worthwhile.
+            let capacity = n(first(&s)).capacity();
+            let mut allocation = s.allocate_page(capacity).unwrap();
+            let page = allocation.page();
+            page.size.rows = capacity.rows;
+            *cell_at(page, 0, 0) = cp('X');
+            allocation
+                .finalize(Location::Prepend, FinalizeOptions { compress: true })
+                .unwrap();
+            drop(allocation);
+
+            let node = first(&s);
+            assert_eq!(case.compressed, n(node).is_compressed());
+            assert_eq!(if case.compressed { 1 } else { 0 }, s.memory_stats().compressed_pages);
+
+            // Reading the page uncompresses it with its contents intact.
+            assert_eq!('X' as u32, cell_at(pg(node), 0, 0).codepoint());
+            s.assert_integrity();
+        }
+    }
+
+    #[test]
+    fn page_list_page_allocation_stays_detached_until_finalize() {
+        let mut result = init_opts(Options {
+            cols: 1,
+            rows: 1,
+            max_size: None,
+            max_lines: None,
+        });
+
+        let initial_first = first(&result);
+        let initial_last = last(&result);
+        let initial_total_rows = result.total_rows;
+        let initial_page_size = result.page_size;
+
+        // Allocating and populating a detached page does not alter any live list
+        // links or accounting. Deinit returns it to the same PageList pools.
+        let mut detached = result.allocate_page(Capacity::new(1, 1)).unwrap();
+        detached.page().size.rows = 1;
+        assert_eq!(initial_first, first(&result));
+        assert_eq!(initial_last, last(&result));
+        assert_eq!(initial_total_rows, result.total_rows);
+        assert_eq!(initial_page_size, result.page_size);
+        result.assert_integrity();
+        detached.deinit();
+        result.assert_integrity();
+
+        // Invalid populated dimensions leave ownership with the allocation so it
+        // can still be released normally.
+        let mut invalid = result.allocate_page(Capacity::new(1, 1)).unwrap();
+        assert_eq!(
+            FinalizeError::InvalidPageDimensions,
+            invalid
+                .finalize(Location::Prepend, FinalizeOptions::default())
+                .unwrap_err()
+        );
+
+        assert_eq!(initial_first, first(&result));
+        assert_eq!(initial_last, last(&result));
+        assert_eq!(initial_total_rows, result.total_rows);
+        assert_eq!(initial_page_size, result.page_size);
+        result.assert_integrity();
+        drop(invalid);
+    }
+
+    #[test]
+    fn page_list_page_allocation_rejects_limits_before_modifying_the_destination() {
+        let mut result = init_opts(Options {
+            cols: 1,
+            rows: 1,
+            max_size: Some(0),
+            max_lines: None,
+        });
+
+        // The effective minimum permits one complete page beyond the active page.
+        // Fill that allowance so the following allocation exceeds the byte limit.
+        {
+            let mut allocation = result.allocate_page(Capacity::new(1, 1)).unwrap();
+            allocation.page().size.rows = 1;
+            allocation.finalize(Location::Prepend, FinalizeOptions::default()).unwrap();
+        }
+
+        let before_first = first(&result);
+        let before_total_rows = result.total_rows;
+        let before_page_size = result.page_size;
+
+        let mut allocation = result.allocate_page(Capacity::new(1, 1)).unwrap();
+        allocation.page().size.rows = 1;
+        assert_eq!(
+            FinalizeError::MaxSizeExceeded,
+            allocation
+                .finalize(Location::Prepend, FinalizeOptions::default())
+                .unwrap_err()
+        );
+
+        assert_eq!(before_first, first(&result));
+        assert_eq!(before_total_rows, result.total_rows);
+        assert_eq!(before_page_size, result.page_size);
+        result.assert_integrity();
+        drop(allocation);
+    }
+
+    #[test]
+    fn page_list_page_allocation_allocation_failure_leaves_list_unchanged() {
+        let failing = FailingAllocator::leak(usize::MAX);
+        let mut result = PageList::init_alloc(
+            failing.allocator(),
+            Options {
+                cols: 1,
+                rows: 1,
+                max_size: None,
+                max_lines: None,
+            },
+        )
+        .unwrap();
+
+        let initial_first = first(&result);
+        let initial_total_rows = result.total_rows;
+        let initial_page_size = result.page_size;
+
+        // Existing pool capacity is deliberately an implementation detail. Allow
+        // preheated slots to succeed until allocation reaches node-pool growth.
+        failing.set_fail_index(failing.alloc_index());
+        let mut allocations: Vec<PageAllocation> = Vec::new();
+
+        let mut failed = false;
+        for _ in 0..64 {
+            match result.allocate_page(Capacity::new(1, 1)) {
+                Ok(a) => allocations.push(a),
+                Err(err) => {
+                    assert_eq!(AllocError::OutOfMemory, err);
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed);
+        assert!(failing.has_induced_failure());
+
+        // Detached allocations and failed pool growth never publish into the live
+        // list; the deferred cleanup returns every successful allocation.
+        assert_eq!(initial_first, first(&result));
+        assert_eq!(initial_total_rows, result.total_rows);
+        assert_eq!(initial_page_size, result.page_size);
+        result.assert_integrity();
+        drop(allocations);
+    }
+
+    #[test]
+    fn page_list_pin_row_movement_clamps_across_mixed_width_pages() {
+        let s = mixed_width_pin_list_for_test();
+
+        let first = first(&s);
+        let second = next(first);
+        let third = next(second);
+
+        assert!(pin_at(third, 2, 0).eql(pin_at(second, 3, 0).down(1).unwrap()));
+        assert!(pin_at(first, 1, 0).eql(pin_at(second, 3, 0).up(1).unwrap()));
+
+        match pin_at(second, 3, 0).down_overflow(10) {
+            PinOverflow::Offset(_) => panic!(),
+            PinOverflow::Overflow { end, .. } => assert!(pin_at(third, 2, 0).eql(end)),
+        }
+        match pin_at(second, 3, 0).up_overflow(10) {
+            PinOverflow::Offset(_) => panic!(),
+            PinOverflow::Overflow { end, .. } => assert!(pin_at(first, 1, 0).eql(end)),
+        }
+    }
+
+    #[test]
+    fn page_list_pin_wrapping_crosses_mixed_width_pages() {
+        let s = mixed_width_pin_list_for_test();
+
+        let first = first(&s);
+        let second = next(first);
+        let third = next(second);
+
+        assert!(pin_at(third, 2, 0).eql(pin_at(first, 1, 0).right_wrap(7).unwrap()));
+        assert!(pin_at(second, 0, 0).eql(pin_at(third, 2, 0).left_wrap(6).unwrap()));
+        assert!(Pin::new(first).left_wrap(1).is_none());
+        assert!(pin_at(third, 2, 0).right_wrap(1).is_none());
+    }
+
+    #[test]
+    fn page_list_pin_rejects_columns_beyond_mixed_width_page_bounds() {
+        let s = mixed_width_pin_list_for_test();
+
+        assert!(s.pin(pt_screen(1, 0)).is_some());
+        assert!(s.pin(pt_screen(2, 0)).is_none());
+        assert!(s.pin(pt_screen(3, 1)).is_some());
+        assert!(s.pin(pt_screen(3, 2)).is_none());
+    }
+
+    #[test]
+    fn page_list_pin_right_wrap_exact_row_multiple() {
+        let s = init(10, 3);
+
+        let start = s.pin(pt_active(5, 0)).unwrap();
+        let wrapped = start.right_wrap(14).unwrap();
+        let _ = wrapped.row_and_cell();
+
+        assert_eq!(Some(pt_active(9, 1)), s.point_from_pin(Tag::Active, wrapped));
+    }
+
+    #[test]
+    fn page_list_pin_left_wrap_exact_row_multiple() {
+        let s = init(10, 3);
+
+        let start = s.pin(pt_active(5, 2)).unwrap();
+        let wrapped = start.left_wrap(15).unwrap();
+        let _ = wrapped.row_and_cell();
+
+        assert_eq!(Some(pt_active(0, 1)), s.point_from_pin(Tag::Active, wrapped));
+    }
+
+    #[test]
+    fn page_list_pin_right_wrap_maximum_distance() {
+        let s = init(1, 3);
+
+        let start = s.pin(pt_active(0, 0)).unwrap();
+        assert_eq!(None, start.right_wrap(usize::MAX));
+    }
+
+    #[test]
+    fn page_list_pin_left_wrap_maximum_distance() {
+        let s = init(1, 3);
+
+        let start = s.pin(pt_active(0, 2)).unwrap();
+        assert_eq!(None, start.left_wrap(usize::MAX));
+    }
+
+    #[test]
+    fn page_list_incremental_compression_skips_visible_history() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(3);
+
+        let initial_activity = s.page_compression.activity_serial;
+        assert!(initial_activity > 0);
+
+        s.scroll(Scroll::Top);
+        let top_activity = s.page_compression.activity_serial;
+        assert!(top_activity != initial_activity);
+        assert_eq!(IncrementalCompressionResult::Complete, s.compress(CompressMode::Drain));
+
+        let first = first(&s);
+        let second = next(first);
+        assert_eq!(first, s.get_top_left(Tag::Viewport).node);
+        assert_eq!(first, s.get_bottom_right(Tag::Viewport).unwrap().node);
+        assert!(!n(first).is_compressed());
+
+        let mut eligible = CompressionIterator::init(&s);
+        let mut compressed_pages: usize = 0;
+        while let Some(node) = eligible.next() {
+            compressed_pages += 1;
+            assert!(n(node).is_compressed());
+        }
+        assert!(compressed_pages > 0);
+
+        // Move the viewport to the start of the second page. Rendering it restores
+        // that page, while the first page which just left view becomes eligible.
+        s.scroll(Scroll::Row(n(first).rows() as usize));
+        assert_eq!(second, s.get_top_left(Tag::Viewport).node);
+        let _ = pg(second);
+        assert!(!n(second).is_compressed());
+        let _ = s.compress(CompressMode::Drain);
+        assert!(n(first).is_compressed());
+        assert!(!n(second).is_compressed());
+
+        // Returning to the active area makes every complete historical page
+        // eligible again, including the page which was just visible.
+        s.scroll(Scroll::Active);
+        let _ = s.compress(CompressMode::Drain);
+        assert!(n(second).is_compressed());
+        assert!(!s.page_compression.flags.did_compress);
+        assert!(!s.page_compression.flags.verifying);
+        assert_eq!(None, s.page_compression.last_serial);
+        assert_eq!(0, s.page_compression.next_serial);
+    }
+
+    #[test]
+    fn page_list_owns_incremental_compression_state() {
+        let mut s = init(80, 24);
+
+        let state = IncrementalCompressionState {
+            flags: IncrementalCompressionFlags {
+                did_compress: true,
+                verifying: true,
+            },
+            activity_serial: 42,
+            last_serial: Some(42),
+            next_serial: 43,
+        };
+        let with_activity = |a: u64| IncrementalCompressionState {
+            activity_serial: a,
+            ..Default::default()
+        };
+
+        s.page_compression = state;
+        s.scroll(Scroll::Top);
+        assert_eq!(with_activity(43), s.page_compression);
+
+        // Every scroll restarts traversal, even if clamping leaves the viewport in
+        // the same place. Missing an eligible page is worse than a no-op pass.
+        s.page_compression = state;
+        s.scroll(Scroll::Top);
+        assert_eq!(with_activity(43), s.page_compression);
+
+        s.page_compression = state;
+        s.scroll(Scroll::Active);
+        assert_eq!(with_activity(43), s.page_compression);
+
+        s.page_compression = state;
+        s.resize(Resize {
+            cols: Some(80),
+            rows: Some(24),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(with_activity(43), s.page_compression);
+
+        s.page_compression = state;
+        s.reset();
+        assert_eq!(with_activity(42), s.page_compression);
+
+        s.page_compression = state;
+        assert_eq!(IncrementalCompressionResult::Complete, s.compress(CompressMode::Full));
+        assert_eq!(with_activity(42), s.page_compression);
+
+        s.page_compression = state;
+        let cloned = s.clone(clone_opts(pt_active(0, 0), None)).unwrap();
+        assert_eq!(IncrementalCompressionState::default(), cloned.page_compression);
+    }
+
+    #[test]
+    fn page_list_replacements_preserve_compression_continuation_and_mark_activity() {
+        let mut s = init(80, 24);
+
+        let state = IncrementalCompressionState {
+            flags: IncrementalCompressionFlags {
+                verifying: true,
+                did_compress: false,
+            },
+            activity_serial: 42,
+            last_serial: Some(7),
+            next_serial: 8,
+        };
+        let expected = IncrementalCompressionState {
+            activity_serial: 43,
+            ..state
+        };
+
+        s.page_compression = state;
+        let replacement = s.increase_capacity(first(&s), None).unwrap();
+        assert_eq!(expected, s.page_compression);
+
+        s.page_compression = state;
+        s.compact(replacement).unwrap().unwrap();
+        assert_eq!(expected, s.page_compression);
+    }
+
+    #[test]
+    fn page_list_incremental_compression_bounds_inspected_pages() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(INCREMENTAL_COMPRESSION_MAX_INSPECTED + 1);
+
+        // Precompress every candidate so the incremental pass exercises its
+        // metadata-only skip budget without stopping at a resident attempt.
+        let _ = s.compress(CompressMode::Full);
+        s.page_compression.reset();
+        s.page_compression.mark_activity();
+        assert_eq!(INCREMENTAL_COMPRESSION_MAX_INSPECTED + 1, s.memory_stats().compressed_pages);
+
+        let mut expected_last = first(&s);
+        for _ in 1..INCREMENTAL_COMPRESSION_MAX_INSPECTED {
+            expected_last = next(expected_last);
+        }
+
+        let first_r = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, first_r);
+        assert_eq!(n(expected_last).serial, s.page_compression.last_serial.unwrap());
+
+        let second = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, second);
+        assert!(s.page_compression.flags.verifying);
+        assert!(s.page_compression.last_serial.is_none());
+
+        // The verification pass is bounded independently, too.
+        assert_eq!(IncrementalCompressionResult::Pending, s.compress(CompressMode::Incremental));
+        assert_eq!(IncrementalCompressionResult::Complete, s.compress(CompressMode::Incremental));
+    }
+
+    #[test]
+    fn page_list_incremental_compression_advances_after_failure() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(2);
+
+        let first = first(&s);
+        let second = next(first);
+        random_bytes(0x494E_4352_5041_5353, mem(pg(first)));
+
+        let failed = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, failed);
+        assert!(!n(first).is_compressed());
+
+        // The unsuccessful first page does not stall the pass. The next step
+        // continues at the following serial and compresses that page.
+        let continued = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, continued);
+        assert!(n(second).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_advances_after_allocation_failure() {
+        let failing = FailingAllocator::leak(usize::MAX);
+        let mut s = PageList::init_alloc(
+            failing.allocator(),
+            Options {
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.grow_cold_pages_for_test(2);
+        let first = first(&s);
+        let second = next(first);
+
+        // Pool preheating supplies compression scratch. Failing the allocator's
+        // next request therefore rejects the exact encoded allocation while the
+        // source page and pass remain valid.
+        failing.set_fail_index(failing.alloc_index());
+        let failed = s.compress(CompressMode::Incremental);
+        assert!(failing.has_induced_failure());
+        assert_eq!(IncrementalCompressionResult::Pending, failed);
+        assert!(!n(first).is_compressed());
+
+        // Allow allocations again. The pass must continue with the following page
+        // rather than retrying the failed candidate.
+        failing.set_fail_index(usize::MAX);
+        let continued = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, continued);
+        assert!(n(second).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_advances_after_decommit_failure() {
+        let tw = &COMPRESS_PAGE_TW;
+
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(2);
+
+        tw.error_always(CompressPageFailPoint::Decommit, DecommitError::DecommitFailed);
+        let failed = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, failed);
+        assert!(!n(first(&s)).is_compressed());
+        tw.end(tripwire::ResetMode::Reset).unwrap();
+
+        // The failed candidate remains resident and the pass continues at the
+        // next serial once reclamation is available again.
+        let continued = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, continued);
+        assert!(n(next(first(&s))).is_compressed());
+        tw.end(tripwire::ResetMode::Reset).unwrap_or(());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_restarts_after_replacement() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(1);
+
+        let initial = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, initial);
+        assert!(n(first(&s)).is_compressed());
+
+        let old = first(&s);
+        let old_serial = n(old).serial;
+        let mut replacement = old;
+        while pg(replacement).memory.len() <= std_size() {
+            replacement = s
+                .increase_capacity(replacement, Some(IncreaseCapacity::GraphemeBytes))
+                .unwrap();
+        }
+        assert!(n(replacement).serial != old_serial);
+        assert!(pg(replacement).memory.len() > std_size());
+        assert!(!n(replacement).is_compressed());
+
+        // The exact continuation serial disappeared with the old node. The pass
+        // restarts at the first page and considers the oversized replacement.
+        let restarted = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, restarted);
+        assert!(n(replacement).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_restarts_after_reset() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(1);
+
+        let initial = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, initial);
+        assert!(n(first(&s)).is_compressed());
+
+        // Reset replaces every page and clears the PageList-owned traversal.
+        s.reset();
+        s.grow_cold_pages_for_test(1);
+        let restarted = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, restarted);
+        assert!(n(first(&s)).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_restarts_after_active_boundary_resize() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(1);
+
+        let initial = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, initial);
+        assert!(n(first(&s)).is_compressed());
+
+        let first = first(&s);
+        let all_rows = s.total_rows as CellCountInt;
+        s.resize(Resize {
+            rows: Some(all_rows),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(first, s.get_top_left(Tag::Active).node);
+
+        // Restore the page while it is active. Resize reset the traversal, and
+        // active contents remain ineligible.
+        let _ = pg(first);
+        let active_r = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, active_r);
+        assert_eq!(IncrementalCompressionResult::Complete, s.compress(CompressMode::Incremental));
+
+        // Shrinking the active area makes the page fully historical again. The
+        // resize reset the PageList-owned cursor, so the next step can reclaim it.
+        s.resize(Resize {
+            rows: Some(24),
+            ..Default::default()
+        })
+        .unwrap();
+        s.grow_cold_pages_for_test(1);
+        assert_eq!(IncrementalCompressionResult::Pending, s.compress(CompressMode::Incremental));
+        assert!(n(first).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_restarts_after_prune_reuse() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(2 * PagePool::item_size()),
+            ..Default::default()
+        });
+        s.grow_cold_pages_for_test(1);
+
+        let initial = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, initial);
+        assert!(n(first(&s)).is_compressed());
+
+        let reused = first(&s);
+        let old_serial = n(reused).serial;
+        while n(last(&s)).rows() < n(last(&s)).capacity().rows {
+            s.grow().unwrap();
+        }
+        assert_eq!(Some(reused), s.grow().unwrap());
+        assert!(n(reused).serial != old_serial);
+
+        // Make the remaining old page fully historical. The continuation serial
+        // disappeared when its node was recycled, so the pass safely restarts.
+        s.grow_cold_pages_for_test(1);
+        let _ = s.compress(CompressMode::Incremental);
+        assert_eq!(1, s.memory_stats().compressed_pages);
+    }
+
+    #[test]
+    fn page_list_bounded_pruning_after_partial_erase_preserves_live_serials() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(2 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        while s.total_pages() < 2 {
+            s.grow().unwrap();
+        }
+        let first = first(&s);
+        let old_serial = n(first).serial;
+        let old_rows = n(first).rows();
+
+        s.erase_history(Some(pt_history(0, 0)));
+        assert_eq!(first, s.pages.first.unwrap());
+        assert_eq!(old_rows - 1, n(first).rows());
+        assert!(!s.node_is_valid(first, old_serial));
+
+        s.fill_last_page_for_test();
+        s.grow().unwrap();
+        s.expect_live_page_serials_valid_for_test();
+    }
+
+    #[test]
+    fn page_list_partial_erase_restarts_compression_before_continuation() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(INCREMENTAL_COMPRESSION_MAX_INSPECTED + 1);
+        let _ = s.compress(CompressMode::Full);
+
+        let first = first(&s);
+        assert!(n(first).is_compressed());
+
+        let mut marker = first;
+        for _ in 1..INCREMENTAL_COMPRESSION_MAX_INSPECTED {
+            marker = next(marker);
+        }
+        s.page_compression = IncrementalCompressionState {
+            flags: IncrementalCompressionFlags {
+                verifying: true,
+                did_compress: false,
+            },
+            last_serial: Some(n(marker).serial),
+            next_serial: s.page_serial,
+            activity_serial: 0,
+        };
+
+        let activity = s.page_compression.activity_serial;
+        s.erase_history(Some(pt_history(0, 0)));
+        assert!(!n(first).is_compressed());
+        assert!(activity != s.page_compression.activity_serial);
+
+        // The changed generation is before the saved marker, so continuation must
+        // restart and recompress it instead of reporting verification complete.
+        assert_eq!(IncrementalCompressionResult::Pending, s.compress(CompressMode::Incremental));
+        assert!(n(first).is_compressed());
+    }
+
+    #[test]
+    fn page_list_bounded_pruning_after_split_invalidation_preserves_live_serials() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(2 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        while s.total_pages() < 2 {
+            s.grow().unwrap();
+        }
+        let first = first(&s);
+        let old_serial = n(first).serial;
+        let activity = s.page_compression.activity_serial;
+
+        s.split(pin_at(first, 0, n(first).rows() / 2)).unwrap();
+        assert!(!s.node_is_valid(first, old_serial));
+        assert!(activity != s.page_compression.activity_serial);
+
+        s.fill_last_page_for_test();
+        s.grow().unwrap();
+        s.expect_live_page_serials_valid_for_test();
+    }
+
+    #[test]
+    fn page_list_repeated_bounded_pruning_after_split_preserves_live_serials() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(3 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        let epoch = s.page_serial_epoch;
+        while s.total_pages() < 3 {
+            s.grow().unwrap();
+        }
+        let first = first(&s);
+        s.split(pin_at(first, 0, n(first).rows() / 2)).unwrap();
+
+        // The split target has a fresh serial but precedes older successor pages.
+        // Prune both the old source and then that target while verifying ordinary
+        // list mutation does not advance the whole-list validity epoch.
+        for _ in 0..2 {
+            while n(last(&s)).rows() < n(last(&s)).capacity().rows {
+                s.grow().unwrap();
+            }
+            s.grow().unwrap();
+
+            // Ordinary pruning invalidates one generation at a time through live
+            // list validation; only reset may begin a new whole-list epoch.
+            assert_eq!(epoch, s.page_serial_epoch);
+            s.expect_live_page_serials_valid_for_test();
+        }
+    }
+
+    #[test]
+    fn page_list_bounded_pruning_after_front_replacement_preserves_live_serials() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(2 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        while s.total_pages() < 2 {
+            s.grow().unwrap();
+        }
+        let old = first(&s);
+        let old_serial = n(old).serial;
+        let replacement = s.increase_capacity(old, None).unwrap();
+        assert!(replacement != old);
+        assert!(!s.node_is_valid(old, old_serial));
+
+        s.fill_last_page_for_test();
+        s.grow().unwrap();
+
+        s.expect_live_page_serials_valid_for_test();
+    }
+
+    #[test]
+    fn page_list_bounded_pruning_after_middle_replacement_preserves_live_serials() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(3 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        while s.total_pages() < 3 {
+            s.grow().unwrap();
+        }
+        let old = next(first(&s));
+        let old_serial = n(old).serial;
+        let replacement = s.increase_capacity(old, None).unwrap();
+        assert!(replacement != old);
+        assert!(!s.node_is_valid(old, old_serial));
+
+        // Prune the original first page and then the fresh middle replacement.
+        for _ in 0..2 {
+            s.fill_last_page_for_test();
+            s.grow().unwrap();
+            s.expect_live_page_serials_valid_for_test();
+        }
+    }
+
+    #[test]
+    fn page_list_incremental_compression_restarts_after_earlier_replacement() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(3);
+
+        let _ = s.compress(CompressMode::Incremental);
+        let _ = s.compress(CompressMode::Incremental);
+        assert!(n(first(&s)).is_compressed());
+        assert!(n(next(first(&s))).is_compressed());
+
+        // Replace a page before the still-valid continuation marker. The list's
+        // allocation serial changes even though the marker itself remains, so the
+        // next step must restart and inspect the replacement.
+        let old_first = first(&s);
+        let old_serial = n(old_first).serial;
+        let replacement = s
+            .increase_capacity(old_first, Some(IncreaseCapacity::GraphemeBytes))
+            .unwrap();
+        assert!(n(replacement).serial != old_serial);
+        assert!(!n(replacement).is_compressed());
+
+        let _ = s.compress(CompressMode::Incremental);
+        assert!(n(replacement).is_compressed());
+    }
+
+    #[test]
+    fn page_list_incremental_compression_keeps_progress_after_tail_growth() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(INCREMENTAL_COMPRESSION_MAX_INSPECTED + 1);
+        let _ = s.compress(CompressMode::Full);
+        s.page_compression.reset();
+        s.page_compression.mark_activity();
+
+        let mut expected_last = first(&s);
+        for _ in 1..INCREMENTAL_COMPRESSION_MAX_INSPECTED {
+            expected_last = next(expected_last);
+        }
+
+        let first_r = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, first_r);
+        assert_eq!(n(expected_last).serial, s.page_compression.last_serial.unwrap());
+
+        // Allocate a new page at the active tail between steps. It is after the
+        // continuation marker and must not restart progress through cold history.
+        let next_serial = s.page_serial;
+        while s.page_serial == next_serial {
+            s.grow().unwrap();
+        }
+        let continued = s.compress(CompressMode::Incremental);
+        assert_eq!(IncrementalCompressionResult::Pending, continued);
+        assert!(s.page_compression.flags.verifying);
+    }
+
+    #[test]
+    fn page_list_memory_usage() {
+        let mut s = init(80, 24);
+
+        // A fresh list holds the preheated pool items, one of which backs
+        // the only page.
+        let fresh = s.memory_usage();
+        assert_eq!(s.total_pages(), fresh.pages);
+        assert_eq!(PAGE_PREHEAT * PagePool::item_size(), fresh.virtual_bytes);
+        assert_eq!(s.page_size, fresh.resident_bytes);
+        assert!(fresh.resident_bytes <= fresh.virtual_bytes);
+        assert_eq!(0, fresh.compressed_pages);
+        assert_eq!(0, fresh.compressed_bytes);
+
+        s.grow_cold_pages_for_test(2);
+        let before = s.memory_usage();
+        assert_eq!(s.total_pages(), before.pages);
+        assert_eq!(
+            s.page_size + s.pool.pages.free_count() * PagePool::item_size(),
+            before.virtual_bytes
+        );
+        assert!(before.resident_bytes <= before.virtual_bytes);
+
+        // Compression changes residency but not address space.
+        let _ = s.compress(CompressMode::Full);
+        let compressed = s.memory_usage();
+        assert_eq!(before.pages, compressed.pages);
+        assert_eq!(before.virtual_bytes, compressed.virtual_bytes);
+        assert!(compressed.resident_bytes < before.resident_bytes);
+        assert_eq!(2, compressed.compressed_pages);
+        assert!(compressed.compressed_bytes > 0);
+        assert_eq!(s.memory_stats().estimated_resident_bytes(), compressed.resident_bytes);
+
+        // The query itself never restores a page.
+        assert_eq!(compressed, s.memory_usage());
+
+        // Reading a page restores it.
+        let _ = pg(first(&s));
+        let restored = s.memory_usage();
+        assert_eq!(1, restored.compressed_pages);
+        assert!(restored.resident_bytes > compressed.resident_bytes);
+        assert_eq!(before.virtual_bytes, restored.virtual_bytes);
+
+        // Destroyed pages go back to the pool: the address space is kept but
+        // the memory is no longer resident.
+        s.erase_rows(pt_history(0, 0), None);
+        let erased = s.memory_usage();
+        assert!(erased.pages < restored.pages);
+        assert_eq!(before.virtual_bytes, erased.virtual_bytes);
+        assert!(erased.resident_bytes < restored.resident_bytes);
+    }
+
+    #[test]
+    fn page_list_memory_stats_do_not_restore_compressed_pages() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(2);
+
+        let before = s.memory_stats();
+        assert_eq!(s.total_pages(), before.resident_pages);
+        assert_eq!(0, before.compressed_pages);
+        assert_eq!(s.page_size, before.raw_bytes);
+        assert_eq!(before.raw_bytes, before.resident_raw_bytes);
+        assert_eq!(0, before.decommitted_raw_bytes);
+        assert_eq!(s.page_size, before.resident_backing_bytes);
+        assert_eq!(0, before.encoded_bytes);
+        assert_eq!(before.resident_backing_bytes, before.estimated_resident_bytes());
+        assert_eq!(0, before.estimated_savings());
+
+        let _ = s.compress(CompressMode::Full);
+        let first = first(&s);
+        assert_eq!(Storage::Compressed, n(first).storage());
+        assert!(n(first).page_if_resident().is_none());
+
+        let after = s.memory_stats();
+        assert!(n(first).is_compressed());
+        assert_eq!(s.total_pages(), after.resident_pages + after.compressed_pages);
+        assert_eq!(2, after.compressed_pages);
+        assert_eq!(s.page_size, after.raw_bytes);
+        assert_eq!(after.raw_bytes, after.resident_raw_bytes + after.decommitted_raw_bytes);
+        assert_eq!(
+            after.resident_backing_bytes + after.encoded_bytes,
+            after.estimated_resident_bytes()
+        );
+        assert_eq!(after.decommitted_raw_bytes - after.encoded_bytes, after.estimated_savings());
+
+        let first_raw_len = n(first).metadata().memory.len();
+        let first_encoded_len = encoded(first).len();
+        let _ = pg(first);
+        assert_eq!(Storage::Resident, n(first).storage());
+        assert!(n(first).page_if_resident().is_some());
+
+        let restored = s.memory_stats();
+        assert_eq!(after.resident_pages + 1, restored.resident_pages);
+        assert_eq!(after.compressed_pages - 1, restored.compressed_pages);
+        assert_eq!(after.raw_bytes, restored.raw_bytes);
+        assert_eq!(after.resident_raw_bytes + first_raw_len, restored.resident_raw_bytes);
+        assert_eq!(after.decommitted_raw_bytes - first_raw_len, restored.decommitted_raw_bytes);
+        assert_eq!(after.resident_backing_bytes + first_raw_len, restored.resident_backing_bytes);
+        assert_eq!(after.encoded_bytes - first_encoded_len, restored.encoded_bytes);
+    }
+
+    #[test]
+    fn page_list_preserved_page_keeps_compressed_storage() {
+        let mut s = init(80, 24);
+
+        let node = first(&s);
+        let resident = pg(node);
+        resident.dirty = true;
+        *cell_at(resident, 3, 2) = cp('X');
+
+        // Resident nodes can be borrowed without allocating an unnecessary copy.
+        {
+            let failing = FailingAllocator::leak(0);
+            let mut preserved = n(node).page_preserving_state(failing.allocator()).unwrap();
+            match preserved {
+                PreservedPage::Borrowed(page_) => assert_eq!(resident as *const Page, page_),
+                PreservedPage::Owned { .. } => panic!(),
+            }
+            assert!(!failing.has_induced_failure());
+            preserved.deinit();
+        }
+
+        let expected = mem(resident).to_vec();
+        let retained_ptr = resident.memory.ptr();
+
+        assert!(s.compress_page(node));
+        let stats = s.memory_stats();
+        let expected_encoded = encoded(node).to_vec();
+
+        // Test decommit simulates physical reclamation by clearing the retained
+        // mapping. A preserved page must decode elsewhere rather than restoring
+        // it.
+        assert!(mem(n(node).metadata()).iter().all(|&b| b == 0));
+
+        // Preserved-page allocation is opportunistic for callers. Failure leaves
+        // the node and its compressed representation untouched.
+        let failing = FailingAllocator::leak(0);
+        assert_eq!(
+            AllocError::OutOfMemory,
+            n(node).page_preserving_state(failing.allocator()).unwrap_err()
+        );
+        assert_eq!(Storage::Compressed, n(node).storage());
+        assert_eq!(stats, s.memory_stats());
+
+        let mut preserved = n(node).page_preserving_state(Allocator::GLOBAL).unwrap();
+        match preserved {
+            PreservedPage::Borrowed(_) => panic!(),
+            PreservedPage::Owned { .. } => {}
+        }
+        let page_ = preserved.page();
+
+        assert!(page_.memory.ptr() != retained_ptr);
+        assert_eq!(&expected[..], mem(page_));
+        assert!(page_.dirty);
+        assert_eq!('X' as u32, cell_at(page_, 3, 2).content_codepoint());
+
+        // The node still owns the same compressed representation, and neither its
+        // storage accounting nor its discarded raw mapping changed while cloning.
+        assert_eq!(Storage::Compressed, n(node).storage());
+        assert_eq!(stats, s.memory_stats());
+        assert_eq!(retained_ptr, n(node).metadata().memory.ptr());
+        assert!(mem(n(node).metadata()).iter().all(|&b| b == 0));
+        assert_eq!(&expected_encoded[..], encoded(node));
+        preserved.deinit();
+    }
+
+    #[test]
+    fn page_list_memory_stats_include_unused_pool_backing() {
+        let mut s = init(80, 24);
+
+        // Pool allocation ownership is based on the requested layout fitting in a
+        // standard item. The Page itself exposes only the initialized prefix.
+        let node = s.create_page(CreatePage::cap(Capacity::new(1, 1))).unwrap();
+        assert_eq!(Owned::Pool, n(node).owned);
+        assert!(pg(node).memory.len() < PagePool::item_size());
+        pg(node).size.rows = 1;
+        append_node(&mut s, node);
+        s.total_rows += 1;
+
+        let raw_len = n(node).metadata().memory.len();
+        let before = s.memory_stats();
+        assert!(before.raw_bytes < s.page_size);
+        assert_eq!(before.raw_bytes, before.resident_raw_bytes);
+        assert_eq!(s.page_size, before.resident_backing_bytes);
+        assert_eq!(s.page_size, before.estimated_resident_bytes());
+
+        assert!(s.compress_page(node));
+        let encoded_len = encoded(node).len();
+        let compressed = s.memory_stats();
+        assert_eq!(before.raw_bytes, compressed.raw_bytes);
+        assert_eq!(before.resident_raw_bytes - raw_len, compressed.resident_raw_bytes);
+        assert_eq!(raw_len, compressed.decommitted_raw_bytes);
+        assert_eq!(before.resident_backing_bytes - raw_len, compressed.resident_backing_bytes);
+        assert_eq!(encoded_len, compressed.encoded_bytes);
+        assert_eq!(
+            before.estimated_resident_bytes() - raw_len + encoded_len,
+            compressed.estimated_resident_bytes()
+        );
+    }
+
+    #[test]
+    fn page_list_does_not_compress_the_mixed_history_and_active_page() {
+        let mut s = init(80, 24);
+
+        // One additional row creates history, but the history and all active rows
+        // still share the first page. The active boundary therefore has a
+        // historical prefix and must remain resident as one indivisible mapping.
+        s.grow().unwrap();
+        let active = s.get_top_left(Tag::Active);
+        assert_eq!(first(&s), active.node);
+        assert!(active.y > 0);
+
+        let _ = s.compress(CompressMode::Full);
+        assert!(!n(first(&s)).is_compressed());
+    }
+
+    #[test]
+    fn page_list_compresses_only_complete_cold_history_pages() {
+        // More active rows than one page at these dimensions can hold ensures the
+        // active area spans multiple nodes when the pass chooses its boundary.
+        let active_rows = initial_capacity(80).rows + 1;
+        let mut s = init(80, active_rows);
+        s.grow_cold_pages_for_test(2);
+
+        // Move the active top into the boundary page so it has both a historical
+        // prefix and active rows while the active area still spans later pages.
+        s.grow().unwrap();
+
+        let active = s.get_top_left(Tag::Active);
+        let active_node = active.node;
+        assert!(active.y > 0);
+        assert!(active_node != last(&s));
+
+        let mut expected_compressed: usize = 0;
+        let mut expected_raw_bytes: usize = 0;
+        let mut current = s.pages.first;
+        while let Some(node) = current {
+            if node == active_node {
+                break;
+            }
+            expected_compressed += 1;
+            expected_raw_bytes += n(node).metadata().memory.len();
+            current = n(node).next;
+        }
+        assert_eq!(2, expected_compressed);
+
+        let first = first(&s);
+        *cell_at(pg(first), 0, 0) = cp('X');
+        let expected = mem(pg(first)).to_vec();
+        let first_memory = pg(first).memory.ptr();
+        let page_size = s.page_size;
+
+        let _ = s.compress(CompressMode::Full);
+        let memory = s.memory_stats();
+        assert_eq!(expected_compressed, memory.compressed_pages);
+        assert_eq!(expected_raw_bytes, memory.decommitted_raw_bytes);
+        assert!(memory.encoded_bytes < memory.decommitted_raw_bytes);
+        assert_eq!(page_size, s.page_size);
+
+        current = s.pages.first;
+        let mut actual_encoded_bytes: usize = 0;
+        while let Some(node) = current {
+            if node == active_node {
+                break;
+            }
+            assert!(n(node).is_compressed());
+            actual_encoded_bytes += encoded(node).len();
+            current = n(node).next;
+        }
+        assert_eq!(actual_encoded_bytes, memory.encoded_bytes);
+        current = Some(active_node);
+        while let Some(node) = current {
+            assert!(!n(node).is_compressed());
+            current = n(node).next;
+        }
+
+        // Restoring the oldest page preserves both the mapping identity and all
+        // of its bytes even though the pass discarded its physical pages.
+        assert_eq!(first_memory, n(first).metadata().memory.ptr());
+        assert_eq!(&expected[..], mem(pg(first)));
+        assert_eq!(first_memory, pg(first).memory.ptr());
+    }
+
+    #[test]
+    fn page_list_lazily_restores_compressed_history_made_active_by_resize() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(1);
+
+        let first = first(&s);
+        *cell_at(pg(first), 0, 0) = cp('X');
+        let memory_ptr = pg(first).memory.ptr();
+        let memory_len = pg(first).memory.len();
+        let page_size = s.page_size;
+
+        let _ = s.compress(CompressMode::Full);
+        assert!(n(first).is_compressed());
+
+        // Pull all scrollback into the active area by making the viewport as tall
+        // as the complete screen. A row-only resize needs only page metadata, so
+        // the newly active page can remain compressed until its contents are used.
+        let all_rows = s.total_rows as CellCountInt;
+        s.resize(Resize {
+            rows: Some(all_rows),
+            ..Default::default()
+        })
+        .unwrap();
+        let active = s.get_top_left(Tag::Active);
+        assert_eq!(first, active.node);
+        assert_eq!(0, active.y);
+        assert!(n(first).is_compressed());
+        assert_eq!(page_size, s.page_size);
+
+        // The compression pass must not reconsider the node now that it is active.
+        // Content access follows the normal page boundary, which recommits and
+        // restores the retained mapping before returning the cell.
+        let _ = s.compress(CompressMode::Full);
+        assert!(n(first).is_compressed());
+        let cell = s.get_cell(pt_active(0, 0)).unwrap();
+        assert_eq!('X' as u32, unsafe { (*cell.cell).content_codepoint() });
+        assert!(!n(first).is_compressed());
+        assert_eq!(memory_ptr, pg(first).memory.ptr());
+        assert_eq!(memory_len, pg(first).memory.len());
+        assert_eq!(page_size, s.page_size);
+    }
+
+    #[test]
+    fn page_list_full_and_incremental_compression_skip_a_spanning_viewport() {
+        let mut full = init(80, 24);
+        full.grow_cold_pages_for_test(3);
+
+        let mut incremental = init(80, 24);
+        incremental.grow_cold_pages_for_test(3);
+
+        // Start near the end of the first page so the viewport intersects both
+        // the first and second historical page mappings.
+        let first = first(&full);
+        let overlap_rows: usize = full.rows as usize / 2;
+        let viewport_row: usize = n(first).rows() as usize - overlap_rows;
+        full.scroll(Scroll::Row(viewport_row));
+        incremental.scroll(Scroll::Row(viewport_row));
+        assert!(full.get_top_left(Tag::Viewport).node != full.get_bottom_right(Tag::Viewport).unwrap().node);
+        let second = next(first);
+        assert_eq!(first, full.get_top_left(Tag::Viewport).node);
+        assert_eq!(second, full.get_bottom_right(Tag::Viewport).unwrap().node);
+
+        let _ = full.compress(CompressMode::Full);
+        let _ = incremental.compress(CompressMode::Drain);
+        assert_eq!(full.memory_stats(), incremental.memory_stats());
+        assert!(!n(first).is_compressed());
+        assert!(!n(second).is_compressed());
+
+        let full_active = full.get_top_left(Tag::Active).node;
+        let incremental_active = incremental.get_top_left(Tag::Active).node;
+        let mut full_node = first;
+        let mut incremental_node = incremental.pages.first.unwrap();
+        while full_node != full_active {
+            assert_eq!(n(full_node).is_compressed(), n(incremental_node).is_compressed());
+
+            full_node = next(full_node);
+            incremental_node = next(incremental_node);
+        }
+        assert_eq!(incremental_active, incremental_node);
+
+        let mut eligible = CompressionIterator::init(&full);
+        let mut compressed_pages: usize = 0;
+        while let Some(node) = eligible.next() {
+            compressed_pages += 1;
+            assert!(n(node).is_compressed());
+        }
+        assert!(compressed_pages > 0);
+    }
+
+    #[test]
+    fn page_list_cold_compression_continues_after_an_incompressible_page() {
+        let mut s = init(80, 24);
+        s.grow_cold_pages_for_test(2);
+
+        let first = first(&s);
+        let second = next(first);
+        random_bytes(0x434F_4C44_5041_4745, mem(pg(first)));
+
+        let page_size = s.page_size;
+        let _ = s.compress(CompressMode::Full);
+        let memory = s.memory_stats();
+        assert_eq!(1, memory.compressed_pages);
+        assert!(!n(first).is_compressed());
+        assert!(n(second).is_compressed());
+        assert_eq!(n(second).metadata().memory.len(), memory.decommitted_raw_bytes);
+        assert!(memory.encoded_bytes < memory.decommitted_raw_bytes);
+        assert_eq!(page_size, s.page_size);
+
+        // Failed resident candidates are deliberately retried on later passes,
+        // while the successful page remains compressed and is skipped.
+        let _ = s.compress(CompressMode::Full);
+        assert_eq!(memory, s.memory_stats());
+    }
+
+    #[test]
+    fn page_list_compression_restores_through_page_access() {
+        let mut s = init(80, 24);
+
+        let node = first(&s);
+        let page = pg(node);
+        page.dirty = true;
+        *cell_at(page, 3, 2) = cp('X');
+
+        let expected = mem(page).to_vec();
+        let memory_ptr = page.memory.ptr();
+        let memory_len = page.memory.len();
+        let page_size = s.page_size;
+
+        assert!(s.compress_page(node));
+        assert!(n(node).is_compressed());
+        assert_eq!(24, n(node).rows());
+        assert_eq!(80, n(node).cols());
+        assert_eq!(memory_ptr, n(node).metadata().memory.ptr());
+        assert_eq!(memory_len, n(node).metadata().memory.len());
+        assert_eq!(page_size, s.page_size);
+
+        // Pin access restores the page without changing its retained mapping.
+        let page_pin = pin_at(node, 3, 2);
+        assert_eq!('X' as u32, pin_rac(page_pin).1.content_codepoint());
+        assert!(!n(node).is_compressed());
+        assert_eq!(memory_ptr, pg(node).memory.ptr());
+        assert_eq!(&expected[..], mem(pg(node)));
+        assert!(pg(node).dirty);
+
+        // Recompressing exercises reuse of the page-pool scratch item. Page
+        // iterator chunks also restore before exposing row memory.
+        assert!(s.compress_page(node));
+        let mut page_it = Pin::new(node).page_iterator(Direction::RightDown, None);
+        let chunk = page_it.next().unwrap();
+        assert_eq!(n(node).rows() as usize, chunk.rows().len());
+        assert!(!n(node).is_compressed());
+        assert_eq!(&expected[..], mem(pg(node)));
+
+        // Read-only PageList operations restore through the same boundary.
+        assert!(s.compress_page(node));
+        let cloned = s.clone(clone_opts(pt_screen(0, 0), None)).unwrap();
+        assert!(!n(node).is_compressed());
+        assert_eq!('X' as u32, cell_at(pg(first(&cloned)), 3, 2).content_codepoint());
+    }
+
+    #[test]
+    fn page_list_compression_uses_temporary_scratch_for_oversized_pages() {
+        let mut s = init(80, 24);
+
+        let mut node = first(&s);
+        while pg(node).memory.len() <= std_size() {
+            node = s.increase_capacity(node, Some(IncreaseCapacity::GraphemeBytes)).unwrap();
+        }
+
+        let expected = mem(pg(node)).to_vec();
+        let memory_ptr = pg(node).memory.ptr();
+        let memory_len = pg(node).memory.len();
+        let page_size = s.page_size;
+
+        assert!(s.compress_page(node));
+        assert!(n(node).is_compressed());
+        assert_eq!(page_size, s.page_size);
+        assert_eq!(memory_ptr, n(node).metadata().memory.ptr());
+        assert_eq!(memory_len, n(node).metadata().memory.len());
+
+        assert_eq!(&expected[..], mem(pg(node)));
+        assert!(!n(node).is_compressed());
+        assert_eq!(memory_ptr, pg(node).memory.ptr());
+    }
+
+    #[test]
+    fn page_list_compression_leaves_incompressible_pages_resident() {
+        let mut s = init(80, 24);
+
+        let node = first(&s);
+        let original = mem(pg(node)).to_vec();
+
+        random_bytes(0x5041_4745_4C49_5354, mem(pg(node)));
+        let page_size = s.page_size;
+
+        assert!(!s.compress_page(node));
+        assert!(!n(node).is_compressed());
+        assert_eq!(page_size, s.page_size);
+
+        mem(pg(node)).copy_from_slice(&original);
+    }
+
+    #[test]
+    fn page_list_reset_discards_malformed_compressed_data() {
+        let mut s = init(80, 24);
+
+        let node = first(&s);
+        assert!(s.compress_page(node));
+        encoded(node).fill(0xFF);
+
+        s.reset();
+        assert!(!n(first(&s)).is_compressed());
+        assert_eq!(1, s.total_pages());
+    }
+
+    #[test]
+    fn page_list_deinit_discards_malformed_compressed_data() {
+        let mut s = init(80, 24);
+        let node = first(&s);
+        assert!(s.compress_page(node));
+        encoded(node).fill(0xFF);
+
+        drop(s);
+    }
+
+    #[test]
+    fn page_list_prune_reuses_malformed_compressed_page_memory() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(2 * PagePool::item_size()),
+            ..Default::default()
+        });
+
+        // Allocate the second page so the first one can be pruned and reused.
+        while s.pages.first == s.pages.last {
+            s.grow().unwrap();
+        }
+        let first = first(&s);
+        assert!(s.compress_page(first));
+        encoded(first).fill(0xFF);
+
+        let mut reused = false;
+        let growth_limit = n(last(&s)).capacity().rows as usize + 1;
+        for _ in 0..growth_limit {
+            if let Some(new_node) = s.grow().unwrap() {
+                if new_node == first {
+                    reused = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(reused);
+        assert_eq!(first, last(&s));
+        assert!(!n(first).is_compressed());
+        assert_eq!(1, n(first).rows());
+        pg(first).assert_integrity();
+    }
+
+    #[test]
+    fn page_list() {
+        let mut s = init(80, 24);
+        assert!(s.viewport == Viewport::Active);
+        assert!(s.pages.first.is_some());
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Initial total rows should be our row count
+        assert_eq!(s.rows as usize, s.total_rows);
+
+        // Our viewport pin must be defined. It isn't used until the
+        // viewport is a pin but it prevents undefined access on clone.
+        assert!(vp(&s).node == first(&s));
+
+        // Active area should be the top
+        assert_eq!(pin_at(first(&s), 0, 0), s.get_top_left(Tag::Active));
+
+        // Scrollbar should be where we expect it
+        assert_eq!(
+            Scrollbar {
+                total: s.rows as usize,
+                offset: 0,
+                len: s.rows as usize,
+            },
+            s.scrollbar()
+        );
+    }
+}
