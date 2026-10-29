@@ -1,0 +1,70 @@
+//! Port of `src/terminal/c/main.zig`.
+//!
+//! STATUS: not yet ported.
+
+// @generated-mods-begin (tools/scaffold.py; do not edit by hand)
+#[path = "allocator.rs"]
+pub mod allocator;
+#[path = "build_info.rs"]
+pub mod build_info;
+#[path = "cell.rs"]
+pub mod cell;
+#[path = "color.rs"]
+pub mod color;
+#[path = "color_scheme.rs"]
+pub mod color_scheme;
+#[path = "focus.rs"]
+pub mod focus;
+#[path = "formatter.rs"]
+pub mod formatter;
+#[path = "grid_ref.rs"]
+pub mod grid_ref;
+#[path = "grid_ref_tracked.rs"]
+pub mod grid_ref_tracked;
+#[path = "io.rs"]
+pub mod io;
+#[path = "key_encode.rs"]
+pub mod key_encode;
+#[path = "key_event.rs"]
+pub mod key_event;
+#[path = "kitty_graphics.rs"]
+pub mod kitty_graphics;
+#[path = "modes.rs"]
+pub mod modes;
+#[path = "mouse_encode.rs"]
+pub mod mouse_encode;
+#[path = "mouse_event.rs"]
+pub mod mouse_event;
+#[path = "osc.rs"]
+pub mod osc;
+#[path = "paste.rs"]
+pub mod paste;
+#[path = "render.rs"]
+pub mod render;
+#[path = "result.rs"]
+pub mod result;
+#[path = "row.rs"]
+pub mod row;
+#[path = "search.rs"]
+pub mod search;
+#[path = "selection.rs"]
+pub mod selection;
+#[path = "selection_gesture.rs"]
+pub mod selection_gesture;
+#[path = "sgr.rs"]
+pub mod sgr;
+#[path = "size_report.rs"]
+pub mod size_report;
+#[path = "snapshot.rs"]
+pub mod snapshot;
+#[path = "style.rs"]
+pub mod style;
+#[path = "sys.rs"]
+pub mod sys;
+#[path = "terminal.rs"]
+pub mod terminal;
+#[path = "types.rs"]
+pub mod types;
+#[path = "unicode.rs"]
+pub mod unicode;
+// @generated-mods-end

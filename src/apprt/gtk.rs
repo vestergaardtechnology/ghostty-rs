@@ -1,0 +1,46 @@
+//! Port of `src/apprt/gtk.zig`.
+//!
+//! STATUS: not yet ported.
+
+// @generated-mods-begin (tools/scaffold.py; do not edit by hand)
+#[path = "gtk/adw_version.rs"]
+pub mod adw_version;
+#[path = "gtk/app.rs"]
+pub mod app;
+#[path = "gtk/build/mod.rs"]
+pub mod build;
+#[path = "gtk/cgroup.rs"]
+pub mod cgroup;
+#[path = "gtk/class.rs"]
+pub mod class;
+#[path = "gtk/desktop_notifications.rs"]
+pub mod desktop_notifications;
+#[path = "gtk/ext.rs"]
+pub mod ext;
+#[path = "gtk/flatpak.rs"]
+pub mod flatpak;
+#[path = "gtk/gsettings.rs"]
+pub mod gsettings;
+#[path = "gtk/gtk_version.rs"]
+pub mod gtk_version;
+#[path = "gtk/ipc/mod.rs"]
+pub mod ipc;
+#[path = "gtk/key.rs"]
+pub mod key;
+#[path = "gtk/media.rs"]
+pub mod media;
+#[path = "gtk/portal.rs"]
+pub mod portal;
+#[path = "gtk/post_fork.rs"]
+pub mod post_fork;
+#[path = "gtk/pre_exec.rs"]
+pub mod pre_exec;
+#[path = "gtk/scale.rs"]
+pub mod scale;
+#[path = "gtk/surface.rs"]
+pub mod surface;
+#[path = "gtk/weak_ref.rs"]
+pub mod weak_ref;
+#[path = "gtk/winproto.rs"]
+pub mod winproto;
+// @generated-mods-end
