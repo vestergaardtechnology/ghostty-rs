@@ -83,6 +83,14 @@ pub fn g_value_holds(value: Option<&glib::Value>, g_type: glib::Type) -> bool {
     }
 }
 
+/// `glib.Source.remove(id) != 0`: removes the source, returning false
+/// (instead of panicking like `glib::SourceId::remove`) if it no longer
+/// exists, so callers can log it as the Zig code does.
+pub(crate) fn source_remove(id: glib::SourceId) -> bool {
+    // SAFETY: g_source_remove accepts any ID and reports unknown ones.
+    unsafe { glib::ffi::g_source_remove(id.as_raw()) != glib::ffi::GFALSE }
+}
+
 /// Test-only helper: GTK may only be used from the one thread that
 /// initialized it, but the Rust test harness runs tests on many threads.
 /// [`test_gtk::run`] runs a closure on a single, dedicated GTK thread
