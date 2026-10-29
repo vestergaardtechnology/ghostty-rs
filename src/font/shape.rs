@@ -14,11 +14,13 @@ use crate::terminal::page;
 use crate::terminal::style::Style;
 
 pub use super::shaper::cache::Cache;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use super::shaper::coretext;
 pub use super::shaper::feature::{Feature, FeatureList, DEFAULT_FEATURES};
 pub use super::shaper::harfbuzz;
 pub use super::shaper::noop;
 pub use super::shaper::run::{RunIterator, RunIteratorHook, TextRun};
+#[cfg(target_arch = "wasm32")]
 pub use super::shaper::web_canvas;
 
 /// Zig `default_features`.
