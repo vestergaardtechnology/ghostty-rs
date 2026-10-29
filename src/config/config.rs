@@ -9011,3 +9011,1984 @@ impl FormatEntry for RepeatableCommand {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::binding::{ActionKey, Value as BindingValue};
+
+    fn fmt_entry<T: FormatEntry + ?Sized>(name: &str, v: &T) -> String {
+        let mut buf = String::new();
+        v.format_entry(&mut formatterpkg::entry_formatter(name, &mut buf)).unwrap();
+        buf
+    }
+
+    /// Zig's `TestIterator`: yields the given strings, no location.
+    fn test_iter<'a>(data: &'a [&'a str]) -> args::SliceIterator<'a> {
+        args::slice_iterator(data)
+    }
+
+    // -- handle bom ---------------------------------------------------------
+
+    #[test]
+    fn handle_bom_in_config_files() {
+        {
+            let data: &[u8] = b"\xef\xbb\xbfabnormal-command-exit-runtime = 2500\n";
+            let mut cfg = Config::default();
+            cfg.load_reader(data, "/home/ghostty/.config/ghostty/config.ghostty").unwrap();
+            cfg.finalize().unwrap();
+
+            assert!(cfg._diagnostics.empty());
+            assert_eq!(2500, cfg.abnormal_command_exit_runtime);
+        }
+
+        {
+            let data: &[u8] = b"abnormal-command-exit-runtime = 2500\n";
+            let mut cfg = Config::default();
+            cfg.load_reader(data, "/home/ghostty/.config/ghostty/config.ghostty").unwrap();
+            cfg.finalize().unwrap();
+
+            assert!(cfg._diagnostics.empty());
+            assert_eq!(2500, cfg.abnormal_command_exit_runtime);
+        }
+    }
+
+    // -- WorkingDirectory ---------------------------------------------------
+
+    #[test]
+    fn working_directory_parse_cli() {
+        let mut wd = WorkingDirectory::Inherit;
+
+        wd.parse_cli(Some("inherit")).unwrap();
+        assert_eq!(WorkingDirectory::Inherit, wd);
+
+        wd.parse_cli(Some("home")).unwrap();
+        assert_eq!(WorkingDirectory::Home, wd);
+
+        wd.parse_cli(Some("~/projects/ghostty")).unwrap();
+        assert_eq!(Some("~/projects/ghostty"), wd.value());
+
+        wd.parse_cli(Some("\"/tmp path\"")).unwrap();
+        assert_eq!(Some("/tmp path"), wd.value());
+    }
+
+    #[test]
+    fn working_directory_finalize() {
+        let environ_map = crate::os::environ_map();
+
+        {
+            let mut wd = WorkingDirectory::Path("~/projects/ghostty".to_owned());
+            wd.finalize();
+
+            let mut buf = [0u8; MAX_PATH_BYTES];
+            let expected = crate::os::expand_home(&environ_map, "~/projects/ghostty", &mut buf)
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|_| "~/projects/ghostty".to_owned());
+            assert_eq!(expected, wd.value().unwrap());
+        }
+    }
+
+    // -- Color --------------------------------------------------------------
+
+    #[test]
+    fn color_parse_cli_hex() {
+        assert_eq!(Color { r: 0, g: 0, b: 0 }, Color::parse_cli(Some("#000000")).unwrap());
+        assert_eq!(Color { r: 10, g: 11, b: 12 }, Color::parse_cli(Some("#0A0B0C")).unwrap());
+        assert_eq!(Color { r: 10, g: 11, b: 12 }, Color::parse_cli(Some("0A0B0C")).unwrap());
+        assert_eq!(Color { r: 255, g: 255, b: 255 }, Color::parse_cli(Some("FFFFFF")).unwrap());
+        assert_eq!(Color { r: 255, g: 255, b: 255 }, Color::parse_cli(Some("FFF")).unwrap());
+        assert_eq!(Color { r: 51, g: 68, b: 85 }, Color::parse_cli(Some("#345")).unwrap());
+    }
+
+    #[test]
+    fn color_parse_cli_from_name() {
+        assert_eq!(Color { r: 0, g: 0, b: 0 }, Color::parse_cli(Some("black")).unwrap());
+    }
+
+    #[test]
+    fn color_format_config() {
+        let color = Color { r: 10, g: 11, b: 12 };
+        assert_eq!("a = #0a0b0c\n", fmt_entry("a", &color));
+    }
+
+    #[test]
+    fn color_parse_cli_with_whitespace() {
+        assert_eq!(
+            Color { r: 0xAA, g: 0xBB, b: 0xCC },
+            Color::parse_cli(Some(" #AABBCC   ")).unwrap()
+        );
+        assert_eq!(Color { r: 0, g: 0, b: 0 }, Color::parse_cli(Some("  black ")).unwrap());
+    }
+
+    // -- TerminalColor ------------------------------------------------------
+
+    #[test]
+    fn terminal_color_parse_cli() {
+        assert_eq!(
+            TerminalColor::Color(Color { r: 78, g: 42, b: 132 }),
+            TerminalColor::parse_cli(Some("#4e2a84")).unwrap()
+        );
+        assert_eq!(
+            TerminalColor::Color(Color { r: 0, g: 0, b: 0 }),
+            TerminalColor::parse_cli(Some("black")).unwrap()
+        );
+        assert_eq!(
+            TerminalColor::CellForeground,
+            TerminalColor::parse_cli(Some("cell-foreground")).unwrap()
+        );
+        assert_eq!(
+            TerminalColor::CellBackground,
+            TerminalColor::parse_cli(Some("cell-background")).unwrap()
+        );
+
+        assert_eq!(Err(Error::InvalidValue), TerminalColor::parse_cli(Some("a")));
+    }
+
+    #[test]
+    fn terminal_color_format_config() {
+        let sc = TerminalColor::CellForeground;
+        assert_eq!("a = cell-foreground\n", fmt_entry("a", &sc));
+    }
+
+    // -- BoldColor ----------------------------------------------------------
+
+    #[test]
+    fn bold_color_parse_cli() {
+        assert_eq!(
+            BoldColor::Color(Color { r: 78, g: 42, b: 132 }),
+            BoldColor::parse_cli(Some("#4e2a84")).unwrap()
+        );
+        assert_eq!(
+            BoldColor::Color(Color { r: 0, g: 0, b: 0 }),
+            BoldColor::parse_cli(Some("black")).unwrap()
+        );
+        assert_eq!(BoldColor::Bright, BoldColor::parse_cli(Some("bright")).unwrap());
+
+        assert_eq!(Err(Error::InvalidValue), BoldColor::parse_cli(Some("a")));
+    }
+
+    #[test]
+    fn bold_color_format_config() {
+        let sc = BoldColor::Bright;
+        assert_eq!("a = bright\n", fmt_entry("a", &sc));
+    }
+
+    // -- ColorList ----------------------------------------------------------
+
+    #[test]
+    fn color_list_parse_cli() {
+        let mut p = ColorList::default();
+        p.parse_cli(Some("black,white")).unwrap();
+        assert_eq!(2, p.colors.len());
+
+        // Test whitespace handling
+        p.parse_cli(Some("black, white")).unwrap(); // space after comma
+        assert_eq!(2, p.colors.len());
+        p.parse_cli(Some("black , white")).unwrap(); // spaces around comma
+        assert_eq!(2, p.colors.len());
+        p.parse_cli(Some(" black , white ")).unwrap(); // extra spaces at ends
+        assert_eq!(2, p.colors.len());
+
+        // Error cases
+        assert_eq!(Err(Error::ValueRequired), p.parse_cli(None));
+        assert_eq!(Err(Error::InvalidValue), p.parse_cli(Some(" ")));
+    }
+
+    #[test]
+    fn color_list_format() {
+        let mut p = ColorList::default();
+        p.parse_cli(Some("black,white")).unwrap();
+        assert_eq!("a = #000000,#ffffff\n", fmt_entry("a", &p));
+    }
+
+    #[test]
+    fn color_list_clone() {
+        let mut source = ColorList::default();
+        source.parse_cli(Some("#ff0000,#00ff00,#0000ff")).unwrap();
+
+        let cloned = source.clone();
+
+        assert!(source.equal(&cloned));
+        assert_eq!(source.colors_c.len(), cloned.colors_c.len());
+        for (src_c, clone_c) in source.colors_c.iter().zip(&cloned.colors_c) {
+            assert_eq!(src_c.r, clone_c.r);
+            assert_eq!(src_c.g, clone_c.g);
+            assert_eq!(src_c.b, clone_c.b);
+        }
+    }
+
+    // -- Palette ------------------------------------------------------------
+
+    #[test]
+    fn palette_parse_cli() {
+        let mut p = Palette::default();
+        p.parse_cli(Some("0=#AABBCC")).unwrap();
+        assert!(p.value[0].r == 0xAA);
+        assert!(p.value[0].g == 0xBB);
+        assert!(p.value[0].b == 0xCC);
+        assert!(p.mask.is_set(0));
+        assert!(!p.mask.is_set(1));
+    }
+
+    #[test]
+    fn palette_parse_cli_base() {
+        let mut p = Palette::default();
+
+        p.parse_cli(Some("0b1=#014589")).unwrap();
+        p.parse_cli(Some("0o7=#234567")).unwrap();
+        p.parse_cli(Some("0xF=#ABCDEF")).unwrap();
+
+        assert!(p.value[0b1].r == 0x01);
+        assert!(p.value[0b1].g == 0x45);
+        assert!(p.value[0b1].b == 0x89);
+
+        assert!(p.value[0o7].r == 0x23);
+        assert!(p.value[0o7].g == 0x45);
+        assert!(p.value[0o7].b == 0x67);
+
+        assert!(p.value[0xF].r == 0xAB);
+        assert!(p.value[0xF].g == 0xCD);
+        assert!(p.value[0xF].b == 0xEF);
+
+        assert!(p.mask.is_set(0b1));
+        assert!(p.mask.is_set(0o7));
+        assert!(p.mask.is_set(0xF));
+        assert!(!p.mask.is_set(0));
+        assert!(!p.mask.is_set(2));
+    }
+
+    #[test]
+    fn palette_parse_cli_overflow() {
+        let mut p = Palette::default();
+        assert_eq!(Err(Error::Other("Overflow")), p.parse_cli(Some("256=#AABBCC")));
+        // Mask should remain empty since parsing failed.
+        assert_eq!(0usize, p.mask.count());
+    }
+
+    #[test]
+    fn palette_format_config() {
+        let list = Palette::default();
+        assert_eq!("a = 0=#1d1f21\n", &fmt_entry("a", &list)[0..14]);
+    }
+
+    #[test]
+    fn palette_parse_cli_with_whitespace() {
+        let mut p = Palette::default();
+        p.parse_cli(Some("0 =  #AABBCC")).unwrap();
+        p.parse_cli(Some(" 1= #DDEEFF    ")).unwrap();
+        p.parse_cli(Some("  2  =  #123456 ")).unwrap();
+
+        assert!(p.value[0].r == 0xAA);
+        assert!(p.value[0].g == 0xBB);
+        assert!(p.value[0].b == 0xCC);
+
+        assert!(p.value[1].r == 0xDD);
+        assert!(p.value[1].g == 0xEE);
+        assert!(p.value[1].b == 0xFF);
+
+        assert!(p.value[2].r == 0x12);
+        assert!(p.value[2].g == 0x34);
+        assert!(p.value[2].b == 0x56);
+
+        assert!(p.mask.is_set(0));
+        assert!(p.mask.is_set(1));
+        assert!(p.mask.is_set(2));
+        assert!(!p.mask.is_set(3));
+    }
+
+    // -- RepeatableString ---------------------------------------------------
+
+    #[test]
+    fn repeatable_string_parse_cli() {
+        let mut list = RepeatableString::default();
+        list.parse_cli(Some("A")).unwrap();
+        list.parse_cli(Some("B")).unwrap();
+        assert_eq!(2usize, list.list.len());
+
+        list.parse_cli(Some("")).unwrap();
+        assert_eq!(0usize, list.list.len());
+    }
+
+    #[test]
+    fn repeatable_string_parse_cli_overwrite() {
+        let mut list = RepeatableString::default();
+        list.parse_cli(Some("A")).unwrap();
+
+        // Set our overwrite flag
+        list.overwrite_next = true;
+
+        list.parse_cli(Some("B")).unwrap();
+        assert_eq!(1usize, list.list.len());
+        list.parse_cli(Some("C")).unwrap();
+        assert_eq!(2usize, list.list.len());
+    }
+
+    #[test]
+    fn repeatable_string_format_config_empty() {
+        let list = RepeatableString::default();
+        assert_eq!("a = \n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_string_format_config_single_item() {
+        let mut list = RepeatableString::default();
+        list.parse_cli(Some("A")).unwrap();
+        assert_eq!("a = A\n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_string_format_config_multiple_items() {
+        let mut list = RepeatableString::default();
+        list.parse_cli(Some("A")).unwrap();
+        list.parse_cli(Some("B")).unwrap();
+        assert_eq!("a = A\na = B\n", fmt_entry("a", &list));
+    }
+
+    // -- SelectionWordChars -------------------------------------------------
+
+    #[test]
+    fn selection_word_chars_parse_cli() {
+        let mut chars = SelectionWordChars::default();
+        chars.parse_cli(Some(" \t;,")).unwrap();
+
+        // Should have null + 4 characters
+        assert_eq!(5usize, chars.codepoints.len());
+        assert_eq!(0u32, chars.codepoints[0]);
+        assert_eq!(' ' as u32, chars.codepoints[1]);
+        assert_eq!('\t' as u32, chars.codepoints[2]);
+        assert_eq!(';' as u32, chars.codepoints[3]);
+        assert_eq!(',' as u32, chars.codepoints[4]);
+    }
+
+    #[test]
+    fn selection_word_chars_parse_cli_escape_sequences() {
+        // \t escape should be parsed as tab
+        let mut chars = SelectionWordChars::default();
+        chars.parse_cli(Some(" \\t;,")).unwrap();
+
+        assert_eq!(5usize, chars.codepoints.len());
+        assert_eq!(0u32, chars.codepoints[0]);
+        assert_eq!(' ' as u32, chars.codepoints[1]);
+        assert_eq!('\t' as u32, chars.codepoints[2]);
+        assert_eq!(';' as u32, chars.codepoints[3]);
+        assert_eq!(',' as u32, chars.codepoints[4]);
+    }
+
+    #[test]
+    fn selection_word_chars_parse_cli_backslash_escape() {
+        // \\ should be parsed as a single backslash
+        let mut chars = SelectionWordChars::default();
+        chars.parse_cli(Some("\\\\;")).unwrap();
+
+        assert_eq!(3usize, chars.codepoints.len());
+        assert_eq!(0u32, chars.codepoints[0]);
+        assert_eq!('\\' as u32, chars.codepoints[1]);
+        assert_eq!(';' as u32, chars.codepoints[2]);
+    }
+
+    #[test]
+    fn selection_word_chars_parse_cli_unicode_escape() {
+        // \u{2502} should be parsed as │
+        let mut chars = SelectionWordChars::default();
+        chars.parse_cli(Some("\\u{2502};")).unwrap();
+
+        assert_eq!(3usize, chars.codepoints.len());
+        assert_eq!(0u32, chars.codepoints[0]);
+        assert_eq!('│' as u32, chars.codepoints[1]);
+        assert_eq!(';' as u32, chars.codepoints[2]);
+    }
+
+    #[test]
+    fn selection_word_chars_parse_cli_truncated_utf_8() {
+        let inputs: [&[u8]; 6] = [
+            b"\xc2",
+            b"\xe2",
+            b"\xe2\x94",
+            b"\xf0",
+            b"\xf0\x9f",
+            b"\xf0\x9f\x98",
+        ];
+        for input in inputs {
+            let mut chars = SelectionWordChars::default();
+            assert_eq!(Err(Error::InvalidValue), chars.parse_cli_bytes(Some(input)));
+        }
+    }
+
+    // -- RepeatableFontVariation --------------------------------------------
+
+    #[test]
+    fn repeatable_font_variation_parse_cli() {
+        let mut list = RepeatableFontVariation::default();
+        list.parse_cli(Some("wght=200")).unwrap();
+        list.parse_cli(Some("slnt=-15")).unwrap();
+
+        assert_eq!(2usize, list.list.len());
+        assert_eq!(
+            Variation {
+                id: VariationId::init(b"wght"),
+                value: 200.0,
+            },
+            list.list[0]
+        );
+        assert_eq!(
+            Variation {
+                id: VariationId::init(b"slnt"),
+                value: -15.0,
+            },
+            list.list[1]
+        );
+    }
+
+    #[test]
+    fn repeatable_font_variation_parse_cli_with_whitespace() {
+        let mut list = RepeatableFontVariation::default();
+        list.parse_cli(Some("wght =200")).unwrap();
+        list.parse_cli(Some("slnt= -15")).unwrap();
+
+        assert_eq!(2usize, list.list.len());
+        assert_eq!(
+            Variation {
+                id: VariationId::init(b"wght"),
+                value: 200.0,
+            },
+            list.list[0]
+        );
+        assert_eq!(
+            Variation {
+                id: VariationId::init(b"slnt"),
+                value: -15.0,
+            },
+            list.list[1]
+        );
+    }
+
+    #[test]
+    fn repeatable_font_variation_format_config_single() {
+        let mut list = RepeatableFontVariation::default();
+        list.parse_cli(Some("wght = 200")).unwrap();
+        assert_eq!("a = wght=200\n", fmt_entry("a", &list));
+    }
+
+    // -- Keybinds -----------------------------------------------------------
+
+    fn kb(keybinds: &mut Keybinds, input: &str) -> Result<(), Error> {
+        keybinds.parse_cli(Some(input))
+    }
+
+    #[test]
+    fn keybinds_parse_cli() {
+        let mut set = Keybinds::default();
+        kb(&mut set, "shift+a=copy_to_clipboard").unwrap();
+        kb(&mut set, "shift+a=csi:hello").unwrap();
+    }
+
+    #[test]
+    fn keybinds_format_config_single() {
+        let mut list = Keybinds::default();
+        kb(&mut list, "shift+a=csi:hello").unwrap();
+        assert_eq!("a = shift+a=csi:hello\n", fmt_entry("a", &list));
+    }
+
+    // Regression test for https://github.com/ghostty-org/ghostty/issues/2734
+    #[test]
+    fn keybinds_format_config_multiple_items() {
+        let mut list = Keybinds::default();
+        kb(&mut list, "ctrl+z>1=goto_tab:1").unwrap();
+        kb(&mut list, "ctrl+z>2=goto_tab:2").unwrap();
+
+        // Note they turn into translated keys because they match
+        // their ASCII mapping.
+        let want = "keybind = ctrl+z>1=goto_tab:1\nkeybind = ctrl+z>2=goto_tab:2\n";
+        assert_eq!(want, fmt_entry("keybind", &list));
+    }
+
+    #[test]
+    fn keybinds_format_config_multiple_items_nested() {
+        let mut list = Keybinds::default();
+        kb(&mut list, "ctrl+a>ctrl+b>n=new_window").unwrap();
+        kb(&mut list, "ctrl+a>ctrl+b>w=close_window").unwrap();
+        kb(&mut list, "ctrl+a>ctrl+c>t=new_tab").unwrap();
+        kb(&mut list, "ctrl+b>ctrl+d>a=previous_tab").unwrap();
+
+        // NB: This does not currently retain the order of the keybinds.
+        let want = "a = ctrl+a>ctrl+b>n=new_window\n\
+                    a = ctrl+a>ctrl+b>w=close_window\n\
+                    a = ctrl+a>ctrl+c>t=new_tab\n\
+                    a = ctrl+b>ctrl+d>a=previous_tab\n";
+        assert_eq!(want, fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_definition() {
+        let mut keybinds = Keybinds::default();
+
+        // Define a table by adding a binding to it
+        kb(&mut keybinds, "foo/shift+a=copy_to_clipboard").unwrap();
+        assert_eq!(1, keybinds.tables.len());
+        assert!(keybinds.tables.contains_key("foo"));
+
+        let table = keybinds.tables.get("foo").unwrap();
+        assert_eq!(1, table.bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_clear() {
+        let mut keybinds = Keybinds::default();
+
+        // Add a binding to a table
+        kb(&mut keybinds, "foo/shift+a=copy_to_clipboard").unwrap();
+        assert_eq!(1, keybinds.tables.get("foo").unwrap().bindings.len());
+
+        // Clear the table with "foo/"
+        kb(&mut keybinds, "foo/").unwrap();
+        assert_eq!(0, keybinds.tables.get("foo").unwrap().bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_multiple_bindings() {
+        let mut keybinds = Keybinds::default();
+
+        kb(&mut keybinds, "foo/shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds, "foo/shift+b=paste_from_clipboard").unwrap();
+        kb(&mut keybinds, "bar/ctrl+c=close_window").unwrap();
+
+        assert_eq!(2, keybinds.tables.len());
+        assert_eq!(2, keybinds.tables.get("foo").unwrap().bindings.len());
+        assert_eq!(1, keybinds.tables.get("bar").unwrap().bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_does_not_affect_root_set() {
+        let mut keybinds = Keybinds::default();
+
+        kb(&mut keybinds, "shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds, "foo/shift+b=paste_from_clipboard").unwrap();
+
+        // Root set should have the first binding
+        assert_eq!(1, keybinds.set.bindings.len());
+        // Table should have the second binding
+        assert_eq!(1, keybinds.tables.get("foo").unwrap().bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_empty_name_is_invalid() {
+        let mut keybinds = Keybinds::default();
+        assert_eq!(
+            Err(Error::Other("InvalidFormat")),
+            kb(&mut keybinds, "/shift+a=copy_to_clipboard")
+        );
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_with_key_sequence() {
+        let mut keybinds = Keybinds::default();
+
+        // Key sequences should work within tables
+        kb(&mut keybinds, "foo/ctrl+a>ctrl+b=new_window").unwrap();
+
+        let table = keybinds.tables.get("foo").unwrap();
+        assert_eq!(1, table.bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_slash_in_action_argument_is_not_a_table() {
+        let mut keybinds = Keybinds::default();
+
+        // A slash after the = should not be interpreted as a table delimiter
+        kb(&mut keybinds, "ctrl+a=text:/hello").unwrap();
+
+        // Should be in root set, not a table
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_slash_as_key_with_modifier_is_not_a_table() {
+        let mut keybinds = Keybinds::default();
+
+        // ctrl+/ should be parsed as a keybind with '/' as the key, not a table
+        kb(&mut keybinds, "ctrl+/=text:foo").unwrap();
+
+        // Should be in root set, not a table
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_shift_slash_as_key_is_not_a_table() {
+        let mut keybinds = Keybinds::default();
+
+        // shift+/ should be parsed as a keybind, not a table
+        kb(&mut keybinds, "shift+/=ignore").unwrap();
+
+        // Should be in root set, not a table
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_bare_slash_as_key_is_not_a_table() {
+        let mut keybinds = Keybinds::default();
+
+        // Bare / as a key should work (empty table name is rejected)
+        kb(&mut keybinds, "/=text:foo").unwrap();
+
+        // Should be in root set, not a table
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_slash_in_key_sequence_is_not_a_table() {
+        let mut keybinds = Keybinds::default();
+
+        // Key sequence ending with / should work
+        kb(&mut keybinds, "ctrl+a>ctrl+/=new_window").unwrap();
+
+        // Should be in root set, not a table
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_with_slash_in_binding() {
+        let mut keybinds = Keybinds::default();
+
+        // Table with a binding that uses / as the key
+        kb(&mut keybinds, "mytable//=text:foo").unwrap();
+
+        // Should be in the table
+        assert_eq!(0, keybinds.set.bindings.len());
+        assert_eq!(1, keybinds.tables.len());
+        assert!(keybinds.tables.contains_key("mytable"));
+        assert_eq!(1, keybinds.tables.get("mytable").unwrap().bindings.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_with_sequence_containing_slash() {
+        let mut keybinds = Keybinds::default();
+
+        // Table with a key sequence that ends with /
+        kb(&mut keybinds, "mytable/a>/=new_window").unwrap();
+
+        // Should be in the table
+        assert_eq!(0, keybinds.set.bindings.len());
+        assert_eq!(1, keybinds.tables.len());
+        assert!(keybinds.tables.contains_key("mytable"));
+    }
+
+    #[test]
+    fn keybinds_parse_cli_chain_without_prior_parsed_binding_is_invalid() {
+        let mut keybinds = Keybinds::default();
+
+        assert_eq!(Err(Error::Other("InvalidFormat")), kb(&mut keybinds, "chain=new_tab"));
+    }
+
+    #[test]
+    fn keybinds_parse_cli_table_chain_syntax_is_invalid() {
+        let mut keybinds = Keybinds::default();
+
+        kb(&mut keybinds, "foo/a=text:hello").unwrap();
+        assert_eq!(
+            Err(Error::Other("InvalidFormat")),
+            kb(&mut keybinds, "foo/chain=deactivate_key_table")
+        );
+    }
+
+    #[test]
+    fn keybinds_parse_cli_chain_applies_to_most_recent_table_binding() {
+        let mut keybinds = Keybinds::default();
+
+        kb(&mut keybinds, "ctrl+n=activate_key_table:foo").unwrap();
+        kb(&mut keybinds, "foo/a=text:hello").unwrap();
+        kb(&mut keybinds, "chain=deactivate_key_table").unwrap();
+
+        let root_entry = keybinds
+            .set
+            .get(Trigger {
+                mods: mods!(ctrl),
+                key: TriggerKey::Unicode('n' as u32),
+            })
+            .unwrap()
+            .value_ptr;
+        let BindingValue::Leaf(leaf) = root_entry else {
+            panic!("expected leaf");
+        };
+        assert_eq!(ActionKey::ActivateKeyTable, leaf.action.key());
+
+        let foo_entry = keybinds
+            .tables
+            .get("foo")
+            .unwrap()
+            .get(Trigger {
+                key: TriggerKey::Unicode('a' as u32),
+                mods: Mods::EMPTY,
+            })
+            .unwrap()
+            .value_ptr;
+        let BindingValue::LeafChained(chained) = foo_entry else {
+            panic!("expected leaf_chained");
+        };
+        assert_eq!(2usize, chained.actions.len());
+        assert_eq!(ActionKey::Text, chained.actions[0].key());
+        assert_eq!(ActionKey::DeactivateKeyTable, chained.actions[1].key());
+    }
+
+    #[test]
+    fn keybinds_clone_with_tables() {
+        let mut keybinds = Keybinds::default();
+        kb(&mut keybinds, "shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds, "foo/shift+b=paste_from_clipboard").unwrap();
+        kb(&mut keybinds, "bar/ctrl+c=close_window").unwrap();
+
+        let cloned = keybinds.clone();
+
+        // Verify the clone has the same structure
+        assert_eq!(keybinds.set.bindings.len(), cloned.set.bindings.len());
+        assert_eq!(keybinds.tables.len(), cloned.tables.len());
+        assert_eq!(
+            keybinds.tables.get("foo").unwrap().bindings.len(),
+            cloned.tables.get("foo").unwrap().bindings.len()
+        );
+        assert_eq!(
+            keybinds.tables.get("bar").unwrap().bindings.len(),
+            cloned.tables.get("bar").unwrap().bindings.len()
+        );
+    }
+
+    #[test]
+    fn keybinds_equal_with_tables() {
+        let mut keybinds1 = Keybinds::default();
+        kb(&mut keybinds1, "foo/shift+a=copy_to_clipboard").unwrap();
+
+        let mut keybinds2 = Keybinds::default();
+        kb(&mut keybinds2, "foo/shift+a=copy_to_clipboard").unwrap();
+
+        assert!(keybinds1.equal(&keybinds2));
+    }
+
+    #[test]
+    fn keybinds_equal_with_tables_different_table_count() {
+        let mut keybinds1 = Keybinds::default();
+        kb(&mut keybinds1, "foo/shift+a=copy_to_clipboard").unwrap();
+
+        let mut keybinds2 = Keybinds::default();
+        kb(&mut keybinds2, "foo/shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds2, "bar/shift+b=paste_from_clipboard").unwrap();
+
+        assert!(!keybinds1.equal(&keybinds2));
+    }
+
+    #[test]
+    fn keybinds_equal_with_tables_different_table_names() {
+        let mut keybinds1 = Keybinds::default();
+        kb(&mut keybinds1, "foo/shift+a=copy_to_clipboard").unwrap();
+
+        let mut keybinds2 = Keybinds::default();
+        kb(&mut keybinds2, "bar/shift+a=copy_to_clipboard").unwrap();
+
+        assert!(!keybinds1.equal(&keybinds2));
+    }
+
+    #[test]
+    fn keybinds_equal_with_tables_different_bindings() {
+        let mut keybinds1 = Keybinds::default();
+        kb(&mut keybinds1, "foo/shift+a=copy_to_clipboard").unwrap();
+
+        let mut keybinds2 = Keybinds::default();
+        kb(&mut keybinds2, "foo/shift+b=paste_from_clipboard").unwrap();
+
+        assert!(!keybinds1.equal(&keybinds2));
+    }
+
+    #[test]
+    fn keybinds_format_entry_with_tables() {
+        let mut keybinds = Keybinds::default();
+        kb(&mut keybinds, "foo/shift+a=csi:hello").unwrap();
+
+        assert_eq!("keybind = foo/shift+a=csi:hello\n", fmt_entry("keybind", &keybinds));
+    }
+
+    #[test]
+    fn keybinds_format_entry_with_tables_and_root_set() {
+        let mut keybinds = Keybinds::default();
+        kb(&mut keybinds, "shift+b=csi:world").unwrap();
+        kb(&mut keybinds, "foo/shift+a=csi:hello").unwrap();
+
+        let output = fmt_entry("keybind", &keybinds);
+        assert!(output.contains("keybind = shift+b=csi:world\n"));
+        assert!(output.contains("keybind = foo/shift+a=csi:hello\n"));
+    }
+
+    #[test]
+    fn keybinds_parse_cli_clear_clears_tables() {
+        let mut keybinds = Keybinds::default();
+
+        // Add bindings to root set and tables
+        kb(&mut keybinds, "shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds, "foo/shift+b=paste_from_clipboard").unwrap();
+        kb(&mut keybinds, "bar/ctrl+c=close_window").unwrap();
+
+        assert_eq!(1, keybinds.set.bindings.len());
+        assert_eq!(2, keybinds.tables.len());
+
+        // Clear all keybinds
+        kb(&mut keybinds, "clear").unwrap();
+
+        // Both root set and tables should be cleared
+        assert_eq!(0, keybinds.set.bindings.len());
+        assert_eq!(0, keybinds.tables.len());
+    }
+
+    #[test]
+    fn keybinds_parse_cli_reset_clears_tables() {
+        let mut keybinds = Keybinds::default();
+
+        // Add bindings to tables
+        kb(&mut keybinds, "foo/shift+a=copy_to_clipboard").unwrap();
+        kb(&mut keybinds, "bar/shift+b=paste_from_clipboard").unwrap();
+
+        assert_eq!(2, keybinds.tables.len());
+
+        // Reset to defaults (empty value)
+        kb(&mut keybinds, "").unwrap();
+
+        // Tables should be cleared, root set has defaults
+        assert_eq!(0, keybinds.tables.len());
+        assert!(!keybinds.set.bindings.is_empty());
+    }
+
+    // -- RepeatableCodepointMap ---------------------------------------------
+
+    #[test]
+    fn repeatable_codepoint_map_parse_cli() {
+        let mut list = RepeatableCodepointMap::default();
+        list.parse_cli(Some("U+ABCD=Comic Sans")).unwrap();
+        list.parse_cli(Some("U+0001 - U+0005=Verdana")).unwrap();
+        list.parse_cli(Some("U+0006-U+0009, U+ABCD=Courier")).unwrap();
+
+        assert_eq!(4usize, list.map.list.len());
+        {
+            let entry = &list.map.list[0];
+            assert_eq!([0xABCD, 0xABCD], entry.range);
+            assert_eq!("Comic Sans", entry.descriptor.family.as_deref().unwrap());
+        }
+        {
+            let entry = &list.map.list[1];
+            assert_eq!([1, 5], entry.range);
+            assert_eq!("Verdana", entry.descriptor.family.as_deref().unwrap());
+        }
+        {
+            let entry = &list.map.list[2];
+            assert_eq!([6, 9], entry.range);
+            assert_eq!("Courier", entry.descriptor.family.as_deref().unwrap());
+        }
+        {
+            let entry = &list.map.list[3];
+            assert_eq!([0xABCD, 0xABCD], entry.range);
+            assert_eq!("Courier", entry.descriptor.family.as_deref().unwrap());
+        }
+    }
+
+    #[test]
+    fn repeatable_codepoint_map_format_config_single() {
+        let mut list = RepeatableCodepointMap::default();
+        list.parse_cli(Some("U+ABCD=Comic Sans")).unwrap();
+        assert_eq!("a = U+ABCD=Comic Sans\n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_codepoint_map_format_config_range() {
+        let mut list = RepeatableCodepointMap::default();
+        list.parse_cli(Some("U+0001 - U+0005=Verdana")).unwrap();
+        assert_eq!("a = U+0001-U+0005=Verdana\n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_codepoint_map_format_config_multiple() {
+        let mut list = RepeatableCodepointMap::default();
+        list.parse_cli(Some("U+0006-U+0009, U+ABCD=Courier")).unwrap();
+        assert_eq!("a = U+0006-U+0009=Courier\na = U+ABCD=Courier\n", fmt_entry("a", &list));
+    }
+
+    // -- RepeatableClipboardCodepointMap ------------------------------------
+
+    #[test]
+    fn repeatable_clipboard_codepoint_map_parse_cli_codepoint_replacement() {
+        let mut list = RepeatableClipboardCodepointMap::default();
+        list.parse_cli(Some("U+2500=U+002D")).unwrap(); // box drawing → hyphen
+
+        assert_eq!(1usize, list.map.list.len());
+        let entry = &list.map.list[0];
+        assert_eq!([0x2500, 0x2500], entry.range);
+        assert_eq!(clipboard_codepoint_map::Replacement::Codepoint(0x002D), entry.replacement);
+    }
+
+    #[test]
+    fn repeatable_clipboard_codepoint_map_parse_cli_string_replacement() {
+        let mut list = RepeatableClipboardCodepointMap::default();
+        list.parse_cli(Some("U+03A3=SUM")).unwrap(); // Greek sigma → "SUM"
+
+        assert_eq!(1usize, list.map.list.len());
+        let entry = &list.map.list[0];
+        assert_eq!([0x03A3, 0x03A3], entry.range);
+        assert_eq!(
+            clipboard_codepoint_map::Replacement::String("SUM".to_owned()),
+            entry.replacement
+        );
+    }
+
+    #[test]
+    fn repeatable_clipboard_codepoint_map_parse_cli_range_replacement() {
+        let mut list = RepeatableClipboardCodepointMap::default();
+        list.parse_cli(Some("U+2500-U+2503=|")).unwrap(); // box drawing range → pipe
+
+        assert_eq!(1usize, list.map.list.len());
+        let entry = &list.map.list[0];
+        assert_eq!([0x2500, 0x2503], entry.range);
+        assert_eq!(
+            clipboard_codepoint_map::Replacement::String("|".to_owned()),
+            entry.replacement
+        );
+    }
+
+    #[test]
+    fn repeatable_clipboard_codepoint_map_format_config_codepoint() {
+        let mut list = RepeatableClipboardCodepointMap::default();
+        list.parse_cli(Some("U+2500=U+002D")).unwrap();
+        assert_eq!("a = U+2500=U+002D\n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_clipboard_codepoint_map_format_config_string() {
+        let mut list = RepeatableClipboardCodepointMap::default();
+        list.parse_cli(Some("U+03A3=SUM")).unwrap();
+        assert_eq!("a = U+03A3=SUM\n", fmt_entry("a", &list));
+    }
+
+    // -- FontStyle ----------------------------------------------------------
+
+    #[test]
+    fn font_style_parse_cli() {
+        let mut p = FontStyle::Default;
+        p.parse_cli(Some("default")).unwrap();
+        assert_eq!(FontStyle::Default, p);
+
+        p.parse_cli(Some("false")).unwrap();
+        assert_eq!(FontStyle::False, p);
+
+        p.parse_cli(Some("bold")).unwrap();
+        assert_eq!(Some(&StringZ::from("bold")), p.name_value());
+    }
+
+    #[test]
+    fn font_style_format_config_default() {
+        let mut p = FontStyle::Default;
+        p.parse_cli(Some("default")).unwrap();
+        assert_eq!("a = default\n", fmt_entry("a", &p));
+    }
+
+    #[test]
+    fn font_style_format_config_false() {
+        let mut p = FontStyle::Default;
+        p.parse_cli(Some("false")).unwrap();
+        assert_eq!("a = false\n", fmt_entry("a", &p));
+    }
+
+    #[test]
+    fn font_style_format_config_named() {
+        let mut p = FontStyle::Default;
+        p.parse_cli(Some("bold")).unwrap();
+        assert_eq!("a = bold\n", fmt_entry("a", &p));
+    }
+
+    // -- RepeatableCommand --------------------------------------------------
+
+    #[test]
+    fn repeatable_command_parse_cli() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Foo,action:ignore")).unwrap();
+        list.parse_cli(Some("title:Bar,description:bobr,action:text:ale bydle")).unwrap();
+        list.parse_cli(Some("title:Quux,description:boo,action:increase_font_size:2.5")).unwrap();
+        list.parse_cli(Some("title:Baz,description:Raspberry Pie,action:set_font_size:3.14")).unwrap();
+
+        assert_eq!(4usize, list.value.len());
+
+        assert_eq!(Action::Ignore, list.value[0].action);
+        assert_eq!(b"Foo", list.value[0].title.to_bytes());
+
+        assert_eq!(Action::Text(b"ale bydle".to_vec()), list.value[1].action);
+        assert_eq!(b"Bar", list.value[1].title.to_bytes());
+        assert_eq!(b"bobr", list.value[1].description.to_bytes());
+
+        assert_eq!(Action::IncreaseFontSize(2.5), list.value[2].action);
+        assert_eq!(b"Quux", list.value[2].title.to_bytes());
+        assert_eq!(b"boo", list.value[2].description.to_bytes());
+
+        assert_eq!(Action::SetFontSize(3.14), list.value[3].action);
+        assert_eq!(b"Baz", list.value[3].title.to_bytes());
+        assert_eq!(b"Raspberry Pie", list.value[3].description.to_bytes());
+
+        list.parse_cli(Some("clear")).unwrap();
+        assert_eq!(0usize, list.value.len());
+
+        list.parse_cli(Some("")).unwrap();
+        assert_eq!(crate::input::command::defaults().len(), list.value.len());
+    }
+
+    #[test]
+    fn repeatable_command_clone_rebuilds_the_c_mirror() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Foo,description:bar,action:new_tab")).unwrap();
+
+        let copy = list.clone();
+        assert_eq!(list.value_c.len(), copy.value_c.len());
+        // The clone's C strings must not alias the source's — the
+        // source config can be freed while the clone lives on.
+        assert!(list.value_c[0].title != copy.value_c[0].title);
+        let a = unsafe { std::ffi::CStr::from_ptr(list.value_c[0].title) };
+        let b = unsafe { std::ffi::CStr::from_ptr(copy.value_c[0].title) };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn repeatable_command_format_config_empty() {
+        let list = RepeatableCommand::default();
+        assert_eq!("a = \n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_command_format_config_single_item() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Bobr, action:text:Bober")).unwrap();
+        assert_eq!("a = title:\"Bobr\",action:\"text:Bober\"\n", fmt_entry("a", &list));
+    }
+
+    #[test]
+    fn repeatable_command_format_config_multiple_items() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Bobr, action:text:kurwa")).unwrap();
+        list.parse_cli(Some("title:Ja,   description: pierdole,  action:text:jakie bydle")).unwrap();
+        assert_eq!(
+            "a = title:\"Bobr\",action:\"text:kurwa\"\na = title:\"Ja\",description:\"pierdole\",action:\"text:jakie bydle\"\n",
+            fmt_entry("a", &list)
+        );
+    }
+
+    #[test]
+    fn repeatable_command_parse_cli_commas() {
+        {
+            let mut list = RepeatableCommand::default();
+            list.parse_cli(Some("title:\"Bo,br\",action:\"text:kur,wa\"")).unwrap();
+            assert_eq!(1usize, list.value.len());
+
+            let item = &list.value[0];
+            assert_eq!(b"Bo,br", item.title.to_bytes());
+            assert_eq!(b"", item.description.to_bytes());
+            assert_eq!(Action::Text(b"kur,wa".to_vec()), item.action);
+        }
+        {
+            let mut list = RepeatableCommand::default();
+            list.parse_cli(Some("title:\"Bo,br\",description:\"abc,def\",action:text:kurwa")).unwrap();
+            assert_eq!(1usize, list.value.len());
+
+            let item = &list.value[0];
+            assert_eq!(b"Bo,br", item.title.to_bytes());
+            assert_eq!(b"abc,def", item.description.to_bytes());
+            assert_eq!(Action::Text(b"kurwa".to_vec()), item.action);
+        }
+    }
+
+    #[test]
+    fn repeatable_command_cval() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Foo,action:ignore")).unwrap();
+        list.parse_cli(Some("title:Bar,description:bobr,action:text:ale bydle")).unwrap();
+
+        assert_eq!(2usize, list.value.len());
+        assert_eq!(2usize, list.value_c.len());
+
+        let cv = list.cval();
+        assert_eq!(2usize, cv.len);
+
+        let s = |p: *const std::ffi::c_char| unsafe { std::ffi::CStr::from_ptr(p) }.to_str().unwrap();
+        let commands = unsafe { std::slice::from_raw_parts(cv.commands, cv.len) };
+
+        // First entry
+        assert_eq!("Foo", s(commands[0].title));
+        assert_eq!("ignore", s(commands[0].action_key));
+        assert_eq!("ignore", s(commands[0].action));
+
+        // Second entry
+        assert_eq!("Bar", s(commands[1].title));
+        assert_eq!("bobr", s(commands[1].description));
+        assert_eq!("text", s(commands[1].action_key));
+        assert_eq!("text:ale bydle", s(commands[1].action));
+    }
+
+    #[test]
+    fn repeatable_command_cval_cleared() {
+        let mut list = RepeatableCommand::default();
+        list.parse_cli(Some("title:Foo,action:ignore")).unwrap();
+        assert_eq!(1usize, list.cval().len);
+
+        list.parse_cli(Some("clear")).unwrap();
+        assert_eq!(0usize, list.cval().len);
+    }
+
+    // -- MouseScrollMultiplier ----------------------------------------------
+
+    #[test]
+    fn mouse_scroll_multiplier_parse() {
+        let epsilon = 0.00001;
+        let approx = |a: f64, b: f64| assert!((a - b).abs() <= epsilon, "{a} != {b}");
+
+        let mut args = MouseScrollMultiplier { precision: 0.1, discrete: 3.0 };
+        args.parse_cli(Some("3")).unwrap();
+        approx(3.0, args.precision);
+        approx(3.0, args.discrete);
+
+        args = MouseScrollMultiplier { precision: 0.1, discrete: 3.0 };
+        args.parse_cli(Some("precision:1")).unwrap();
+        approx(1.0, args.precision);
+        approx(3.0, args.discrete);
+
+        args = MouseScrollMultiplier { precision: 0.1, discrete: 3.0 };
+        args.parse_cli(Some("discrete:5")).unwrap();
+        approx(0.1, args.precision);
+        approx(5.0, args.discrete);
+
+        args = MouseScrollMultiplier { precision: 0.1, discrete: 3.0 };
+        args.parse_cli(Some("precision:3,discrete:7")).unwrap();
+        approx(3.0, args.precision);
+        approx(7.0, args.discrete);
+
+        args = MouseScrollMultiplier { precision: 0.1, discrete: 3.0 };
+        args.parse_cli(Some("discrete:8,precision:6")).unwrap();
+        approx(6.0, args.precision);
+        approx(8.0, args.discrete);
+
+        args = MouseScrollMultiplier::DEFAULT;
+        assert_eq!(Err(Error::InvalidValue), args.parse_cli(Some("foo:1")));
+        assert_eq!(Err(Error::InvalidValue), args.parse_cli(Some("precision:bar")));
+        assert_eq!(Err(Error::InvalidValue), args.parse_cli(Some("precision:1,discrete:3,foo:5")));
+        assert_eq!(Err(Error::InvalidValue), args.parse_cli(Some("precision:1,,discrete:3")));
+        assert_eq!(Err(Error::InvalidValue), args.parse_cli(Some(",precision:1,discrete:3")));
+    }
+
+    #[test]
+    fn format_entry_mouse_scroll_multiplier() {
+        let args = MouseScrollMultiplier { precision: 1.5, discrete: 2.5 };
+        assert_eq!(
+            "mouse-scroll-multiplier = precision:1.5,discrete:2.5\n",
+            fmt_entry("mouse-scroll-multiplier", &args)
+        );
+    }
+
+    // -- QuickTerminalSize --------------------------------------------------
+
+    #[test]
+    fn parse_quick_terminal_size() {
+        let mut v = QuickTerminalSize::default();
+
+        v.parse_cli(Some("50%")).unwrap();
+        assert_eq!(Some(QuickTerminalSizeSize::Percentage(50.0)), v.primary);
+        assert_eq!(None, v.secondary);
+
+        v.parse_cli(Some("200px")).unwrap();
+        assert_eq!(Some(QuickTerminalSizeSize::Pixels(200)), v.primary);
+        assert_eq!(None, v.secondary);
+
+        v.parse_cli(Some("50%,200px")).unwrap();
+        assert_eq!(Some(QuickTerminalSizeSize::Percentage(50.0)), v.primary);
+        assert_eq!(Some(QuickTerminalSizeSize::Pixels(200)), v.secondary);
+
+        assert_eq!(Err(Error::ValueRequired), v.parse_cli(None));
+        assert_eq!(Err(Error::ValueRequired), v.parse_cli(Some("")));
+        assert_eq!(Err(Error::ValueRequired), v.parse_cli(Some("69px,")));
+        assert_eq!(Err(Error::Other("TooManyArguments")), v.parse_cli(Some("69px,42%,69px")));
+
+        assert_eq!(Err(Error::Other("MissingUnit")), v.parse_cli(Some("420")));
+        assert_eq!(Err(Error::Other("MissingUnit")), v.parse_cli(Some("bobr")));
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("bobr%")));
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("-32%")));
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("-69px")));
+    }
+
+    #[test]
+    fn calculate_quick_terminal_size() {
+        type Dimensions = QuickTerminalSizeDimensions;
+        let dims_landscape = Dimensions { width: 2560, height: 1600 };
+        let dims_portrait = Dimensions { width: 1600, height: 2560 };
+
+        {
+            let size = QuickTerminalSize::default();
+            assert_eq!(
+                Dimensions { width: 2560, height: 400 },
+                size.calculate(QuickTerminalPosition::Top, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 400, height: 1600 },
+                size.calculate(QuickTerminalPosition::Left, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 800, height: 400 },
+                size.calculate(QuickTerminalPosition::Center, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 400, height: 800 },
+                size.calculate(QuickTerminalPosition::Center, dims_portrait)
+            );
+        }
+        {
+            let size = QuickTerminalSize {
+                primary: Some(QuickTerminalSizeSize::Percentage(20.0)),
+                secondary: None,
+            };
+            assert_eq!(
+                Dimensions { width: 2560, height: 320 },
+                size.calculate(QuickTerminalPosition::Top, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 512, height: 1600 },
+                size.calculate(QuickTerminalPosition::Left, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 512, height: 400 },
+                size.calculate(QuickTerminalPosition::Center, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 400, height: 512 },
+                size.calculate(QuickTerminalPosition::Center, dims_portrait)
+            );
+        }
+        {
+            let size = QuickTerminalSize {
+                primary: Some(QuickTerminalSizeSize::Pixels(600)),
+                secondary: None,
+            };
+            assert_eq!(
+                Dimensions { width: 2560, height: 600 },
+                size.calculate(QuickTerminalPosition::Top, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 600, height: 1600 },
+                size.calculate(QuickTerminalPosition::Left, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 600, height: 400 },
+                size.calculate(QuickTerminalPosition::Center, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 400, height: 600 },
+                size.calculate(QuickTerminalPosition::Center, dims_portrait)
+            );
+        }
+        {
+            let size = QuickTerminalSize {
+                primary: Some(QuickTerminalSizeSize::Percentage(69.0)),
+                secondary: Some(QuickTerminalSizeSize::Pixels(420)),
+            };
+            assert_eq!(
+                Dimensions { width: 420, height: 1104 },
+                size.calculate(QuickTerminalPosition::Top, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 1766, height: 420 },
+                size.calculate(QuickTerminalPosition::Left, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 1766, height: 420 },
+                size.calculate(QuickTerminalPosition::Center, dims_landscape)
+            );
+            assert_eq!(
+                Dimensions { width: 420, height: 1766 },
+                size.calculate(QuickTerminalPosition::Center, dims_portrait)
+            );
+        }
+    }
+
+    // -- BackgroundBlur -----------------------------------------------------
+
+    #[test]
+    fn parse_background_blur() {
+        let mut v = BackgroundBlur::False;
+
+        v.parse_cli(None).unwrap();
+        assert_eq!(BackgroundBlur::True, v);
+
+        v.parse_cli(Some("true")).unwrap();
+        assert_eq!(BackgroundBlur::True, v);
+
+        v.parse_cli(Some("false")).unwrap();
+        assert_eq!(BackgroundBlur::False, v);
+
+        v.parse_cli(Some("42")).unwrap();
+        assert_eq!(BackgroundBlur::Radius(42), v);
+
+        v.parse_cli(Some("macos-glass-regular")).unwrap();
+        assert_eq!(BackgroundBlur::MacosGlassRegular, v);
+
+        v.parse_cli(Some("macos-glass-clear")).unwrap();
+        assert_eq!(BackgroundBlur::MacosGlassClear, v);
+
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("")));
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("aaaa")));
+        assert_eq!(Err(Error::InvalidValue), v.parse_cli(Some("420")));
+    }
+
+    // -- WindowDecoration ---------------------------------------------------
+
+    #[test]
+    fn parse_window_decoration() {
+        assert_eq!(WindowDecoration::Auto, WindowDecoration::parse_cli(None).unwrap());
+        assert_eq!(WindowDecoration::Auto, WindowDecoration::parse_cli(Some("true")).unwrap());
+        assert_eq!(WindowDecoration::None, WindowDecoration::parse_cli(Some("false")).unwrap());
+        assert_eq!(WindowDecoration::Server, WindowDecoration::parse_cli(Some("server")).unwrap());
+        assert_eq!(WindowDecoration::Client, WindowDecoration::parse_cli(Some("client")).unwrap());
+        assert_eq!(WindowDecoration::Auto, WindowDecoration::parse_cli(Some("auto")).unwrap());
+        assert_eq!(WindowDecoration::None, WindowDecoration::parse_cli(Some("none")).unwrap());
+        assert_eq!(Err(Error::InvalidValue), WindowDecoration::parse_cli(Some("")));
+        assert_eq!(Err(Error::InvalidValue), WindowDecoration::parse_cli(Some("aaaa")));
+    }
+
+    // -- Theme --------------------------------------------------------------
+
+    #[test]
+    fn parse_theme() {
+        // Single
+        {
+            let v = Theme::parse_cli_new(Some("foo")).unwrap();
+            assert_eq!("foo", v.light);
+            assert_eq!("foo", v.dark);
+        }
+
+        // Single whitespace
+        {
+            let v = Theme::parse_cli_new(Some("  foo  ")).unwrap();
+            assert_eq!("foo", v.light);
+            assert_eq!("foo", v.dark);
+        }
+
+        // Light/dark
+        {
+            let v = Theme::parse_cli_new(Some(" light:foo,  dark : bar  ")).unwrap();
+            assert_eq!("foo", v.light);
+            assert_eq!("bar", v.dark);
+        }
+
+        // Expand tilde to home
+        {
+            let environ_map = crate::os::environ_map();
+
+            let mut home_buf = [0u8; MAX_PATH_BYTES];
+            let home = crate::os::expand_home(&environ_map, "~/", &mut home_buf)
+                .unwrap()
+                .to_owned();
+
+            let mut v = Theme::parse_cli_new(Some("light:~/foo, dark:~/bar")).unwrap();
+            v.finalize();
+
+            assert_eq!(format!("{}foo", home), v.light);
+            assert_eq!(format!("{}bar", home), v.dark);
+        }
+
+        assert_eq!(Err(Error::ValueRequired), Theme::parse_cli_new(None));
+        assert_eq!(Err(Error::ValueRequired), Theme::parse_cli_new(Some("")));
+        assert_eq!(Err(Error::InvalidValue), Theme::parse_cli_new(Some("light:foo")));
+        assert_eq!(Err(Error::InvalidValue), Theme::parse_cli_new(Some("dark:foo")));
+    }
+
+    // -- Duration -----------------------------------------------------------
+
+    #[test]
+    fn parse_duration() {
+        for unit in Duration::UNITS {
+            let t = format!("0{}", unit.name);
+            let d = Duration::parse_cli(Some(&t)).unwrap();
+            assert_eq!(0u64, d.duration);
+        }
+
+        for unit in Duration::UNITS {
+            let t = format!("1{}", unit.name);
+            let d = Duration::parse_cli(Some(&t)).unwrap();
+            assert_eq!(unit.factor, d.duration);
+        }
+
+        assert_eq!(0u64, Duration::parse_cli(Some("0")).unwrap().duration);
+        assert_eq!(100u64, Duration::parse_cli(Some("100ns")).unwrap().duration);
+        assert_eq!(1000u64, Duration::parse_cli(Some("1µs")).unwrap().duration);
+        assert_eq!(1001u64, Duration::parse_cli(Some("1µs1ns")).unwrap().duration);
+        assert_eq!(1001u64, Duration::parse_cli(Some("1µs 1ns")).unwrap().duration);
+        assert_eq!(1001u64, Duration::parse_cli(Some(" 1µs1ns")).unwrap().duration);
+        assert_eq!(1001u64, Duration::parse_cli(Some("1µs1ns ")).unwrap().duration);
+        assert_eq!(30 * NS_PER_S, Duration::parse_cli(Some("30s")).unwrap().duration);
+        assert_eq!(
+            u64::MAX,
+            Duration::parse_cli(Some("584y 49w 23h 34m 33s 709ms 551µs 615ns"))
+                .unwrap()
+                .duration
+        );
+
+        // Overflow
+        assert_eq!(u64::MAX, Duration::parse_cli(Some("600y")).unwrap().duration);
+
+        // Repeated units
+        assert_eq!(200u64, Duration::parse_cli(Some("100ns100ns")).unwrap().duration);
+
+        assert_eq!(Err(Error::ValueRequired), Duration::parse_cli(None));
+        assert_eq!(Err(Error::ValueRequired), Duration::parse_cli(Some("")));
+        assert_eq!(Err(Error::InvalidValue), Duration::parse_cli(Some("1")));
+        assert_eq!(Err(Error::InvalidValue), Duration::parse_cli(Some("s")));
+        assert_eq!(Err(Error::InvalidValue), Duration::parse_cli(Some("1x")));
+        assert_eq!(Err(Error::InvalidValue), Duration::parse_cli(Some("1 ")));
+    }
+
+    #[test]
+    fn test_format() {
+        for unit in Duration::UNITS {
+            let d = Duration { duration: unit.factor };
+            let actual = format!("{}", d);
+            let expected = if unit.name != "us" {
+                format!("1{}", unit.name)
+            } else {
+                "1µs".to_owned()
+            };
+            assert_eq!(expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_entry_formatter() {
+        let p = Duration { duration: u64::MAX };
+        assert_eq!("a = 584y 49w 23h 34m 33s 709ms 551µs 615ns\n", fmt_entry("a", &p));
+    }
+
+    // -- WindowPadding ------------------------------------------------------
+
+    #[test]
+    fn parse_window_padding() {
+        assert_eq!(
+            WindowPadding { top_left: 100, bottom_right: 100 },
+            WindowPadding::parse_cli(Some("100")).unwrap()
+        );
+        assert_eq!(
+            WindowPadding { top_left: 100, bottom_right: 200 },
+            WindowPadding::parse_cli(Some("100,200")).unwrap()
+        );
+
+        // Trim whitespace
+        assert_eq!(
+            WindowPadding { top_left: 100, bottom_right: 200 },
+            WindowPadding::parse_cli(Some(" 100 , 200 ")).unwrap()
+        );
+
+        assert_eq!(Err(Error::ValueRequired), WindowPadding::parse_cli(None));
+        assert_eq!(Err(Error::InvalidValue), WindowPadding::parse_cli(Some("")));
+        assert_eq!(Err(Error::InvalidValue), WindowPadding::parse_cli(Some("a")));
+    }
+
+    // -- Config -------------------------------------------------------------
+
+    #[test]
+    fn parse_hook_invalid_command() {
+        let mut cfg = Config::default();
+
+        let data = ["foo"];
+        let mut it = test_iter(&data);
+        assert!(cfg.parse_manually_hook("--command", &mut it).unwrap());
+        assert!(cfg.command.is_none());
+    }
+
+    #[test]
+    fn parse_e_command_only() {
+        let mut cfg = Config::default();
+
+        let data = ["foo"];
+        let mut it = test_iter(&data);
+        assert!(!cfg.parse_manually_hook("-e", &mut it).unwrap());
+
+        let Some(Command::Direct(cmd)) = &cfg.initial_command else {
+            panic!("expected direct command");
+        };
+        assert_eq!(cmd.len(), 1);
+        assert_eq!(cmd[0], "foo");
+    }
+
+    #[test]
+    fn parse_e_command_and_args() {
+        let mut cfg = Config::default();
+
+        let data = ["echo", "foo", "bar baz"];
+        let mut it = test_iter(&data);
+        assert!(!cfg.parse_manually_hook("-e", &mut it).unwrap());
+
+        let Some(Command::Direct(cmd)) = &cfg.initial_command else {
+            panic!("expected direct command");
+        };
+        assert_eq!(cmd.len(), 3);
+        assert_eq!(cmd[0], "echo");
+        assert_eq!(cmd[1], "foo");
+        assert_eq!(cmd[2], "bar baz");
+    }
+
+    #[test]
+    fn clone_default() {
+        let source = Config::default();
+        let dest = source.clone();
+
+        // Should have no changes
+        let mut it = source.change_iterator(&dest);
+        assert_eq!(None, it.next());
+    }
+
+    #[test]
+    fn clone_preserves_conditional_state() {
+        let mut a = Config::default();
+        a._conditional_state.theme = conditional::Theme::Dark;
+        assert_eq!(conditional::Theme::Dark, a._conditional_state.theme);
+        let dest = a.clone();
+
+        // Should have no changes
+        let mut it = a.change_iterator(&dest);
+        assert_eq!(None, it.next());
+
+        // Should have the same conditional state
+        assert_eq!(conditional::Theme::Dark, dest._conditional_state.theme);
+    }
+
+    /// Writes the test theme files into a temp dir and returns their
+    /// real paths (Zig `td.dir.realPathFile`).
+    fn write_themes(td: &crate::os::TempDir, names: &[(&str, &str)]) -> Vec<String> {
+        names
+            .iter()
+            .map(|(name, data)| {
+                let path = td.path().join(name);
+                std::fs::write(&path, data).unwrap();
+                std::fs::canonicalize(&path).unwrap().to_string_lossy().into_owned()
+            })
+            .collect()
+    }
+
+    const THEME_LIGHT: &str = include_str!("testdata/theme_light");
+    const THEME_DARK: &str = include_str!("testdata/theme_dark");
+    const THEME_SIMPLE: &str = include_str!("testdata/theme_simple");
+
+    #[test]
+    fn clone_can_then_change_conditional_state() {
+        // This tests a particular bug sequence where:
+        //   1. Load light
+        //   2. Convert to dark
+        //   3. Clone dark
+        //   4. Convert to light
+        //   5. Config is still dark (bug)
+
+        // Setup our test theme
+        let td = crate::os::TempDir::init().unwrap();
+        let paths = write_themes(&td, &[("theme_light", THEME_LIGHT), ("theme_dark", THEME_DARK)]);
+        let (light, dark) = (&paths[0], &paths[1]);
+
+        let mut cfg_light = Config::default();
+        let arg = format!("--theme=light:{},dark:{}", light, dark);
+        let data = [arg.as_str()];
+        let mut it = test_iter(&data);
+        cfg_light.load_iter(&mut it).unwrap();
+        cfg_light.finalize().unwrap();
+
+        let cfg_dark = cfg_light
+            .change_conditional_state(conditional::State {
+                theme: conditional::Theme::Dark,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(Color { r: 0xEE, g: 0xEE, b: 0xEE }, cfg_dark.background);
+
+        let cfg_clone = cfg_dark.clone();
+        assert_eq!(Color { r: 0xEE, g: 0xEE, b: 0xEE }, cfg_clone.background);
+
+        let cfg_light2 = cfg_clone
+            .change_conditional_state(conditional::State {
+                theme: conditional::Theme::Light,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(Color { r: 0xFF, g: 0xFF, b: 0xFF }, cfg_light2.background);
+        td.deinit();
+    }
+
+    #[test]
+    fn clone_preserves_conditional_set() {
+        let mut cfg = Config::default();
+        let data = ["--theme=light:foo,dark:bar", "--window-theme=auto"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        let clone1 = cfg.clone();
+
+        assert!(clone1._conditional_set.contains(conditional::Key::Theme));
+    }
+
+    #[test]
+    fn working_directory_expands_tilde() {
+        let environ_map = crate::os::environ_map();
+
+        let mut cfg = Config::default();
+        let data = ["--working-directory=~/projects/ghostty"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        let mut buf = [0u8; MAX_PATH_BYTES];
+        let expected = crate::os::expand_home(&environ_map, "~/projects/ghostty", &mut buf)
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|_| "~/projects/ghostty".to_owned());
+        assert_eq!(expected, cfg.working_directory.as_ref().unwrap().value().unwrap());
+    }
+
+    #[test]
+    fn changed() {
+        let source = Config::default();
+        let mut dest = source.clone();
+        dest.font_thicken = true;
+
+        assert!(source.changed(&dest, Key::FontThicken));
+        assert!(!source.changed(&dest, Key::FontSize));
+    }
+
+    #[test]
+    fn change_conditional_state_ignores_irrelevant_changes() {
+        let mut cfg = Config::default();
+        let data = ["--theme=foo"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert!(cfg
+            .change_conditional_state(conditional::State {
+                theme: conditional::Theme::Dark,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn change_conditional_state_applies_relevant_changes() {
+        let mut cfg = Config::default();
+        let data = ["--theme=light:foo,dark:bar"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        let cfg2 = cfg
+            .change_conditional_state(conditional::State {
+                theme: conditional::Theme::Dark,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+
+        assert!(cfg2._conditional_set.contains(conditional::Key::Theme));
+    }
+
+    #[test]
+    fn theme_loading() {
+        // Setup our test theme
+        let td = crate::os::TempDir::init().unwrap();
+        let paths = write_themes(&td, &[("theme", THEME_SIMPLE)]);
+        let path = &paths[0];
+
+        let mut cfg = Config::default();
+        let arg = format!("--theme={}", path);
+        let data = [arg.as_str()];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(Color { r: 0x12, g: 0x3A, b: 0xBC }, cfg.background);
+
+        // Not a conditional theme
+        assert!(!cfg._conditional_set.contains(conditional::Key::Theme));
+        td.deinit();
+    }
+
+    #[test]
+    fn theme_loading_preserves_conditional_state() {
+        // Setup our test theme
+        let td = crate::os::TempDir::init().unwrap();
+        let paths = write_themes(&td, &[("theme", THEME_SIMPLE)]);
+        let path = &paths[0];
+
+        let mut cfg = Config::default();
+        cfg._conditional_state = conditional::State {
+            theme: conditional::Theme::Dark,
+            ..Default::default()
+        };
+        let arg = format!("--theme={}", path);
+        let data = [arg.as_str()];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert!(cfg._conditional_state.theme == conditional::Theme::Dark);
+        td.deinit();
+    }
+
+    #[test]
+    fn theme_priority_is_lower_than_config() {
+        // Setup our test theme
+        let td = crate::os::TempDir::init().unwrap();
+        let paths = write_themes(&td, &[("theme", THEME_SIMPLE)]);
+        let path = &paths[0];
+
+        let mut cfg = Config::default();
+        let arg = format!("--theme={}", path);
+        let data = ["--background=#ABCDEF", arg.as_str()];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(Color { r: 0xAB, g: 0xCD, b: 0xEF }, cfg.background);
+        td.deinit();
+    }
+
+    #[test]
+    fn theme_loading_correct_light_dark() {
+        // Setup our test theme
+        let td = crate::os::TempDir::init().unwrap();
+        let paths = write_themes(&td, &[("theme_light", THEME_LIGHT), ("theme_dark", THEME_DARK)]);
+        let (light, dark) = (&paths[0], &paths[1]);
+        let arg = format!("--theme=light:{},dark:{}", light, dark);
+
+        // Light
+        {
+            let mut cfg = Config::default();
+            let data = [arg.as_str()];
+            let mut it = test_iter(&data);
+            cfg.load_iter(&mut it).unwrap();
+            cfg.finalize().unwrap();
+
+            assert_eq!(Color { r: 0xFF, g: 0xFF, b: 0xFF }, cfg.background);
+        }
+
+        // Dark
+        {
+            let mut cfg = Config::default();
+            cfg._conditional_state = conditional::State {
+                theme: conditional::Theme::Dark,
+                ..Default::default()
+            };
+            let data = [arg.as_str()];
+            let mut it = test_iter(&data);
+            cfg.load_iter(&mut it).unwrap();
+            cfg.finalize().unwrap();
+
+            assert_eq!(Color { r: 0xEE, g: 0xEE, b: 0xEE }, cfg.background);
+        }
+
+        // Light to Dark
+        {
+            let mut cfg = Config::default();
+            let data = [arg.as_str()];
+            let mut it = test_iter(&data);
+            cfg.load_iter(&mut it).unwrap();
+            cfg.finalize().unwrap();
+
+            let new = cfg
+                .change_conditional_state(conditional::State {
+                    theme: conditional::Theme::Dark,
+                    ..Default::default()
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(Color { r: 0xEE, g: 0xEE, b: 0xEE }, new.background);
+        }
+        td.deinit();
+    }
+
+    #[test]
+    fn theme_specifying_light_dark_changes_window_theme_from_auto() {
+        let mut cfg = Config::default();
+        let data = ["--theme=light:foo,dark:bar", "--window-theme=auto"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert!(cfg.window_theme == WindowTheme::System);
+    }
+
+    #[test]
+    fn theme_specifying_light_dark_sets_theme_usage_in_conditional_state() {
+        let mut cfg = Config::default();
+        let data = ["--theme=light:foo,dark:bar", "--window-theme=auto"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert!(cfg.window_theme == WindowTheme::System);
+        assert!(cfg._conditional_set.contains(conditional::Key::Theme));
+    }
+
+    #[test]
+    fn scrollback_limits() {
+        let mut cfg = Config::default();
+        assert_eq!(50_000_000usize, cfg.scrollback_limit_bytes.value);
+        assert_eq!(usize::MAX, cfg.scrollback_limit_lines.value);
+
+        let data = ["--scrollback-limit-bytes=1234", "--scrollback-limit-lines=567"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+
+        assert_eq!(1234usize, cfg.scrollback_limit_bytes.value);
+        assert_eq!(567usize, cfg.scrollback_limit_lines.value);
+
+        let data = [
+            "--scrollback-limit-bytes=unlimited",
+            "--scrollback-limit-lines=unlimited",
+        ];
+        let mut unlimited_it = test_iter(&data);
+        cfg.load_iter(&mut unlimited_it).unwrap();
+
+        assert_eq!(usize::MAX, cfg.scrollback_limit_bytes.value);
+        assert_eq!(usize::MAX, cfg.scrollback_limit_lines.value);
+
+        let data = ["--scrollback-limit-bytes=", "--scrollback-limit-lines="];
+        let mut reset_it = test_iter(&data);
+        cfg.load_iter(&mut reset_it).unwrap();
+
+        assert_eq!(50_000_000usize, cfg.scrollback_limit_bytes.value);
+        assert_eq!(usize::MAX, cfg.scrollback_limit_lines.value);
+    }
+
+    #[test]
+    fn clipboard_write_limit() {
+        let mut cfg = Config::default();
+        assert_eq!(64 * 1024 * 1024usize, cfg.clipboard_write_limit_bytes.value);
+
+        let data = ["--clipboard-write-limit-bytes=1234"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+
+        assert_eq!(1234usize, cfg.clipboard_write_limit_bytes.value);
+
+        let data = ["--clipboard-write-limit-bytes=unlimited"];
+        let mut unlimited_it = test_iter(&data);
+        cfg.load_iter(&mut unlimited_it).unwrap();
+
+        assert_eq!(usize::MAX, cfg.clipboard_write_limit_bytes.value);
+    }
+
+    #[test]
+    fn compatibility_scrollback_limit_renamed_to_bytes() {
+        let mut cfg = Config::default();
+        let data = ["--scrollback-limit=1234"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+
+        assert_eq!(1234usize, cfg.scrollback_limit_bytes.value);
+
+        let data = ["--scrollback-limit=unlimited"];
+        let mut unlimited_it = test_iter(&data);
+        cfg.load_iter(&mut unlimited_it).unwrap();
+
+        assert_eq!(usize::MAX, cfg.scrollback_limit_bytes.value);
+    }
+
+    #[test]
+    fn compatibility_gtk_single_instance_desktop() {
+        let mut cfg = Config::default();
+        let data = ["--gtk-single-instance=desktop"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+
+        // We need to test this BEFORE finalize, because finalize will
+        // convert our detect to a real value.
+        assert_eq!(GtkSingleInstance::Detect, cfg.gtk_single_instance);
+    }
+
+    #[test]
+    fn compatibility_removed_cursor_invert_fg_bg() {
+        let mut cfg = Config::default();
+        let data = ["--cursor-invert-fg-bg"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(Some(TerminalColor::CellForeground), cfg.cursor_color);
+        assert_eq!(Some(TerminalColor::CellBackground), cfg.cursor_text);
+    }
+
+    #[test]
+    fn compatibility_removed_selection_invert_fg_bg() {
+        let mut cfg = Config::default();
+        let data = ["--selection-invert-fg-bg"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(Some(TerminalColor::CellBackground), cfg.selection_foreground);
+        assert_eq!(Some(TerminalColor::CellForeground), cfg.selection_background);
+    }
+
+    #[test]
+    fn compatibility_removed_bold_is_bright() {
+        let mut cfg = Config::default();
+        let data = ["--bold-is-bright"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        assert_eq!(Some(BoldColor::Bright), cfg.bold_color);
+    }
+
+    #[test]
+    fn compatibility_window_new_window() {
+        let mut cfg = Config::default();
+        let data = ["--macos-dock-drop-behavior=window"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+        assert_eq!(MacOSDockDropBehavior::NewWindow, cfg.macos_dock_drop_behavior);
+    }
+
+    // -- Port-specific checks -----------------------------------------------
+
+    #[test]
+    fn help_strings_and_field_order() {
+        // The first field is `language`, whose help text starts as in Zig.
+        assert_eq!("language", Config::FIELDS[0].name);
+        assert!(Config::FIELDS[0]
+            .help()
+            .starts_with("Set Ghostty's graphical user interface language to a language other than the\nsystem default language."));
+        assert_eq!("auto-update-channel", Config::FIELDS[Config::FIELDS.len() - 1].name);
+    }
+
+    #[test]
+    fn replay_e_from_cli_through_config_file() {
+        // `-e` is kept at the end of the replay steps across a config
+        // reload with a changed conditional state.
+        let mut cfg = Config::default();
+        let data = ["--theme=light:foo,dark:bar", "-e", "echo", "hi"];
+        let mut it = test_iter(&data);
+        cfg.load_iter(&mut it).unwrap();
+        cfg.finalize().unwrap();
+
+        let cfg2 = cfg
+            .change_conditional_state(conditional::State {
+                theme: conditional::Theme::Dark,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let Some(Command::Direct(cmd)) = &cfg2.initial_command else {
+            panic!("expected direct command");
+        };
+        assert_eq!(2, cmd.len());
+        assert_eq!(cmd[0], "echo");
+        assert_eq!(cmd[1], "hi");
+    }
+}
