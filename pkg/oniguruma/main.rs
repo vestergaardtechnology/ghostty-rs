@@ -1,6 +1,6 @@
-//! Port of `src/oniguruma/main.zig`.
+//! Port of `pkg/oniguruma/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "c.rs"]
@@ -20,3 +20,9 @@ pub mod testing;
 #[path = "types.rs"]
 pub mod types;
 // @generated-mods-end
+
+pub use init::{deinit, init};
+pub use match_param::MatchParam;
+pub use regex::Regex;
+pub use region::Region;
+pub use types::{Encoding, Syntax};

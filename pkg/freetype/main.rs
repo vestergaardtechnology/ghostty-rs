@@ -1,6 +1,6 @@
-//! Port of `src/freetype/main.zig`.
+//! Port of `pkg/freetype/main.zig`.
 //!
-//! STATUS: not yet ported.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "c.rs"]
@@ -18,3 +18,12 @@ pub mod tag;
 #[path = "test.rs"]
 pub mod test;
 // @generated-mods-end
+
+/// Zig: `pub const testing = @import("test.zig");`
+pub use test as testing;
+
+pub use computations::mul_fix;
+pub use errors::Error;
+pub use face::{Face, LoadFlags};
+pub use library::Library;
+pub use tag::Tag;
