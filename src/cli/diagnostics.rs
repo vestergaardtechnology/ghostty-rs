@@ -84,9 +84,10 @@ impl Location {
 ///
 /// We enable precompute for tests so that the logic is semantically
 /// analyzed and run. We specifically want precompute for libghostty.
-// TODO(port-dedupe): replace the `false` with
-// `crate::build_config::ARTIFACT == crate::build_config::Artifact::Lib`.
-const PRECOMPUTE_ENABLED: bool = cfg!(test) || false;
+const PRECOMPUTE_ENABLED: bool = match crate::build_config::ARTIFACT {
+    crate::build_config::Artifact::Exe | crate::build_config::Artifact::WasmModule => cfg!(test),
+    crate::build_config::Artifact::Lib => true,
+};
 
 /// Precomputed data for diagnostics. This is used specifically
 /// when we build libghostty so that we can precompute the messages

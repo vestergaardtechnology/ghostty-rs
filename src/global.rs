@@ -20,6 +20,9 @@ use crate::os::{EnvironMap, ResourcesDir};
 /// backend.
 pub use crate::pkg::xev;
 
+pub use crate::cli::ghostty::Action;
+use crate::cli::args::cli_flags;
+
 /// Global process state. This is initialized in main() for exe artifacts and
 /// by ghostty_init() for lib artifacts. Most other methods in this file will
 /// retrieve items stored in this state.
@@ -74,6 +77,8 @@ pub enum InitError {
     InvalidAction,
     /// Oniguruma failed to initialize.
     Oniguruma(crate::pkg::oniguruma::errors::Error),
+    /// glslang failed to initialize.
+    Glslang(crate::pkg::glslang::Error),
     /// The resources directory path was too long.
     NoSpaceLeft,
 }
@@ -184,7 +189,7 @@ fn init_inner(opts: &InitOpts) -> Result<(), InitError> {
         // this. Env vars are useful for logging too because they are
         // easy to set.
         if let Some(v) = s.environ.get("GHOSTTY_LOG") {
-            s.logging = parse_packed_logging(v).unwrap_or_default();
+            s.logging = crate::cli::args::parse_packed_struct::<Logging>(v).unwrap_or_default();
         }
     });
 
@@ -242,7 +247,7 @@ fn init_inner(opts: &InitOpts) -> Result<(), InitError> {
     sync_environ();
 
     // Initialize glslang for shader compilation
-    glslang_init();
+    crate::pkg::glslang::init().map_err(InitError::Glslang)?;
 
     // Initialize oniguruma for regex
     crate::pkg::oniguruma::init(&[crate::pkg::oniguruma::Encoding::utf8()])
@@ -263,19 +268,14 @@ fn init_inner(opts: &InitOpts) -> Result<(), InitError> {
     Ok(())
 }
 
-/// TODO(port-dedupe): replace with `crate::pkg::glslang::init()` once
-/// `pkg/glslang` is ported (glslang is not linked yet; it is only needed
-/// for custom shaders).
-fn glslang_init() {}
-
-/// Zig: `apprt.runtime.resourcesDir`. The GTK runtime's version only
-/// differs for Flatpak builds (`build_config::FLATPAK`, false here), and
-/// the `none` runtime uses `internal_os.resourcesDir` directly.
-///
-/// TODO(port-dedupe): replace with `crate::apprt::gtk::flatpak::resources_dir`
-/// once the GTK apprt is ported.
+/// Zig: `apprt.runtime.resourcesDir`. Builds without the GTK apprt use
+/// the `none` runtime's version, which is `internal_os.resourcesDir`.
 fn apprt_resources_dir() -> Result<ResourcesDir, InitError> {
-    os::resources_dir().map_err(|_| InitError::NoSpaceLeft)
+    #[cfg(all(not(target_os = "macos"), feature = "gtk"))]
+    let result = crate::apprt::rt::resources_dir();
+    #[cfg(not(all(not(target_os = "macos"), feature = "gtk")))]
+    let result = os::resources_dir();
+    result.map_err(|_| InitError::NoSpaceLeft)
 }
 
 /// Cleans up the global state. This doesn't _need_ to be called but
@@ -400,23 +400,15 @@ pub struct GlobalState {
     pub resources_dir: ResourcesDir,
 }
 
-/// Where logging should go (Zig: `GlobalState.Logging`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Logging {
-    /// Whether to log to stderr. For lib mode we always disable stderr
-    /// logging by default. Otherwise it's enabled by default.
-    pub stderr: bool,
-    /// Whether to log to macOS's unified logging. Enabled by default
-    /// on macOS.
-    pub macos: bool,
-}
-
-impl Default for Logging {
-    fn default() -> Self {
-        Self {
-            stderr: build_config::APP_RUNTIME != crate::apprt::runtime::Runtime::None,
-            macos: cfg!(target_vendor = "apple"),
-        }
+cli_flags! {
+    /// Where logging should go (Zig: `GlobalState.Logging`).
+    pub struct Logging {
+        /// Whether to log to stderr. For lib mode we always disable stderr
+        /// logging by default. Otherwise it's enabled by default.
+        pub stderr: bool = build_config::APP_RUNTIME != crate::apprt::runtime::Runtime::None,
+        /// Whether to log to macOS's unified logging. Enabled by default
+        /// on macOS.
+        pub macos: bool = cfg!(target_vendor = "apple"),
     }
 }
 
@@ -474,194 +466,16 @@ impl ResourceLimits {
     }
 }
 
-/// The ghostty CLI actions (Zig: `cli.ghostty.Action`).
-///
-/// TODO(port-dedupe): replace with `crate::cli::ghostty::Action` once
-/// `src/cli/ghostty.zig` is ported (owned by the CLI port).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Action {
-    Version,
-    Help,
-    ListFonts,
-    ListKeybinds,
-    ListThemes,
-    ListColors,
-    ListActions,
-    Ssh,
-    SshCache,
-    EditConfig,
-    ShowConfig,
-    ExplainConfig,
-    ValidateConfig,
-    ShowFace,
-    CrashReport,
-    Boo,
-    NewWindow,
-    NewTab,
-    ToggleQuickTerminal,
-}
-
-impl Action {
-    const ALL: [(&'static str, Action); 19] = [
-        ("version", Action::Version),
-        ("help", Action::Help),
-        ("list-fonts", Action::ListFonts),
-        ("list-keybinds", Action::ListKeybinds),
-        ("list-themes", Action::ListThemes),
-        ("list-colors", Action::ListColors),
-        ("list-actions", Action::ListActions),
-        ("ssh", Action::Ssh),
-        ("ssh-cache", Action::SshCache),
-        ("edit-config", Action::EditConfig),
-        ("show-config", Action::ShowConfig),
-        ("explain-config", Action::ExplainConfig),
-        ("validate-config", Action::ValidateConfig),
-        ("show-face", Action::ShowFace),
-        ("crash-report", Action::CrashReport),
-        ("boo", Action::Boo),
-        ("new-window", Action::NewWindow),
-        ("new-tab", Action::NewTab),
-        ("toggle-quick-terminal", Action::ToggleQuickTerminal),
-    ];
-
-    /// Zig: `std.meta.stringToEnum`.
-    pub fn from_name(name: &[u8]) -> Option<Action> {
-        Self::ALL
-            .iter()
-            .find(|(n, _)| n.as_bytes() == name)
-            .map(|&(_, a)| a)
-    }
-
-    /// The Zig tag name.
-    pub fn as_str(self) -> &'static str {
-        Self::ALL
-            .iter()
-            .find(|&&(_, a)| a == self)
-            .map(|&(n, _)| n)
-            .unwrap()
-    }
-}
-
-/// Zig: `cli.action.SpecialCase(Action)`.
-enum SpecialCase {
-    Action(Action),
-    Fallback(Action),
-    AbortIfNoAction,
-}
-
-/// Zig: `cli.ghostty.Action.detectSpecialCase`.
-fn detect_special_case(arg: &[u8]) -> Option<SpecialCase> {
-    // If we see a "-e" and we haven't seen a command yet, then
-    // we are done looking for commands. This special case enables
-    // `ghostty -e ghostty +command`. If we've seen a command we
-    // still want to keep looking because
-    // `ghostty +command -e +command` is invalid.
-    if arg == b"-e" {
-        return Some(SpecialCase::AbortIfNoAction);
-    }
-
-    // Special case, --version always outputs the version no
-    // matter what, no matter what other args exist.
-    if arg == b"--version" {
-        return Some(SpecialCase::Action(Action::Version));
-    }
-
-    // --help matches "help" but if a subcommand is specified
-    // then we match the subcommand.
-    if arg == b"--help" || arg == b"-h" {
-        return Some(SpecialCase::Fallback(Action::Help));
-    }
-
-    None
-}
-
-/// Detect the action from CLI args (Zig: `cli.action.detectArgs`, which
-/// skips argv[0] via the args iterator).
-///
-/// TODO(port-dedupe): replace with `crate::cli::action::detect_args` once
-/// `src/cli/action.zig` is ported (owned by the CLI port).
+/// Detect the action from CLI args with `cli.action.detectArgs`
+/// (like Zig, the process args iterator includes argv[0]).
 fn detect_args(args: &[OsString]) -> Result<Option<Action>, InitError> {
-    let mut fallback: Option<Action> = None;
-    let mut pending: Option<Action> = None;
-    for arg in args.iter().skip(1) {
-        let arg = arg.as_encoded_bytes();
-
-        // Allow handling of special cases.
-        if let Some(special) = detect_special_case(arg) {
-            match special {
-                SpecialCase::Action(a) => return Ok(Some(a)),
-                SpecialCase::Fallback(a) => fallback = Some(a),
-                SpecialCase::AbortIfNoAction => {
-                    if pending.is_none() {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-
-        // Commands must start with "+"
-        if arg.first() != Some(&b'+') {
-            continue;
-        }
-        if pending.is_some() {
-            return Err(InitError::MultipleActions);
-        }
-        pending = Some(Action::from_name(&arg[1..]).ok_or(InitError::InvalidAction)?);
-    }
-
-    // If we have an action, we always return that action, even if we've
-    // seen "--help" or "-h" because the action may have its own help text.
-    if pending.is_some() {
-        return Ok(pending);
-    }
-
-    // If we have no action but we have a fallback, then we return that.
-    Ok(fallback)
-}
-
-/// Parse a `Logging` value the way `cli.args.parsePackedStruct` does: a
-/// bool for all fields, or a comma-separated list of (optionally `no-`
-/// prefixed) field names.
-///
-/// TODO(port-dedupe): replace with `crate::cli::args::parse_packed_struct`
-/// once `src/cli/args.zig` is ported (owned by the CLI port).
-fn parse_packed_logging(v: &str) -> Option<Logging> {
-    fn parse_bool(v: &str) -> Option<bool> {
-        match v {
-            "1" | "t" | "T" | "true" => Some(true),
-            "0" | "f" | "F" | "false" => Some(false),
-            _ => None,
-        }
-    }
-
-    // Allow standalone boolean values like "true" and "false" to
-    // turn on or off all of the struct's fields.
-    if let Some(b) = parse_bool(v) {
-        return Some(Logging {
-            stderr: b,
-            macos: b,
-        });
-    }
-
-    let mut result = Logging::default();
-    for part_raw in v.split(',') {
-        // Determine the field we're looking for and the value. If the
-        // field is prefixed with "no-" then we set the value to false.
-        let trimmed = part_raw.trim_matches([' ', '\t']);
-        let (part, value) = match trimmed.strip_prefix("no-") {
-            Some(rest) => (rest, false),
-            None => (trimmed, true),
-        };
-
-        match part {
-            "stderr" => result.stderr = value,
-            "macos" => result.macos = value,
-            // No field matched
-            _ => return None,
-        }
-    }
-
-    Some(result)
+    let args = crate::cli::args::ProcessArgs::new(
+        args.iter().map(|a| a.to_string_lossy().into_owned()),
+    );
+    crate::cli::action::detect_args::<Action>(args).map_err(|err| match err {
+        crate::cli::action::DetectError::MultipleActions => InitError::MultipleActions,
+        crate::cli::action::DetectError::InvalidAction => InitError::InvalidAction,
+    })
 }
 
 #[cfg(test)]
@@ -673,6 +487,10 @@ mod tests {
             .chain(v.iter().copied())
             .map(OsString::from)
             .collect()
+    }
+
+    fn parse_logging(v: &str) -> Option<Logging> {
+        crate::cli::args::parse_packed_struct::<Logging>(v).ok()
     }
 
     #[test]
@@ -706,32 +524,30 @@ mod tests {
             detect_args(&argv(&["+boo", "-e", "+help"])),
             Err(InitError::MultipleActions)
         );
-        // argv[0] is never an action.
-        assert_eq!(detect_args(&[OsString::from("+boo")]), Ok(None));
     }
 
     #[test]
     fn logging_parse() {
         assert_eq!(
-            parse_packed_logging("true"),
+            parse_logging("true"),
             Some(Logging {
                 stderr: true,
                 macos: true
             })
         );
         assert_eq!(
-            parse_packed_logging("false"),
+            parse_logging("false"),
             Some(Logging {
                 stderr: false,
                 macos: false
             })
         );
-        let l = parse_packed_logging("no-stderr").unwrap();
+        let l = parse_logging("no-stderr").unwrap();
         assert!(!l.stderr);
         assert_eq!(l.macos, Logging::default().macos);
-        let l = parse_packed_logging("stderr, macos").unwrap();
+        let l = parse_logging("stderr, macos").unwrap();
         assert!(l.stderr && l.macos);
-        assert_eq!(parse_packed_logging("bogus"), None);
+        assert_eq!(parse_logging("bogus"), None);
     }
 
     #[test]
@@ -748,13 +564,5 @@ mod tests {
         assert_eq!(resources_dir(), ResourcesDir::default());
         assert!(rlimits().nofile.is_none());
         assert_eq!(environ().get("PATH"), std::env::var("PATH").ok().as_ref());
-    }
-
-    #[test]
-    fn action_names_roundtrip() {
-        for (name, a) in Action::ALL {
-            assert_eq!(Action::from_name(name.as_bytes()), Some(a));
-            assert_eq!(a.as_str(), name);
-        }
     }
 }
