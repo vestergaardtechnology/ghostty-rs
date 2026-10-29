@@ -17000,4 +17000,550 @@ mod tests {
         check_next_row(&mut it, true, 2, 0);
         check_next_row(&mut it, false, 2, 2);
     }
+
+    fn wcu(c: u32, wide: Wide) -> PCell {
+        let mut cell = PCell::init(c);
+        cell.set_wide(wide);
+        cell
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_blank_lines_between_no_scrollback() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 3,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        *cell_at(page, 0, 0) = cp('A');
+        *cell_at(page, 0, 2) = cp('C');
+
+        // Resize
+        s.resize(reflow_cols(2)).unwrap();
+        assert_eq!(2, s.cols);
+        assert_eq!(3, s.total_rows());
+
+        let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+        check_next_row(&mut it, false, 2, 'A' as u32);
+        {
+            let offset = it.next().unwrap();
+            let cells = pin_cells(offset, CellSubset::All);
+            assert_eq!(0, cells[0].content_codepoint());
+        }
+        check_next_row(&mut it, false, 2, 'C' as u32);
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_cursor_not_on_last_line_preserves_location() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 5,
+            max_size: Some(1),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        for y in 0..s.rows as usize {
+            fill_row_x(page, y, 2);
+        }
+
+        // Grow blank rows to push our rows back into scrollback
+        s.grow_rows(5).unwrap();
+        assert_eq!(10, s.total_rows());
+
+        // Put a tracked pin in the history
+        let p = s.track_pin(s.pin(pt_active(0, 0)).unwrap()).unwrap();
+
+        // Resize
+        s.resize(Resize {
+            cols: Some(4),
+            reflow: true,
+
+            // Important: not on last row
+            cursor: Some(ResizeCursor::new(1, 1)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(4, s.cols);
+        assert_eq!(10, s.total_rows());
+
+        // Our cursor should move to the first row
+        assert_eq!(pt_active(0, 0), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_no_scrollback_pull_blank_active() {
+        let mut s = init_opts(Options {
+            cols: 5,
+            rows: 5,
+            max_size: Some(1),
+            ..Default::default()
+        });
+        assert!(s.pages.first == s.pages.last);
+        let page = pg(first(&s));
+        for y in 0..s.rows as usize {
+            fill_row_x(page, y, 2);
+        }
+
+        // Grow blank rows to push our rows back into scrollback
+        s.grow_rows(5).unwrap();
+        assert_eq!(10, s.total_rows());
+
+        let p = s.track_pin(s.pin(pt_active(0, 0)).unwrap()).unwrap();
+
+        // Resize with no cursor. Normally the trailing blank rows would be
+        // trimmed and the active area would slide up over our history.
+        s.resize(Resize {
+            cols: Some(4),
+            reflow: true,
+            pull_scrollback: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(4, s.cols);
+        assert_eq!(10, s.total_rows());
+
+        // The top of the active area should not move
+        assert_eq!(pt_active(0, 0), s.point_from_pin(Tag::Active, *tp(p)).unwrap());
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_copy_style() {
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // Create a style
+            let mut style = stylepkg::Style::default();
+            style.flags.bold = true;
+            let style_id = unsafe { page.styles.add(page.memory, style) }.unwrap();
+
+            for x in 0..s.cols as usize - 1 {
+                let mut c = cpu(x as u32);
+                c.set_style_id(style_id);
+                *cell_at(page, x, 0) = c;
+                unsafe { page.styles.use_(page.memory, style_id) };
+            }
+
+            // We're over-counted by 1 because `add` implies `use`.
+            unsafe { page.styles.release(page.memory, style_id) };
+        }
+
+        // Resize
+        s.resize(reflow_cols(2)).unwrap();
+        assert_eq!(2, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+        while let Some(offset) = it.next() {
+            for x in 0..s.cols as usize - 1 {
+                let mut offset_copy = offset;
+                offset_copy.x = x as CellCountInt;
+                let (row, cell) = pin_rac(offset_copy);
+                let style_id = cell.style_id();
+                assert!(style_id != 0);
+
+                let page = pg(offset.node);
+                let style = unsafe { &*page.styles.get(page.memory, style_id) };
+                assert!(style.flags.bold);
+
+                assert!(row.styled());
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_to_eliminate_a_wide_char() {
+        let mut s = init_opts(Options {
+            cols: 2,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            *cell_at(page, 0, 0) = wide_cell('😀', Wide::Wide);
+            *cell_at(page, 1, 0) = wide_cell('\0', Wide::SpacerTail);
+        }
+
+        // Resize
+        s.resize(reflow_cols(1)).unwrap();
+        assert_eq!(1, s.cols);
+        assert_eq!(1, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            check_cell(page, 0, 0, 0, Wide::Narrow);
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_to_wrap_a_wide_char() {
+        let mut s = init_opts(Options {
+            cols: 3,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            *cell_at(page, 0, 0) = cp('x');
+            *cell_at(page, 1, 0) = wide_cell('😀', Wide::Wide);
+            *cell_at(page, 2, 0) = wide_cell('\0', Wide::SpacerTail);
+        }
+
+        // Resize
+        s.resize(reflow_cols(2)).unwrap();
+        assert_eq!(2, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            check_cell(page, 0, 0, 'x' as u32, Wide::Narrow);
+            assert!(row_at(page, 0).wrap());
+            check_cell(page, 1, 0, 0, Wide::SpacerHead);
+            check_cell(page, 0, 1, '😀' as u32, Wide::Wide);
+            check_cell(page, 1, 1, 0, Wide::SpacerTail);
+        }
+    }
+
+    /// A row of four wide CJK pairs.
+    fn wide_pairs_row(page: &Page) {
+        for i in 0..4 {
+            *cell_at(page, i * 2, 0) = wcu(0x4E00 + i as u32, Wide::Wide);
+            *cell_at(page, i * 2 + 1, 0) = wcu(0, Wide::SpacerTail);
+        }
+    }
+
+    fn check_wide_pairs(page: &Page) {
+        for i in 0..4usize {
+            let y = i / 2;
+            let x = (i % 2) * 2;
+            check_cell(page, x, y, 0x4E00 + i as u32, Wide::Wide);
+            check_cell(page, x + 1, y, 0, Wide::SpacerTail);
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_wide_char_bulk_run() {
+        let mut s = init_opts(Options {
+            cols: 8,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            // A full row of wide character pairs so the reflow takes
+            // the bulk run path.
+            wide_pairs_row(pg(first(&s)));
+        }
+
+        // Resize to exactly two pairs per row: runs end on the row
+        // boundary with no spacer heads needed.
+        s.resize(reflow_cols(4)).unwrap();
+        assert_eq!(4, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            check_wide_pairs(page);
+
+            assert!(row_at(page, 0).wrap());
+            assert!(!row_at(page, 0).wrap_continuation());
+            assert!(!row_at(page, 1).wrap());
+            assert!(row_at(page, 1).wrap_continuation());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_wide_char_bulk_run_odd_cols_spacer_head() {
+        let mut s = init_opts(Options {
+            cols: 8,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            wide_pairs_row(pg(first(&s)));
+        }
+
+        // Resize to an odd number of columns: the bulk run must stop a
+        // pair short of the row boundary and the slow path inserts a
+        // spacer head in the final column.
+        s.resize(reflow_cols(5)).unwrap();
+        assert_eq!(5, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            check_wide_pairs(page);
+
+            check_cell(page, 4, 0, 0, Wide::SpacerHead);
+            assert!(row_at(page, 0).wrap());
+            assert_eq!(Wide::Narrow, cell_at(page, 4, 1).wide());
+            assert!(row_at(page, 1).wrap_continuation());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_wide_char_bulk_run_mixed_narrow_round_trip() {
+        // The emoji-in-prose shape: single wide pairs separated by
+        // narrow cells, which must all share a single bulk run.
+        let shape: [(u32, Wide); 9] = [
+            (0x4E00, Wide::Wide),
+            (0, Wide::SpacerTail),
+            ('x' as u32, Wide::Narrow),
+            (0x4E01, Wide::Wide),
+            (0, Wide::SpacerTail),
+            ('y' as u32, Wide::Narrow),
+            (0x4E02, Wide::Wide),
+            (0, Wide::SpacerTail),
+            ('z' as u32, Wide::Narrow),
+        ];
+
+        let mut s = init_opts(Options {
+            cols: 9,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            for (x, c) in shape.iter().enumerate() {
+                *cell_at(page, x, 0) = wcu(c.0, c.1);
+            }
+        }
+
+        // Shrink: the run ends exactly on the row boundary after the
+        // second narrow cell.
+        s.resize(reflow_cols(6)).unwrap();
+        assert_eq!(6, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            for (x, c) in shape[0..6].iter().enumerate() {
+                check_cell(page, x, 0, c.0, c.1);
+            }
+            for (x, c) in shape[6..].iter().enumerate() {
+                check_cell(page, x, 1, c.0, c.1);
+            }
+            assert!(row_at(page, 0).wrap());
+            assert!(row_at(page, 1).wrap_continuation());
+        }
+
+        // Grow back: the wrapped rows must rejoin into the original
+        // single-row layout.
+        s.resize(reflow_cols(9)).unwrap();
+        assert_eq!(9, s.cols);
+        assert_eq!(1, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+            for (x, c) in shape.iter().enumerate() {
+                check_cell(page, x, 0, c.0, c.1);
+            }
+            assert!(!row_at(page, 0).wrap());
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_wide_char_bulk_run_styled() {
+        let mut s = init_opts(Options {
+            cols: 8,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // Create a style
+            let mut style = stylepkg::Style::default();
+            style.flags.bold = true;
+            let style_id = unsafe { page.styles.add(page.memory, style) }.unwrap();
+
+            // Styled pairs: the tail shares the wide cell's style, as
+            // the print path writes them.
+            for i in 0..4 {
+                let mut c = wcu(0x4E00 + i as u32, Wide::Wide);
+                c.set_style_id(style_id);
+                *cell_at(page, i * 2, 0) = c;
+                unsafe { page.styles.use_(page.memory, style_id) };
+
+                let mut t = wcu(0, Wide::SpacerTail);
+                t.set_style_id(style_id);
+                *cell_at(page, i * 2 + 1, 0) = t;
+                unsafe { page.styles.use_(page.memory, style_id) };
+            }
+
+            // We're over-counted by 1 because `add` implies `use`.
+            unsafe { page.styles.release(page.memory, style_id) };
+        }
+
+        // Resize
+        s.resize(reflow_cols(4)).unwrap();
+        assert_eq!(4, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            for y in 0..2 {
+                for x in 0..4 {
+                    let (row, cell) = rac(page, x, y);
+                    let style_id = cell.style_id();
+                    assert!(style_id != 0);
+
+                    let style = unsafe { &*page.styles.get(page.memory, style_id) };
+                    assert!(style.flags.bold);
+                    assert!(row.styled());
+                    assert_eq!(if x % 2 == 0 { Wide::Wide } else { Wide::SpacerTail }, cell.wide());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_wide_char_bulk_run_degenerate_spacer_tail_style() {
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // A styled wide cell whose tail does NOT share its style.
+            // This can't come from the print path, but the run scan must
+            // reject the pair (slow path) rather than rewrite the tail
+            // to the wide cell's style.
+            let mut style = stylepkg::Style::default();
+            style.flags.bold = true;
+            let style_id = unsafe { page.styles.add(page.memory, style) }.unwrap();
+
+            let mut c = wcu(0x4E00, Wide::Wide);
+            c.set_style_id(style_id);
+            *cell_at(page, 0, 0) = c;
+            *cell_at(page, 1, 0) = wcu(0, Wide::SpacerTail);
+            *cell_at(page, 2, 0) = cp('x');
+        }
+
+        // Resize
+        s.resize(reflow_cols(3)).unwrap();
+        assert_eq!(3, s.cols);
+        assert_eq!(1, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            {
+                let cell = cell_at(page, 0, 0);
+                assert_eq!(0x4E00, cell.content_codepoint());
+                assert_eq!(Wide::Wide, cell.wide());
+                assert!(cell.style_id() != 0);
+                let style = unsafe { &*page.styles.get(page.memory, cell.style_id()) };
+                assert!(style.flags.bold);
+            }
+            {
+                let cell = cell_at(page, 1, 0);
+                assert_eq!(Wide::SpacerTail, cell.wide());
+                assert_eq!(stylepkg::DEFAULT_ID, cell.style_id());
+            }
+            check_cell(page, 2, 0, 'x' as u32, Wide::Narrow);
+        }
+    }
+
+    const FAMILY_SUFFIX: [u32; 6] = [0x200D, 0x1F468, 0x200D, 0x1F466, 0x200D, 0x1F466];
+
+    fn check_family(page: &Page, x: usize, y: usize) {
+        let cell = cell_at(page, x, y);
+        assert_eq!(0x1F468, cell.content_codepoint());
+        assert_eq!(Wide::Wide, cell.wide());
+        let cps = page.lookup_grapheme(cell).unwrap();
+        assert_eq!(&FAMILY_SUFFIX[..], cps);
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_to_wrap_a_multi_codepoint_grapheme_with_a_spacer_head() {
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            // We want to make the screen look like this:
+            //
+            // 👨‍👨‍👦‍👦👨‍👨‍👦‍👦
+
+            // First family emoji at (0, 0)
+            {
+                let (row, cell) = rac(page, 0, 0);
+                *cell = wcu(0x1F468, Wide::Wide); // First codepoint of the grapheme
+                page.set_graphemes(row, cell, &FAMILY_SUFFIX).unwrap();
+            }
+            *cell_at(page, 1, 0) = wcu(0, Wide::SpacerTail);
+            // Second family emoji at (2, 0)
+            {
+                let (row, cell) = rac(page, 2, 0);
+                *cell = wcu(0x1F468, Wide::Wide); // First codepoint of the grapheme
+                page.set_graphemes(row, cell, &FAMILY_SUFFIX).unwrap();
+            }
+            *cell_at(page, 3, 0) = wcu(0, Wide::SpacerTail);
+        }
+
+        // Resize
+        s.resize(reflow_cols(3)).unwrap();
+        assert_eq!(3, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        {
+            assert!(s.pages.first == s.pages.last);
+            let page = pg(first(&s));
+
+            check_family(page, 0, 0);
+            // Row should be wrapped
+            assert!(row_at(page, 0).wrap());
+            check_cell(page, 1, 0, 0, Wide::SpacerTail);
+            check_cell(page, 2, 0, 0, Wide::SpacerHead);
+            // (Zig re-checks (0, 0) here; the second emoji lands at (0, 1).)
+            check_family(page, 0, 0);
+            check_cell(page, 1, 1, 0, Wide::SpacerTail);
+        }
+    }
 }
