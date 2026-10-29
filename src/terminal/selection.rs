@@ -27,7 +27,7 @@ use crate::terminal::size::AllocError;
 // future, we should take a look at this again!
 
 /// A single selection within the terminal.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     /// The bounds of the selection.
     pub bounds: Bounds,
@@ -524,5 +524,502 @@ impl Selection {
                 end_pin.x = pin_cols(end_pin) - 1;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::page_list::NodePtr;
+    use crate::terminal::point::Point;
+    use crate::terminal::screen::Options;
+
+    fn init(cols: u16, rows: u16, max_scrollback_bytes: Option<usize>) -> Screen {
+        Screen::init(Options {
+            cols,
+            rows,
+            max_scrollback_bytes,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn scr(x: u16, y: u32) -> Point {
+        Point::Screen(Coordinate { x, y })
+    }
+
+    fn pin(s: &Screen, x: u16, y: u32) -> Pin {
+        s.pages.pin(scr(x, y)).unwrap()
+    }
+
+    fn sel(s: &Screen, a: (u16, u32), b: (u16, u32), rect: bool) -> Selection {
+        Selection::init(pin(s, a.0, a.1), pin(s, b.0, b.1), rect)
+    }
+
+    fn pt(s: &Screen, p: Pin) -> Point {
+        s.pages.point_from_pin(Tag::Screen, p).unwrap()
+    }
+
+    /// Init a selection, adjust it and check the resulting start/end.
+    fn check_adjust(
+        s: &mut Screen,
+        start: (u16, u32),
+        end: (u16, u32),
+        adjustment: Adjustment,
+        exp_start: (u16, u32),
+        exp_end: (u16, u32),
+    ) {
+        let mut sel = sel(s, start, end, false);
+        sel.adjust(s, adjustment);
+        assert_eq!(scr(exp_start.0, exp_start.1), pt(s, sel.start()));
+        assert_eq!(scr(exp_end.0, exp_end.1), pt(s, sel.end()));
+        sel.deinit(s);
+    }
+
+    fn pin_at(node: NodePtr, x: u16) -> Pin {
+        let mut p = Pin::new(node);
+        p.x = x;
+        p
+    }
+
+    fn nd<'a>(n: NodePtr) -> &'a mut crate::terminal::page_list::Node {
+        unsafe { &mut *n.as_ptr() }
+    }
+
+    #[test]
+    fn selection_adjust_right() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A1234\nB5678\nC1234\nD5678").unwrap();
+
+        // Simple movement right
+        check_adjust(&mut s, (5, 1), (3, 3), Adjustment::Right, (5, 1), (4, 3));
+
+        // Already at end of the line.
+        check_adjust(&mut s, (4, 1), (4, 2), Adjustment::Right, (4, 1), (0, 3));
+
+        // Already at end of the screen
+        check_adjust(&mut s, (5, 1), (4, 3), Adjustment::Right, (5, 1), (4, 3));
+    }
+
+    #[test]
+    fn selection_adjust_left() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A1234\nB5678\nC1234\nD5678").unwrap();
+
+        // Simple movement left
+        check_adjust(&mut s, (5, 1), (3, 3), Adjustment::Left, (5, 1), (2, 3));
+
+        // Already at beginning of the line.
+        check_adjust(&mut s, (5, 1), (0, 3), Adjustment::Left, (5, 1), (4, 2));
+    }
+
+    #[test]
+    fn selection_adjust_left_skips_blanks() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A1234\nB5678\nC12\nD56").unwrap();
+
+        // Same line
+        check_adjust(&mut s, (5, 1), (4, 3), Adjustment::Left, (5, 1), (2, 3));
+
+        // Edge
+        check_adjust(&mut s, (5, 1), (0, 3), Adjustment::Left, (5, 1), (2, 2));
+    }
+
+    #[test]
+    fn selection_adjust_up() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A\nB\nC\nD\nE").unwrap();
+
+        // Not on the first line
+        check_adjust(&mut s, (5, 1), (3, 3), Adjustment::Up, (5, 1), (3, 2));
+
+        // On the first line
+        check_adjust(&mut s, (5, 1), (3, 0), Adjustment::Up, (5, 1), (0, 0));
+    }
+
+    #[test]
+    fn selection_adjust_down() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A\nB\nC\nD\nE").unwrap();
+
+        // Not on the first line
+        check_adjust(&mut s, (5, 1), (3, 3), Adjustment::Down, (5, 1), (3, 4));
+
+        // On the last line
+        check_adjust(&mut s, (4, 1), (3, 4), Adjustment::Down, (4, 1), (9, 4));
+    }
+
+    #[test]
+    fn selection_adjust_down_with_not_full_screen() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A\nB\nC").unwrap();
+
+        // On the last line
+        check_adjust(&mut s, (4, 1), (3, 2), Adjustment::Down, (4, 1), (9, 2));
+    }
+
+    #[test]
+    fn selection_adjust_home() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A\nB\nC").unwrap();
+
+        // On the last line
+        check_adjust(&mut s, (4, 1), (1, 2), Adjustment::Home, (4, 1), (0, 0));
+    }
+
+    #[test]
+    fn selection_adjust_end_with_not_full_screen() {
+        let mut s = init(10, 10, Some(0));
+        s.test_write_string("A\nB\nC").unwrap();
+
+        // On the last line
+        check_adjust(&mut s, (4, 0), (1, 1), Adjustment::End, (4, 0), (9, 2));
+    }
+
+    #[test]
+    fn selection_adjust_beginning_of_line() {
+        let mut s = init(8, 10, Some(0));
+        s.test_write_string("A12 B34\nC12 D34").unwrap();
+
+        // Not at beginning of the line
+        check_adjust(&mut s, (5, 1), (5, 1), Adjustment::BeginningOfLine, (5, 1), (0, 1));
+
+        // Already at beginning of the line
+        check_adjust(&mut s, (5, 1), (0, 1), Adjustment::BeginningOfLine, (5, 1), (0, 1));
+
+        // End pin moves to start pin
+        check_adjust(&mut s, (0, 1), (5, 1), Adjustment::BeginningOfLine, (0, 1), (0, 1));
+    }
+
+    #[test]
+    fn selection_adjust_end_of_line() {
+        let mut s = init(8, 10, Some(0));
+        s.test_write_string("A12 B34\nC12 D34").unwrap();
+
+        // Not at end of the line
+        check_adjust(&mut s, (1, 0), (1, 0), Adjustment::EndOfLine, (1, 0), (7, 0));
+
+        // Already at end of the line
+        check_adjust(&mut s, (1, 0), (7, 0), Adjustment::EndOfLine, (1, 0), (7, 0));
+
+        // End pin moves to start pin
+        check_adjust(&mut s, (7, 0), (1, 0), Adjustment::EndOfLine, (7, 0), (7, 0));
+    }
+
+    #[test]
+    fn selection_order_standard() {
+        let mut s = init(100, 100, Some(1));
+
+        // forward, multi-line
+        let sl = sel(&s, (2, 1), (2, 2), false);
+        assert!(sl.order(&s) == Order::Forward);
+        sl.deinit(&mut s);
+
+        // reverse, multi-line
+        let sl = sel(&s, (2, 2), (2, 1), false);
+        assert!(sl.order(&s) == Order::Reverse);
+        sl.deinit(&mut s);
+
+        // forward, same-line
+        let sl = sel(&s, (2, 1), (3, 1), false);
+        assert!(sl.order(&s) == Order::Forward);
+        sl.deinit(&mut s);
+
+        // forward, single char
+        let sl = sel(&s, (2, 1), (2, 1), false);
+        assert!(sl.order(&s) == Order::Forward);
+        sl.deinit(&mut s);
+
+        // reverse, single line
+        let sl = sel(&s, (2, 1), (1, 1), false);
+        assert!(sl.order(&s) == Order::Reverse);
+        sl.deinit(&mut s);
+    }
+
+    #[test]
+    fn selection_rectangle_corners_clamp_across_mixed_width_pages() {
+        let mut s = init(4, 2, Some(0));
+
+        let first = s.pages.pages.first.unwrap();
+        let mut p = Pin::new(first);
+        p.y = 1;
+        s.pages.split(p).unwrap();
+        let second = nd(first).next.unwrap();
+        nd(second).page().size.cols = 2;
+
+        let sl = Selection::init(pin_at(first, 3), pin_at(second, 1), true);
+        assert_eq!(Order::MirroredForward, sl.order(&s));
+
+        let bottom_right = sl.bottom_right(&s);
+        let _ = bottom_right.row_and_cell();
+        assert!(pin_at(second, 1).eql(bottom_right));
+    }
+
+    #[test]
+    fn selection_order_rectangle() {
+        let mut s = init(100, 100, Some(1));
+
+        // Conventions:
+        // TL - top left
+        // BL - bottom left
+        // TR - top right
+        // BR - bottom right
+        let cases: [((u16, u32), (u16, u32), Order); 9] = [
+            // forward (TL -> BR)
+            ((1, 1), (2, 2), Order::Forward),
+            // reverse (BR -> TL)
+            ((2, 2), (1, 1), Order::Reverse),
+            // mirrored_forward (TR -> BL)
+            ((3, 1), (1, 3), Order::MirroredForward),
+            // mirrored_reverse (BL -> TR)
+            ((1, 3), (3, 1), Order::MirroredReverse),
+            // forward, single line (left -> right )
+            ((1, 1), (3, 1), Order::Forward),
+            // reverse, single line (right -> left)
+            ((3, 1), (1, 1), Order::Reverse),
+            // forward, single column (top -> bottom)
+            ((2, 1), (2, 3), Order::Forward),
+            // reverse, single column (bottom -> top)
+            ((2, 3), (2, 1), Order::Reverse),
+            // forward, single cell
+            ((1, 1), (1, 1), Order::Forward),
+        ];
+        for (a, b, expected) in cases {
+            let sl = sel(&s, a, b, true);
+            assert!(sl.order(&s) == expected);
+            sl.deinit(&mut s);
+        }
+    }
+
+    #[test]
+    fn top_left() {
+        let mut s = init(10, 10, Some(0));
+        let cases: [((u16, u32), (u16, u32)); 4] = [
+            // forward
+            ((1, 1), (3, 1)),
+            // reverse
+            ((3, 1), (1, 1)),
+            // mirrored_forward
+            ((3, 1), (1, 3)),
+            // mirrored_reverse
+            ((1, 3), (3, 1)),
+        ];
+        for (a, b) in cases {
+            let sl = sel(&s, a, b, true);
+            let tl = sl.top_left(&s);
+            assert_eq!(Some(scr(1, 1)), s.pages.point_from_pin(Tag::Screen, tl));
+            sl.deinit(&mut s);
+        }
+    }
+
+    #[test]
+    fn bottom_right() {
+        let mut s = init(10, 10, Some(0));
+        let cases: [((u16, u32), (u16, u32), bool, (u16, u32)); 4] = [
+            // forward
+            ((1, 1), (3, 1), false, (3, 1)),
+            // reverse
+            ((3, 1), (1, 1), false, (3, 1)),
+            // mirrored_forward
+            ((3, 1), (1, 3), true, (3, 3)),
+            // mirrored_reverse
+            ((1, 3), (3, 1), true, (3, 3)),
+        ];
+        for (a, b, rect, exp) in cases {
+            let sl = sel(&s, a, b, rect);
+            let br = sl.bottom_right(&s);
+            assert_eq!(Some(scr(exp.0, exp.1)), s.pages.point_from_pin(Tag::Screen, br));
+            sl.deinit(&mut s);
+        }
+    }
+
+    #[test]
+    fn ordered() {
+        let s = init(10, 10, Some(0));
+        {
+            // forward
+            let sl = sel(&s, (1, 1), (3, 1), false);
+            let sel_reverse = sel(&s, (3, 1), (1, 1), false);
+            assert!(sl.ordered(&s, Order::Forward).eql(sl));
+            assert!(sl.ordered(&s, Order::Reverse).eql(sel_reverse));
+            assert!(sl.ordered(&s, Order::MirroredForward).eql(sl));
+        }
+        {
+            // reverse
+            let sl = sel(&s, (3, 1), (1, 1), false);
+            let sel_forward = sel(&s, (1, 1), (3, 1), false);
+            assert!(sl.ordered(&s, Order::Forward).eql(sel_forward));
+            assert!(sl.ordered(&s, Order::Reverse).eql(sl));
+            assert!(sl.ordered(&s, Order::MirroredForward).eql(sel_forward));
+        }
+        {
+            // mirrored_forward
+            let sl = sel(&s, (3, 1), (1, 3), true);
+            let sel_forward = sel(&s, (1, 1), (3, 3), true);
+            let sel_reverse = sel(&s, (3, 3), (1, 1), true);
+            assert!(sl.ordered(&s, Order::Forward).eql(sel_forward));
+            assert!(sl.ordered(&s, Order::Reverse).eql(sel_reverse));
+            assert!(sl.ordered(&s, Order::MirroredReverse).eql(sel_forward));
+        }
+        {
+            // mirrored_reverse
+            let sl = sel(&s, (1, 3), (3, 1), true);
+            let sel_forward = sel(&s, (1, 1), (3, 3), true);
+            let sel_reverse = sel(&s, (3, 3), (1, 1), true);
+            assert!(sl.ordered(&s, Order::Forward).eql(sel_forward));
+            assert!(sl.ordered(&s, Order::Reverse).eql(sel_reverse));
+            assert!(sl.ordered(&s, Order::MirroredForward).eql(sel_forward));
+        }
+    }
+
+    #[test]
+    fn selection_contains() {
+        let s = init(10, 10, Some(0));
+        {
+            let sl = sel(&s, (5, 1), (3, 2), false);
+
+            assert!(sl.contains(&s, pin(&s, 6, 1)));
+            assert!(sl.contains(&s, pin(&s, 1, 2)));
+            assert!(!sl.contains(&s, pin(&s, 1, 1)));
+            assert!(!sl.contains(&s, pin(&s, 5, 2)));
+        }
+
+        // Reverse
+        {
+            let sl = sel(&s, (3, 2), (5, 1), false);
+
+            assert!(sl.contains(&s, pin(&s, 6, 1)));
+            assert!(sl.contains(&s, pin(&s, 1, 2)));
+            assert!(!sl.contains(&s, pin(&s, 1, 1)));
+            assert!(!sl.contains(&s, pin(&s, 5, 2)));
+        }
+
+        // Single line
+        {
+            let sl = sel(&s, (5, 1), (8, 1), false);
+
+            assert!(sl.contains(&s, pin(&s, 6, 1)));
+            assert!(!sl.contains(&s, pin(&s, 2, 1)));
+            assert!(!sl.contains(&s, pin(&s, 9, 1)));
+        }
+    }
+
+    #[test]
+    fn selection_contains_rectangle() {
+        let s = init(15, 15, Some(0));
+        for (a, b) in [((3, 3), (7, 9)), ((7, 9), (3, 3))] {
+            // Forward, then reverse
+            let sl = sel(&s, a, b, true);
+
+            assert!(sl.contains(&s, pin(&s, 5, 6))); // Center
+            assert!(sl.contains(&s, pin(&s, 3, 6))); // Left border
+            assert!(sl.contains(&s, pin(&s, 7, 6))); // Right border
+            assert!(sl.contains(&s, pin(&s, 5, 3))); // Top border
+            assert!(sl.contains(&s, pin(&s, 5, 9))); // Bottom border
+
+            assert!(!sl.contains(&s, pin(&s, 5, 2))); // Above center
+            assert!(!sl.contains(&s, pin(&s, 5, 10))); // Below center
+            assert!(!sl.contains(&s, pin(&s, 2, 6))); // Left center
+            assert!(!sl.contains(&s, pin(&s, 8, 6))); // Right center
+            assert!(!sl.contains(&s, pin(&s, 8, 3))); // Just right of top right
+            assert!(!sl.contains(&s, pin(&s, 2, 9))); // Just left of bottom left
+        }
+
+        // Single line
+        // NOTE: This is the same as normal selection but we just do it for brevity
+        {
+            let sl = sel(&s, (5, 1), (10, 1), true);
+
+            assert!(sl.contains(&s, pin(&s, 6, 1)));
+            assert!(!sl.contains(&s, pin(&s, 2, 1)));
+            assert!(!sl.contains(&s, pin(&s, 12, 1)));
+        }
+    }
+
+    #[test]
+    fn selection_contained_row() {
+        let s = init(10, 5, Some(0));
+        let cols = s.pages.cols;
+
+        {
+            let sl = sel(&s, (5, 1), (3, 3), false);
+
+            // Not contained
+            assert!(sl.contained_row(&s, pin(&s, 1, 4)).is_none());
+
+            // Start line
+            assert_eq!(
+                Selection::init(sl.start(), pin(&s, cols - 1, 1), false),
+                sl.contained_row(&s, pin(&s, 1, 1)).unwrap()
+            );
+
+            // End line
+            assert_eq!(
+                Selection::init(pin(&s, 0, 3), sl.end(), false),
+                sl.contained_row(&s, pin(&s, 2, 3)).unwrap()
+            );
+
+            // Middle line
+            assert_eq!(
+                Selection::init(pin(&s, 0, 2), pin(&s, cols - 1, 2), false),
+                sl.contained_row(&s, pin(&s, 2, 2)).unwrap()
+            );
+        }
+
+        // Rectangle
+        {
+            let sl = sel(&s, (3, 1), (6, 3), true);
+
+            // Not contained
+            assert!(sl.contained_row(&s, pin(&s, 1, 4)).is_none());
+
+            // Start line
+            assert_eq!(sel(&s, (3, 1), (6, 1), true), sl.contained_row(&s, pin(&s, 1, 1)).unwrap());
+
+            // End line
+            assert_eq!(sel(&s, (3, 3), (6, 3), true), sl.contained_row(&s, pin(&s, 2, 3)).unwrap());
+
+            // Middle line
+            assert_eq!(sel(&s, (3, 2), (6, 2), true), sl.contained_row(&s, pin(&s, 2, 2)).unwrap());
+        }
+
+        // Single-line selection
+        {
+            let sl = sel(&s, (2, 1), (6, 1), false);
+
+            // Not contained
+            assert!(sl.contained_row(&s, pin(&s, 1, 0)).is_none());
+            assert!(sl.contained_row(&s, pin(&s, 1, 2)).is_none());
+
+            // Contained
+            assert_eq!(sl, sl.contained_row(&s, pin(&s, 1, 1)).unwrap());
+        }
+    }
+
+    #[test]
+    fn selection_contained_row_clamps_mixed_width_pages() {
+        let mut s = init(4, 3, Some(0));
+
+        let first = s.pages.pages.first.unwrap();
+        let mut p = Pin::new(first);
+        p.y = 2;
+        s.pages.split(p).unwrap();
+        p.y = 1;
+        s.pages.split(p).unwrap();
+        let middle = nd(first).next.unwrap();
+        let last = nd(middle).next.unwrap();
+        nd(middle).page().size.cols = 2;
+
+        let linear = Selection::init(pin_at(first, 1), pin_at(last, 1), false);
+        let linear_row = linear.contained_row(&s, Pin::new(middle)).unwrap();
+        let _ = linear_row.end().row_and_cell();
+        assert!(Pin::new(middle).eql(linear_row.start()));
+        assert!(pin_at(middle, 1).eql(linear_row.end()));
+
+        let rectangle = Selection::init(pin_at(first, 1), pin_at(last, 3), true);
+        let rectangle_row = rectangle.contained_row(&s, Pin::new(middle)).unwrap();
+        let _ = rectangle_row.end().row_and_cell();
+        assert!(pin_at(middle, 1).eql(rectangle_row.start()));
+        assert!(pin_at(middle, 1).eql(rectangle_row.end()));
     }
 }
