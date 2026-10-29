@@ -499,26 +499,10 @@ mod tests {
     use super::*;
     use crate::font::nerd_font_attributes::get_constraint;
 
-    // TODO(port-dedupe): replace with crate::datastruct::comparison::expect_approx_equal
+    crate::impl_approx_equal_fields!(Size { width, height, x, y });
+
     fn expect_approx_equal(expected: Size, actual: Size) {
-        let sqrt_eps = f64::EPSILON.sqrt();
-        let approx = |e: f64, a: f64| {
-            // std.math.approxEqRel
-            if e == a {
-                return true;
-            }
-            if e.is_nan() || a.is_nan() {
-                return false;
-            }
-            (e - a).abs() <= e.abs().max(a.abs()) * sqrt_eps
-        };
-        assert!(
-            approx(expected.width, actual.width)
-                && approx(expected.height, actual.height)
-                && approx(expected.x, actual.x)
-                && approx(expected.y, actual.y),
-            "expected approximately {expected:?}, found {actual:?}"
-        );
+        crate::datastruct::comparison::expect_approx_equal(&expected, &actual).unwrap();
     }
 
     #[test]

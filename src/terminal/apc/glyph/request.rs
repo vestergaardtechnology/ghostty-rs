@@ -22,6 +22,7 @@ use std::fmt;
 
 use crate::datastruct::limited_allocator::LimitedAllocator;
 use crate::font::opentype::glyf::{self, Outline};
+use crate::terminal::fraction;
 
 /// Maximum decoded glyph payload size accepted by the protocol.
 /// This is documented in the spec.
@@ -1067,74 +1068,6 @@ fn base64_decode(dest: &mut [u8], source: &[u8]) -> Result<(), Base64Error> {
         return Err(Base64Error::InvalidPadding);
     }
     Ok(())
-}
-
-/// Stand-in for `src/terminal/fraction.zig`.
-///
-/// TODO(port-dedupe): replace with `crate::terminal::fraction`.
-mod fraction {
-    /// Parse a decimal fraction in the range [0, 1] inclusive.
-    ///
-    /// Accepts an optional leading `+` or `-` sign followed by decimal
-    /// digits with an optional decimal point ("0.5", ".5", "1.", "1"); at
-    /// least one digit is required. Exponent and hexadecimal float syntax
-    /// are not supported. Returns null for invalid syntax and for any value
-    /// outside [0, 1] (so negative values other than -0 are rejected).
-    pub fn parse(value: &[u8]) -> Option<f64> {
-        let mut v = value;
-        let mut negative = false;
-        if !v.is_empty() {
-            match v[0] {
-                b'+' => v = &v[1..],
-                b'-' => {
-                    negative = true;
-                    v = &v[1..];
-                }
-                _ => {}
-            }
-        }
-
-        let mut i: usize = 0;
-        let mut int_part: f64 = 0.0;
-        while i < v.len() && v[i] != b'.' {
-            let d = v[i];
-            if !d.is_ascii_digit() {
-                return None;
-            }
-            int_part = int_part * 10.0 + (d - b'0') as f64;
-            i += 1;
-        }
-
-        let mut digits = i;
-        let mut frac: u64 = 0;
-        let mut scale: u64 = 1;
-        if i < v.len() {
-            debug_assert!(v[i] == b'.');
-            i += 1;
-            while i < v.len() {
-                let d = v[i];
-                if !d.is_ascii_digit() {
-                    return None;
-                }
-                if scale < 1_000_000_000_000_000 {
-                    frac = frac * 10 + (d - b'0') as u64;
-                    scale *= 10;
-                }
-                digits += 1;
-                i += 1;
-            }
-        }
-        if digits == 0 {
-            return None;
-        }
-
-        let magnitude = int_part + frac as f64 / scale as f64;
-        let result = if negative { -magnitude } else { magnitude };
-        if !(result >= 0.0 && result <= 1.0) {
-            return None;
-        }
-        Some(result)
-    }
 }
 
 #[cfg(test)]

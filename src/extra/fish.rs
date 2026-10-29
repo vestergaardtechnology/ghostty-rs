@@ -31,7 +31,7 @@ fn write_completions(writer: &mut String) {
                 writer.push(' ');
             }
             writer.push('+');
-            writer.push_str(action.name);
+            writer.push_str(action.name());
             count += 1;
         }
         writer.push_str("\"\n");
@@ -106,17 +106,17 @@ fn write_completions(writer: &mut String) {
                 writer.push(' ');
             }
             writer.push('+');
-            writer.push_str(action.name);
+            writer.push_str(action.name());
             count += 1;
         }
         writer.push_str("\"\n");
     }
 
     for action in ACTIONS {
-        if action.name == "help" {
+        if action.name() == "help" {
             continue;
         }
-        if action.name == "version" {
+        if action.name() == "version" {
             continue;
         }
 
@@ -126,7 +126,7 @@ fn write_completions(writer: &mut String) {
             }
             writer.push_str(&format!(
                 "complete -c ghostty -n \"__fish_seen_subcommand_from +{}\" -l ",
-                action.name
+                action.name()
             ));
             writer.push_str(opt.name);
             writer.push_str(if opt.ty != FieldType::Bool { " -r" } else { "" });

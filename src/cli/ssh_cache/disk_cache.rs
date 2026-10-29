@@ -72,9 +72,7 @@ impl DiskCache {
     ///
     /// On all platforms, this is `${XDG_STATE_HOME}/ghostty/ssh_cache`.
     pub fn default_path(program: &str) -> Result<PathBuf, Error> {
-        // TODO(port-dedupe): replace with crate::global::environ_map()
-        // once global.zig is ported.
-        let environ_map = crate::os::environ_map();
+        let environ_map = crate::global::environ_map();
         let state_dir = crate::os::xdg::state(
             &environ_map,
             crate::os::xdg::Options {

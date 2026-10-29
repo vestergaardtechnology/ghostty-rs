@@ -10,8 +10,9 @@
 //! action files with `std.zig.Ast` to find the doc comments. The Rust port
 //! takes the same doc comment lines from the compiled types instead:
 //! `Config::FIELDS` (captured by `cli_struct!`), `ActionKey::doc_lines`
-//! (captured by `define_actions!`) and the CLI action table in
-//! [`crate::extra::ACTIONS`]. The output (a Zig source file, the
+//! (captured by `define_actions!`) and the CLI actions' help strings
+//! ([`crate::cli::ghostty::Action::help_string`], via
+//! [`crate::extra::ACTIONS`]). The output (a Zig source file, the
 //! `help_strings` module) is the same.
 
 use std::io::{self, Write};
@@ -75,17 +76,18 @@ fn gen_actions(writer: &mut String) {
 
     for action in ACTIONS {
         // The function must be preceded by a doc comment.
-        if action.doc_lines.is_empty() {
+        if action.help().is_empty() {
             eprint!(
                 "doc comment must be present on run function of the {} action!",
-                action.name
+                action.name()
             );
             std::process::exit(1);
         }
 
-        let comment = extract_doc_comments(action.doc_lines);
+        let lines: Vec<&str> = action.help().split('\n').collect();
+        let comment = extract_doc_comments(&lines);
         writer.push_str("pub const @\"");
-        writer.push_str(action.name);
+        writer.push_str(action.name());
         writer.push_str("\" = \n");
         writer.push_str(&comment);
         writer.push_str("\n\n");

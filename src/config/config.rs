@@ -66,7 +66,12 @@ pub use super::path::{Path, RepeatablePath};
 pub use super::repeatable_string_map::RepeatableStringMap;
 
 pub use crate::font::metrics::Modifier as MetricModifier;
-pub use self::standins::ReleaseChannel;
+pub use crate::build_config::ReleaseChannel;
+
+impl_cli_enum!(ReleaseChannel {
+    Tip => "tip",
+    Stable => "stable",
+});
 
 /// Zig `std.time.ns_per_*`.
 pub const NS_PER_US: u64 = 1000;
@@ -80,96 +85,7 @@ pub const NS_PER_WEEK: u64 = 7 * NS_PER_DAY;
 /// Zig `std.Io.Dir.max_path_bytes`.
 const MAX_PATH_BYTES: usize = 4096;
 
-/// Stand-ins for declarations of modules that are being ported
-/// concurrently. Each is a minimal, faithful subset of the Zig original.
-pub mod standins {
-    use super::*;
-
-    /// TODO(port-dedupe): replace with crate::build_config::ReleaseChannel
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum ReleaseChannel {
-        /// Unstable builds on every commit.
-        Tip,
-
-        /// Stable tagged releases.
-        Stable,
-    }
-
-    impl_cli_enum!(ReleaseChannel {
-        Tip => "tip",
-        Stable => "stable",
-    });
-
-    /// TODO(port-dedupe): replace with crate::build_config::release_channel
-    /// (the default build option is `tip` for dev versions).
-    pub const RELEASE_CHANNEL: ReleaseChannel = ReleaseChannel::Tip;
-
-    /// TODO(port-dedupe): replace with crate::apprt::runtime::Runtime and
-    /// crate::build_config::app_runtime.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum AppRuntime {
-        None,
-        Gtk,
-    }
-
-    /// The default Ghostty application build: GTK on Linux/FreeBSD, the
-    /// embedded runtime (`none`) elsewhere.
-    pub const APP_RUNTIME: AppRuntime =
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) { AppRuntime::Gtk } else { AppRuntime::None };
-
-    /// The process arguments (Zig `global.args().vector`).
-    ///
-    /// TODO(port-dedupe): replace with crate::global::args().
-    pub fn global_args() -> Vec<std::ffi::CString> {
-        use std::os::unix::ffi::OsStringExt;
-        std::env::args_os()
-            .map(|a| std::ffi::CString::new(a.into_vec()).unwrap_or_default())
-            .collect()
-    }
-
-
-    /// CodepointMap is a map of codepoints to a discovery descriptor of a font
-    /// to use for that codepoint (Zig `font.CodepointMap`).
-    ///
-    /// TODO(port-dedupe): replace with crate::font::codepoint_map::CodepointMap
-    /// (its entries are private and can't be iterated, which the config
-    /// formatter and tests need). [`CodepointMap::to_font_map`] converts.
-    #[derive(Debug, Clone, Default, PartialEq)]
-    pub struct CodepointMap {
-        pub list: Vec<CodepointMapEntry>,
-    }
-
-    impl CodepointMap {
-        /// Add an entry to the map.
-        ///
-        /// For conflicting codepoints, entries added later take priority over
-        /// entries added earlier.
-        pub fn add(&mut self, entry: CodepointMapEntry) {
-            debug_assert!(entry.range[0] <= entry.range[1]);
-            self.list.push(entry);
-        }
-
-        /// Convert to the font package's map.
-        pub fn to_font_map(&self) -> crate::font::CodepointMap {
-            let mut map = crate::font::CodepointMap::new();
-            for entry in &self.list {
-                map.add(entry.clone());
-            }
-            map
-        }
-
-        /// Get a descriptor for a codepoint.
-        pub fn get(&self, cp: u32) -> Option<&Descriptor> {
-            self.list
-                .iter()
-                .rev()
-                .find(|e| e.range[0] <= cp && cp <= e.range[1])
-                .map(|e| &e.descriptor)
-        }
-    }
-}
-
-use self::standins::CodepointMap;
+use crate::font::CodepointMap;
 use crate::font::codepoint_map::Entry as CodepointMapEntry;
 use crate::font::discovery::Descriptor;
 use crate::font::face::{Variation, VariationId};
@@ -4340,7 +4256,13 @@ impl Config {
 
     /// Load and parse the CLI args.
     pub fn load_cli_args(&mut self) -> Result<(), LoadError> {
-        let argv = standins::global_args();
+        let argv: Vec<std::ffi::CString> = {
+            use std::os::unix::ffi::OsStringExt;
+            crate::global::args()
+                .into_iter()
+                .map(|a| std::ffi::CString::new(a.into_vec()).unwrap_or_default())
+                .collect()
+        };
         self.load_cli_args_from(&argv)
     }
 
@@ -4866,9 +4788,9 @@ impl Config {
         self.working_directory = Some(wd);
 
         // Apprt-specific defaults
-        match standins::APP_RUNTIME {
-            standins::AppRuntime::None => {}
-            standins::AppRuntime::Gtk => {
+        match crate::build_config::APP_RUNTIME {
+            crate::apprt::runtime::Runtime::None => {}
+            crate::apprt::runtime::Runtime::Gtk => {
                 match self.gtk_single_instance {
                     GtkSingleInstance::True | GtkSingleInstance::False => {}
 
@@ -4932,7 +4854,7 @@ impl Config {
         // We can't set this as a struct default because our config is
         // loaded in environments where a build config isn't available.
         if self.auto_update_channel.is_none() {
-            self.auto_update_channel = Some(standins::RELEASE_CHANNEL);
+            self.auto_update_channel = Some(crate::build_config::RELEASE_CHANNEL);
         }
 
         self.faint_opacity = self.faint_opacity.clamp(0.0, 1.0);
@@ -5307,12 +5229,12 @@ fn probable_cli_environment() -> bool {
 
     // If we have TERM_PROGRAM set to a non-empty value, we assume a graphical
     // terminal environment.
-    if std::env::var_os("TERM_PROGRAM").is_some_and(|v| !v.is_empty()) {
+    if crate::global::environ().get("TERM_PROGRAM").is_some_and(|v| !v.is_empty()) {
         return true;
     }
 
     // CLI arguments makes things probable
-    if std::env::args_os().len() > 1 {
+    if crate::global::args().len() > 1 {
         return true;
     }
 
@@ -5464,27 +5386,10 @@ impl ParseCli for MetricModifier {
     }
 }
 
-/// Adapter from the font package's formatter trait to the config
-/// [`EntryFormatter`].
-struct MetricModifierFormatter<'a, 'b>(&'a mut EntryFormatter<'b>, Option<formatterpkg::Error>);
-
-impl crate::font::metrics::EntryFormatter for MetricModifierFormatter<'_, '_> {
-    fn format_entry_str(&mut self, value: &str) -> fmt::Result {
-        self.0.format_entry(value).map_err(|err| {
-            self.1 = Some(err);
-            fmt::Error
-        })
-    }
-}
-
 impl FormatEntry for MetricModifier {
     /// Used by config formatter
     fn format_entry(&self, f: &mut EntryFormatter<'_>) -> Result<(), formatterpkg::Error> {
-        let mut adapter = MetricModifierFormatter(f, None);
-        match MetricModifier::format_entry(self, &mut adapter) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(adapter.1.unwrap_or(formatterpkg::Error::WriteFailed)),
-        }
+        MetricModifier::format_entry(self, f)
     }
 }
 
@@ -5502,11 +5407,7 @@ impl ParseCli for KeyRemapSet {
 
 impl FormatEntry for KeyRemapSet {
     fn format_entry(&self, f: &mut EntryFormatter<'_>) -> Result<(), formatterpkg::Error> {
-        let mut buf: Vec<u8> = Vec::new();
-        let mut ef = crate::input::key_mods::entry_formatter(f.name, &mut buf);
-        KeyRemapSet::format_entry(self, &mut ef).map_err(|_| formatterpkg::Error::WriteFailed)?;
-        f.writer.write_str(&String::from_utf8_lossy(&buf))?;
-        Ok(())
+        KeyRemapSet::format_entry(self, f)
     }
 }
 
@@ -6270,12 +6171,10 @@ pub struct RepeatableCodepointMap {
 impl RepeatableCodepointMap {
     /// Compare if two of our value are equal. Required by Config.
     pub fn equal(&self, other: &RepeatableCodepointMap) -> bool {
-        let items_a = &self.map.list;
-        let items_b = &other.map.list;
-        if items_a.len() != items_b.len() {
+        if self.map.len() != other.map.len() {
             return false;
         }
-        items_a.iter().zip(items_b).all(|(a, b)| a == b)
+        (0..self.map.len()).all(|i| self.map.entry(i) == other.map.entry(i))
     }
 }
 
@@ -6316,13 +6215,13 @@ impl ParseCli for RepeatableCodepointMap {
 impl FormatEntry for RepeatableCodepointMap {
     /// Used by Formatter
     fn format_entry(&self, f: &mut EntryFormatter<'_>) -> Result<(), formatterpkg::Error> {
-        if self.map.list.is_empty() {
+        if self.map.is_empty() {
             return f.format_entry(&());
         }
 
-        for entry in &self.map.list {
-            let range = entry.range;
-            let family = entry.descriptor.family.as_deref().unwrap_or("");
+        for (range, descriptor) in self.map.ranges().iter().zip(self.map.descriptors()) {
+            let range = *range;
+            let family = descriptor.family.as_deref().unwrap_or("");
             let s = if range[0] == range[1] {
                 format!("U+{:04X}={}", range[0], family)
             } else {
@@ -8559,21 +8458,13 @@ impl Keybinds {
             return formatter.format_entry(&());
         }
 
-        // The binding formatter writes bytes; collect them and forward.
         fn forward(
             formatter: &mut EntryFormatter<'_>,
             prefix: Vec<u8>,
             v: &binding::Value,
         ) -> Result<(), formatterpkg::Error> {
-            let mut out: Vec<u8> = Vec::new();
             let mut buffer = prefix;
-            {
-                let mut f = crate::input::key_mods::entry_formatter(formatter.name, &mut out);
-                v.format_entries(&mut buffer, &mut f)
-                    .map_err(|_| formatterpkg::Error::OutOfMemory)?;
-            }
-            formatter.writer.write_str(&String::from_utf8_lossy(&out))?;
-            Ok(())
+            v.format_entries(&mut buffer, formatter)
         }
 
         // Format root set bindings
@@ -8806,7 +8697,7 @@ impl RepeatableCommand {
             // translating these shared strings for the embedded runtime gives
             // the macOS app a localized command palette in an otherwise
             // unlocalized UI.
-            let localized = if standins::APP_RUNTIME == standins::AppRuntime::Gtk {
+            let localized = if crate::build_config::APP_RUNTIME == crate::apprt::runtime::Runtime::Gtk {
                 cmd.translated()
             } else {
                 cmd.clone()
@@ -9858,24 +9749,24 @@ mod tests {
         list.parse_cli(Some("U+0001 - U+0005=Verdana")).unwrap();
         list.parse_cli(Some("U+0006-U+0009, U+ABCD=Courier")).unwrap();
 
-        assert_eq!(4usize, list.map.list.len());
+        assert_eq!(4usize, list.map.len());
         {
-            let entry = &list.map.list[0];
+            let entry = &list.map.entry(0);
             assert_eq!([0xABCD, 0xABCD], entry.range);
             assert_eq!("Comic Sans", entry.descriptor.family.as_deref().unwrap());
         }
         {
-            let entry = &list.map.list[1];
+            let entry = &list.map.entry(1);
             assert_eq!([1, 5], entry.range);
             assert_eq!("Verdana", entry.descriptor.family.as_deref().unwrap());
         }
         {
-            let entry = &list.map.list[2];
+            let entry = &list.map.entry(2);
             assert_eq!([6, 9], entry.range);
             assert_eq!("Courier", entry.descriptor.family.as_deref().unwrap());
         }
         {
-            let entry = &list.map.list[3];
+            let entry = &list.map.entry(3);
             assert_eq!([0xABCD, 0xABCD], entry.range);
             assert_eq!("Courier", entry.descriptor.family.as_deref().unwrap());
         }

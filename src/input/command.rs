@@ -18,19 +18,7 @@ use super::binding::{
     WriteScreenFormat,
 };
 
-/// `i18n._`: translate a message.
-///
-/// TODO(port-dedupe): replace with crate::os::i18n::_ (gettext).
-fn gettext(s: &CStr) -> &CStr {
-    s
-}
-
-/// `i18n.N_`: mark a string for translation without translating it.
-///
-/// TODO(port-dedupe): replace with crate::os::i18n::N_.
-const fn n_(s: &'static CStr) -> &'static CStr {
-    s
-}
+use crate::os::i18n::{gettext, N_ as n_};
 
 /// A command is a named binding action that can be executed from
 /// something like a command palette.

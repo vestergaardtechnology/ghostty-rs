@@ -100,10 +100,10 @@ pub fn run() -> RunResult {
         )?;
         writeln!(stdout, "  - GTK version   :")?;
         writeln!(stdout, "    build         : {}", gtk_version::COMPTIME_VERSION)?;
-        writeln!(stdout, "    runtime       : {}", gtk_version::runtime_version())?;
+        writeln!(stdout, "    runtime       : {}", gtk_version::get_runtime_version())?;
         writeln!(stdout, "  - libadwaita    : enabled")?;
         writeln!(stdout, "    build         : {}", adw_version::COMPTIME_VERSION)?;
-        writeln!(stdout, "    runtime       : {}", adw_version::runtime_version())?;
+        writeln!(stdout, "    runtime       : {}", adw_version::get_runtime_version())?;
         if build_options::X11 {
             writeln!(stdout, "  - libX11        : enabled")?;
         } else {
@@ -148,6 +148,7 @@ fn desktop_environment_tag(de: internal_os::DesktopEnvironment) -> &'static str 
 
 /// Loads `major.minor.micro` from the version getters of a shared library
 /// at runtime.
+#[cfg(not(feature = "gtk"))]
 fn runtime_lib_version(libs: &[&str], getters: [&str; 3]) -> String {
     use std::ffi::CString;
     for lib in libs {
@@ -180,13 +181,19 @@ fn runtime_lib_version(libs: &[&str], getters: [&str; 3]) -> String {
     "unknown".to_owned()
 }
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::gtk_version once ported.
+#[cfg(feature = "gtk")]
+use crate::apprt::gtk::{adw_version, gtk_version};
+
+/// Without the `gtk` feature GTK isn't linked: report the versions of the
+/// system libraries found at runtime instead of
+/// `crate::apprt::gtk::gtk_version`.
+#[cfg(not(feature = "gtk"))]
 mod gtk_version {
     /// The GTK version the binary was built against (not linked in the
     /// Rust port's default build).
     pub const COMPTIME_VERSION: &str = "unknown";
 
-    pub fn runtime_version() -> String {
+    pub fn get_runtime_version() -> String {
         super::runtime_lib_version(
             &["libgtk-4.so.1", "libgtk-4.so"],
             ["gtk_get_major_version", "gtk_get_minor_version", "gtk_get_micro_version"],
@@ -194,13 +201,14 @@ mod gtk_version {
     }
 }
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::adw_version once ported.
+/// Without the `gtk` feature libadwaita isn't linked (see [`gtk_version`]).
+#[cfg(not(feature = "gtk"))]
 mod adw_version {
     /// The libadwaita version the binary was built against (not linked in
     /// the Rust port's default build).
     pub const COMPTIME_VERSION: &str = "unknown";
 
-    pub fn runtime_version() -> String {
+    pub fn get_runtime_version() -> String {
         super::runtime_lib_version(
             &["libadwaita-1.so.0", "libadwaita-1.so"],
             ["adw_get_major_version", "adw_get_minor_version", "adw_get_micro_version"],

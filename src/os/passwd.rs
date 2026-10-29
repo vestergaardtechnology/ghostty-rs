@@ -7,9 +7,7 @@
 use std::ffi::CStr;
 use std::fmt;
 
-// TODO(port-dedupe): replace with `crate::build_config::FLATPAK` once
-// build_config is ported. The default Ghostty build is not a flatpak build.
-const BUILD_FLATPAK: bool = false;
+use crate::build_config::FLATPAK as BUILD_FLATPAK;
 
 /// Entry that is retrieved from the passwd API. This only contains the
 /// fields we care about.
@@ -105,37 +103,28 @@ pub fn get() -> Result<Entry, Error> {
 fn flatpak_entry(name: &str) -> Result<Entry, Error> {
     use super::flatpak::FlatpakHostCommand;
 
-    // TODO(port-dedupe): replace with `crate::pty::Pty` once ported.
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    // SAFETY: valid out pointers; other arguments may be null.
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+    // A guard so the pty is deinitialized (master closed) on every path,
+    // like Zig's `defer pty.deinit()`. The slave side is closed explicitly
+    // below (or here, if we exit early).
+    struct PtyGuard {
+        pty: crate::pty::Pty,
+        slave_open: bool,
     }
-    struct Fds(libc::c_int, libc::c_int);
-    impl Drop for Fds {
+    impl Drop for PtyGuard {
         fn drop(&mut self) {
-            // SAFETY: closing our fds (-1 is ignored).
-            unsafe {
-                if self.0 >= 0 {
-                    libc::close(self.0);
-                }
-                if self.1 >= 0 {
-                    libc::close(self.1);
-                }
+            if self.slave_open {
+                crate::lib::compat::fd::close(self.pty.slave);
             }
+            self.pty.deinit();
         }
     }
-    let mut fds = Fds(master, slave);
+    let mut guard = PtyGuard {
+        pty: crate::pty::Pty::open(crate::pty::Winsize::default())
+            .map_err(|e| Error::Flatpak(e.to_string()))?,
+        slave_open: true,
+    };
+    let master = guard.pty.master;
+    let slave = guard.pty.slave;
 
     // Note: we wrap our getent call in a /bin/sh login shell because
     // some operating systems (NixOS tested) don't set the PATH for various
@@ -158,7 +147,7 @@ fn flatpak_entry(name: &str) -> Result<Entry, Error> {
     // wait right now but that is fine too. This lets us read the
     // parent and detect EOF.
     crate::lib::compat::fd::close(slave);
-    fds.1 = -1;
+    guard.slave_open = false;
 
     // Read all of our output
     let mut buf = [0u8; 1024];

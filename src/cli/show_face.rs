@@ -1,63 +1,14 @@
 //! Port of `src/cli/show_face.zig`.
 //!
-//! STATUS: partial — the font grid (`font.SharedGridSet`, `SharedGrid`,
-//! `CodepointResolver`, `Collection`) is not ported yet; [`grid`] is a
-//! stand-in resolver (TODO(port-dedupe)) built on the ported font discovery
-//! that checks Ghostty's sprites, then the configured `font-family*` faces,
-//! then fallback discovery. It does not know the embedded default fonts
-//! (JetBrains Mono, Symbols Nerd Font, emoji) or codepoint-map overrides, so
-//! codepoints Ghostty would render from them are reported from the system
-//! font that provides them instead.
+//! STATUS: ported
 
 use std::io::{self, BufWriter, Write};
 
-use super::args::{self, cli_enum, cli_struct, ArgIterator, Error, Fields, ParseHooks};
+use super::args::{self, cli_struct, ArgIterator, Error, Fields, ParseHooks};
 use super::diagnostics::{DiagnosticList, LocationKey};
 use super::ghostty::{global_args, Action, RunResult};
 use crate::config::Config;
 use crate::font;
-
-cli_enum! {
-    /// The font style to search for (Zig `font.Style`).
-    // TODO(port-dedupe): use crate::font::Style directly once it implements
-    // CliEnum.
-    pub enum StyleArg {
-        Regular => "regular",
-        Bold => "bold",
-        Italic => "italic",
-        BoldItalic => "bold_italic",
-    }
-}
-
-impl From<StyleArg> for font::Style {
-    fn from(s: StyleArg) -> font::Style {
-        match s {
-            StyleArg::Regular => font::Style::Regular,
-            StyleArg::Bold => font::Style::Bold,
-            StyleArg::Italic => font::Style::Italic,
-            StyleArg::BoldItalic => font::Style::BoldItalic,
-        }
-    }
-}
-
-cli_enum! {
-    /// The presentation to force (Zig `font.Presentation`).
-    // TODO(port-dedupe): use crate::font::Presentation directly once it
-    // implements CliEnum.
-    pub enum PresentationArg {
-        Text => "text",
-        Emoji => "emoji",
-    }
-}
-
-impl From<PresentationArg> for font::Presentation {
-    fn from(p: PresentationArg) -> font::Presentation {
-        match p {
-            PresentationArg::Text => font::Presentation::Text,
-            PresentationArg::Emoji => font::Presentation::Emoji,
-        }
-    }
-}
 
 cli_struct! {
     #[derive(Debug, Clone)]
@@ -69,10 +20,10 @@ cli_struct! {
         pub string: Option<String> = None,
 
         /// Font style to search for.
-        pub style: StyleArg = StyleArg::Regular,
+        pub style: font::Style = font::Style::Regular,
 
         /// If specified, force text or emoji presentation.
-        pub presentation: Option<PresentationArg> = None,
+        pub presentation: Option<font::Presentation> = None,
     }
     private {
         // Enable arg parsing diagnostics so that we don't get an error if
@@ -188,31 +139,52 @@ maintainer to enable a font discovery mechanism, and try again."
         }
     }
 
-    let font_grid = match grid::SharedGrid::init(&config) {
-        Ok(grid) => grid,
+    let mut font_grid_set = match font::SharedGridSet::init() {
+        Ok(v) => v,
         Err(err) => {
             write!(stderr, "Unable to initialize font grid set: {}", err)?;
             return Ok(1);
         }
     };
 
-    let style: font::Style = opts.style.into();
-    let presentation: Option<font::Presentation> = opts.presentation.map(Into::into);
+    let font_size = font::face::DesiredSize {
+        points: config.font_size,
+        xdpi: 96,
+        ydpi: 96,
+    };
 
-    if let Some(cp) = opts.cp {
-        if let Some(rc) = lookup(stdout, stderr, &font_grid, style, presentation, cp)? {
-            return Ok(rc);
+    let font_config = font::shared_grid_set::DerivedConfig::init(&config);
+
+    let (font_grid_key, font_grid) = match font_grid_set.r#ref(&font_config, font_size) {
+        Ok(v) => v,
+        Err(err) => {
+            write!(stderr, "Unable to get font grid: {}", err)?;
+            return Ok(1);
         }
-    }
-    if let Some(string) = &opts.string {
-        for c in string.chars() {
-            if let Some(rc) = lookup(stdout, stderr, &font_grid, style, presentation, c as u32)? {
+    };
+
+    // Zig: `defer font_grid_set.deref(font_grid_key)`.
+    let result = (|| -> RunResult {
+        if let Some(cp) = opts.cp {
+            if let Some(rc) = lookup(stdout, stderr, &font_grid, opts.style, opts.presentation, cp)? {
                 return Ok(rc);
             }
         }
-    }
+        if let Some(string) = &opts.string {
+            for c in string.chars() {
+                if let Some(rc) =
+                    lookup(stdout, stderr, &font_grid, opts.style, opts.presentation, c as u32)?
+                {
+                    return Ok(rc);
+                }
+            }
+        }
 
-    Ok(0)
+        Ok(0)
+    })();
+    drop(font_grid);
+    font_grid_set.deref(&font_grid_key);
+    result
 }
 
 /// Zig `{X:0>2}` and `{u}` of a codepoint.
@@ -226,24 +198,34 @@ fn cp_strings(cp: u32) -> (String, String) {
 fn lookup<O: Write + ?Sized, E: Write + ?Sized>(
     stdout: &mut O,
     stderr: &mut E,
-    font_grid: &grid::SharedGrid,
+    font_grid: &font::SharedGrid,
     style: font::Style,
     presentation: Option<font::Presentation>,
     cp: u32,
 ) -> io::Result<Option<u8>> {
     let (hex, ch) = cp_strings(cp);
-    let Some(idx) = font_grid.get_index(cp, style, presentation) else {
+    let mut state = font_grid.lock.write().unwrap_or_else(|e| e.into_inner());
+    let Some(idx) = state.resolver.get_index(cp, style, presentation) else {
         writeln!(stdout, "U+{} « {} » not found.", hex, ch)?;
         return Ok(None);
     };
 
-    let name = match idx {
-        grid::Index::Sprite => {
+    let face = match state.resolver.collection.get_face(idx) {
+        Ok(face) => face,
+        Err(font::collection::GetFaceError::SpecialHasNoFace) => {
             writeln!(stdout, "U+{} « {} » is handled by Ghostty's internal sprites.", hex, ch)?;
             return Ok(None);
         }
-        grid::Index::Face(name) => name,
-        grid::Index::Error(err) => {
+        Err(err) => {
+            write!(stderr, "Unable to get face: {}", err)?;
+            return Ok(Some(1));
+        }
+    };
+
+    let mut buf = [0u8; 1024];
+    let name = match face.name(&mut buf) {
+        Ok(name) => String::from_utf8_lossy(name).into_owned(),
+        Err(err) => {
             write!(stderr, "Unable to get name of face: {}", err)?;
             return Ok(Some(1));
         }
@@ -252,151 +234,6 @@ fn lookup<O: Write + ?Sized, E: Write + ?Sized>(
     writeln!(stdout, "U+{} « {} » found in face “{}”.", hex, ch, name)?;
 
     Ok(None)
-}
-
-/// Stand-in for the font grid used by `show-face`.
-///
-/// TODO(port-dedupe): replace with `crate::font::SharedGridSet` /
-/// `SharedGrid.resolver.getIndex` / `collection.getFace` once ported.
-mod grid {
-    use crate::config::Config;
-    use crate::font::{self, DeferredFace, Descriptor, Discover, Presentation, Style};
-
-    /// The result of a lookup (Zig `Collection.Index` resolved to a face
-    /// name, or `error.SpecialHasNoFace` for sprites).
-    pub enum Index {
-        Sprite,
-        Face(String),
-        Error(String),
-    }
-
-    pub struct SharedGrid {
-        lib: font::Library,
-        /// The configured families per style (Zig: the families loaded
-        /// into the collection by `SharedGridSet.DerivedConfig`).
-        families: [Vec<String>; 4],
-        sprite: font::SpriteFace,
-    }
-
-    impl Drop for SharedGrid {
-        fn drop(&mut self) {
-            self.lib.deinit();
-        }
-    }
-
-    fn face_index(face: &DeferredFace) -> Index {
-        let mut buf = [0u8; 1024];
-        match face.name(&mut buf) {
-            Ok(name) => Index::Face(String::from_utf8_lossy(name).into_owned()),
-            Err(err) => Index::Error(err.to_string()),
-        }
-    }
-
-    impl SharedGrid {
-        pub fn init(config: &Config) -> Result<SharedGrid, String> {
-            let list = |v: &crate::config::RepeatableString| -> Vec<String> {
-                v.list.iter().map(|s| s.as_str().to_owned()).collect()
-            };
-            Ok(SharedGrid {
-                lib: font::Library::init().map_err(|e| format!("{:?}", e))?,
-                families: [
-                    list(&config.font_family),
-                    list(&config.font_family_bold),
-                    list(&config.font_family_italic),
-                    list(&config.font_family_bold_italic),
-                ],
-                // Only `has_codepoint` is used, which doesn't depend on the
-                // metrics.
-                sprite: font::SpriteFace {
-                    metrics: font::metrics::Metrics::calc(font::metrics::FaceMetrics {
-                        px_per_em: 16.0,
-                        cell_width: 8.0,
-                        ascent: 12.0,
-                        descent: -4.0,
-                        line_gap: 0.0,
-                        ..Default::default()
-                    }),
-                },
-            })
-        }
-
-        fn style_index(style: Style) -> usize {
-            match style {
-                Style::Regular => 0,
-                Style::Bold => 1,
-                Style::Italic => 2,
-                Style::BoldItalic => 3,
-            }
-        }
-
-        /// Search the configured families of a style.
-        fn collection_get(&self, cp: u32, style: Style, p: Option<Presentation>) -> Option<Index> {
-            let disco = Discover::init(&self.lib);
-            let families = &self.families[Self::style_index(style)];
-            for family in families {
-                let Ok(mut it) = disco.discover(&Descriptor {
-                    family: Some(family.clone()),
-                    bold: matches!(style, Style::Bold | Style::BoldItalic),
-                    italic: matches!(style, Style::Italic | Style::BoldItalic),
-                    ..Default::default()
-                }) else {
-                    continue;
-                };
-                // The collection holds the best match of each family.
-                if let Ok(Some(face)) = it.next() {
-                    if face.has_codepoint(cp, p) {
-                        return Some(face_index(&face));
-                    }
-                }
-            }
-            None
-        }
-
-        /// `CodepointResolver.getIndex`.
-        pub fn get_index(&self, cp: u32, style: Style, p: Option<Presentation>) -> Option<Index> {
-            // If the style is not regular and has no configured faces, use
-            // regular.
-            if style != Style::Regular && self.families[Self::style_index(style)].is_empty() {
-                return self.get_index(cp, Style::Regular, p);
-            }
-
-            // If we have sprite drawing enabled, check if our sprite face can
-            // handle this.
-            if self.sprite.has_codepoint(cp, p) {
-                return Some(Index::Sprite);
-            }
-
-            if let Some(idx) = self.collection_get(cp, style, p) {
-                return Some(idx);
-            }
-
-            // If we're not a regular font style, try looking for a regular
-            // font that will satisfy this request.
-            if style != Style::Regular {
-                if let Some(idx) = self.get_index(cp, Style::Regular, p) {
-                    return Some(idx);
-                }
-            }
-
-            // If we are regular, try looking for a fallback using discovery.
-            if style == Style::Regular {
-                let disco = Discover::init(&self.lib);
-                if let Ok(mut it) = disco.discover(&Descriptor {
-                    codepoint: cp,
-                    ..Default::default()
-                }) {
-                    while let Ok(Some(face)) = it.next() {
-                        if !face.has_codepoint(cp, p) {
-                            continue;
-                        }
-                        return Some(face_index(&face));
-                    }
-                }
-            }
-
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -410,8 +247,8 @@ mod tests {
         let mut iter = ArgIteratorGeneral::init("--cp=0x41 --style=bold_italic --presentation=emoji --font-size=12");
         args::parse(&mut opts, &mut iter).unwrap();
         assert_eq!(Some(0x41), opts.cp);
-        assert_eq!(StyleArg::BoldItalic, opts.style);
-        assert_eq!(Some(PresentationArg::Emoji), opts.presentation);
+        assert_eq!(font::Style::BoldItalic, opts.style);
+        assert_eq!(Some(font::Presentation::Emoji), opts.presentation);
         // The unknown (config) field becomes a diagnostic, not an error.
         assert_eq!(1, opts._diagnostics.items().len());
     }
@@ -427,11 +264,18 @@ mod tests {
 
     #[test]
     fn sprite_codepoints() {
-        let grid = grid::SharedGrid::init(&Config::default()).unwrap();
+        let mut set = font::SharedGridSet::init().unwrap();
+        let config = font::shared_grid_set::DerivedConfig::init(&Config::default());
+        let (key, grid) = set.r#ref(&config, font::face::DesiredSize::new(12.0)).unwrap();
+
         // Box drawing is handled by the sprite face.
-        assert!(matches!(
-            grid.get_index(0x2500, font::Style::Regular, None),
-            Some(grid::Index::Sprite)
-        ));
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let rc = lookup(&mut out, &mut err, &grid, font::Style::Regular, None, 0x2500).unwrap();
+        assert_eq!(None, rc);
+        assert!(String::from_utf8_lossy(&out).contains("internal sprites"));
+
+        drop(grid);
+        set.deref(&key);
     }
 }

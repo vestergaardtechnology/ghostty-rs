@@ -4,10 +4,11 @@
 
 use super::EnvironMap;
 
-// TODO(port-dedupe): replace with `crate::build_config::ARTIFACT == Artifact::Lib`
-// once build_config is ported. The Ghostty application build is an exe.
 #[cfg(target_os = "macos")]
-const ARTIFACT_IS_LIB: bool = false;
+const ARTIFACT_IS_LIB: bool = matches!(
+    crate::build_config::ARTIFACT,
+    crate::build_config::Artifact::Lib
+);
 
 /// Returns true if the program was launched from a desktop environment.
 ///

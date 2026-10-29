@@ -34,7 +34,8 @@ use crate::terminal::osc::{ProgressReport, ProgressReportC};
 use crate::config::config::Duration as ConfigDuration;
 use crate::config::Config;
 
-use self::standin::{CoreSurface, Scrollbar, ScrollbarC};
+use self::standin::CoreSurface;
+use crate::terminal::page_list::{Scrollbar, ScrollbarC};
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
@@ -53,52 +54,6 @@ pub mod standin {
         /// `Surface.pwd(alloc)`.
         pub fn pwd(&self) -> Option<String> {
             self.pwd.clone()
-        }
-    }
-
-    /// TODO(port-dedupe): replace with `crate::terminal::page_list::Scrollbar`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct Scrollbar {
-        /// Total size of the scrollable area.
-        pub total: usize,
-
-        /// The offset into the total area that the viewport is at. This is
-        /// guaranteed to be less than or equal to total. This includes the
-        /// visible row.
-        pub offset: usize,
-
-        /// The length of the visible area. This is including the offset row.
-        pub len: usize,
-    }
-
-    // Sync with: ghostty_action_scrollbar_s
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ScrollbarC {
-        pub total: u64,
-        pub offset: u64,
-        pub len: u64,
-    }
-
-    impl Scrollbar {
-        /// A zero-sized scrollable region.
-        pub const ZERO: Scrollbar = Scrollbar {
-            total: 0,
-            offset: 0,
-            len: 0,
-        };
-
-        pub fn cval(&self) -> ScrollbarC {
-            ScrollbarC {
-                total: self.total as u64,
-                offset: self.offset as u64,
-                len: self.len as u64,
-            }
-        }
-
-        /// Comparison for scrollbars.
-        pub fn eql(&self, other: Scrollbar) -> bool {
-            self.total == other.total && self.offset == other.offset && self.len == other.len
         }
     }
 }
@@ -623,8 +578,14 @@ cval_identity!(
     ResizeWindow,
 );
 
+impl CVal for Scrollbar {
+    type C = ScrollbarC;
+    fn cval(&self) -> ScrollbarC {
+        Scrollbar::cval(*self)
+    }
+}
+
 cval_forward!(
-    Scrollbar => ScrollbarC,
     ExportTerminalIo<'_> => ExportTerminalIoC,
     DesktopNotification<'_> => DesktopNotificationC,
     SetTitle<'_> => SetTitleC,

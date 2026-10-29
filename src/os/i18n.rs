@@ -12,11 +12,23 @@ use std::sync::LazyLock;
 
 use super::i18n_locales::LOCALES;
 
-// TODO(port-dedupe): replace with `crate::build_config::{I18N, BUNDLE_ID}`
-// once build_config is ported. i18n is enabled for the Ghostty app build
-// on Linux and macOS.
-const BUILD_I18N: bool = cfg!(not(windows));
-const BUNDLE_ID: &CStr = c"com.mitchellh.ghostty";
+const BUILD_I18N: bool = crate::build_config::I18N;
+
+/// `build_config.bundle_id`, NUL-terminated for gettext.
+const BUNDLE_ID_Z: [u8; crate::build_config::BUNDLE_ID.len() + 1] = {
+    let src = crate::build_config::BUNDLE_ID.as_bytes();
+    let mut out = [0u8; crate::build_config::BUNDLE_ID.len() + 1];
+    let mut i = 0;
+    while i < src.len() {
+        out[i] = src[i];
+        i += 1;
+    }
+    out
+};
+const BUNDLE_ID: &CStr = match CStr::from_bytes_with_nul(&BUNDLE_ID_Z) {
+    Ok(v) => v,
+    Err(_) => panic!("bundle id must not contain NUL"),
+};
 
 /// Set for faster membership lookup of locales.
 pub static LOCALES_MAP: LazyLock<HashSet<&'static str>> =
@@ -97,8 +109,8 @@ pub fn init_global_domain() -> Result<(), InitError> {
 /// Translate a message for the Ghostty domain (Zig: `_`).
 ///
 /// The returned string is either `msgid` itself or a translation owned by
-/// gettext, which lives for the rest of the program.
-pub fn gettext(msgid: &'static CStr) -> &'static CStr {
+/// gettext, which lives for the rest of the program (so it outlives `'a`).
+pub fn gettext<'a>(msgid: &'a CStr) -> &'a CStr {
     if !BUILD_I18N {
         return msgid;
     }

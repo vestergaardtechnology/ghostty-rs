@@ -344,32 +344,12 @@ fn resolve(base: &str, path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
-/// Error from [`expand_home`] (Zig `homedir.ExpandError`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExpandHomeError {
-    HomeDetectionFailed,
-}
-
-impl std::fmt::Display for ExpandHomeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("error.HomeDetectionFailed")
-    }
-}
-
-/// Expands a `~/`-prefixed path to the user's home directory.
-// TODO(port-dedupe): replace with crate::os::homedir::expand_home (which
-// also falls back to the passwd database when $HOME is unset).
-pub(crate) fn expand_home(path: &str) -> Result<String, ExpandHomeError> {
-    let Some(rest) = path.strip_prefix('~') else {
-        return Ok(path.to_owned());
-    };
-    if !rest.starts_with('/') {
-        return Ok(path.to_owned());
-    }
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => Ok(format!("{}{}", home, rest)),
-        _ => Err(ExpandHomeError::HomeDetectionFailed),
-    }
+/// Expands a `~/`-prefixed path to the user's home directory
+/// (`internal_os.expandHome` with the global environment).
+fn expand_home(path: &str) -> Result<String, crate::os::homedir::Error> {
+    let environ_map = crate::global::environ_map();
+    let mut buf = [0u8; MAX_PATH_BYTES];
+    crate::os::expand_home(&environ_map, path, &mut buf).map(str::to_owned)
 }
 
 #[cfg(test)]

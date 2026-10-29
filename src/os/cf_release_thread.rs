@@ -14,11 +14,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::datastruct::BlockingQueue;
 
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    // TODO(port-dedupe): replace with `pkg/macos` foundation bindings.
-    fn CFRelease(cf: *const c_void);
-}
+use crate::pkg::macos::foundation;
 
 /// A CFTypeRef that may be sent to the release thread.
 #[derive(Debug, Clone, Copy)]
@@ -175,7 +171,7 @@ impl Thread {
                     for r in refs {
                         // SAFETY: the sender transferred ownership of one
                         // reference.
-                        unsafe { CFRelease(r.0) };
+                        unsafe { foundation::cf_release(r.0 as *mut c_void) };
                     }
                 }
             }

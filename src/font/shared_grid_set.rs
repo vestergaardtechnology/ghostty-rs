@@ -704,12 +704,10 @@ impl Key {
         // Setup the codepoint map
         let codepoint_map: CodepointMap = {
             let map = &config.font_codepoint_map;
-            if map.map.list.is_empty() {
+            if map.map.is_empty() {
                 CodepointMap::default()
             } else {
-                // TODO(port-dedupe): the config's map is a stand-in for
-                // `font::CodepointMap`; convert it.
-                map.map.to_font_map()
+                map.map.clone_map()
             }
         };
 

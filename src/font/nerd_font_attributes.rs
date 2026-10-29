@@ -10,31 +10,13 @@
 
 use super::glyph::{Constraint, ConstraintAlign, ConstraintHeight, ConstraintSize};
 use super::nerd_font_tables as generated;
-
-/// A 3-level lookup table (the shape of `lut.Tables(Elem)`).
-// TODO(port-dedupe): replace with crate::unicode::lut::Tables once
-// unicode/lut.zig is ported.
-pub struct Tables<Elem: 'static> {
-    pub stage1: &'static [u16],
-    pub stage2: &'static [u16],
-    pub stage3: &'static [Elem],
-}
-
-impl<Elem: Copy + 'static> Tables<Elem> {
-    /// Get the value for a given codepoint.
-    #[inline]
-    pub fn get(&self, cp: u32) -> Elem {
-        let high = (cp >> 8) as usize;
-        let low = (cp & 0xFF) as usize;
-        self.stage3[self.stage2[self.stage1[high] as usize + low] as usize]
-    }
-}
+use crate::unicode::lut::Tables;
 
 static STAGE3: [Option<Constraint>; generated::STAGE3_LEN] =
     generated::stage3!(Constraint, ConstraintSize, ConstraintAlign, ConstraintHeight);
 
 /// 3-level codepoint lookup. Same shape as `unicode/symbols_table.zig`.
-pub static TABLE: Tables<Option<Constraint>> = Tables {
+pub static TABLE: Tables<'static, Option<Constraint>> = Tables {
     stage1: &generated::STAGE1,
     stage2: &generated::STAGE2,
     stage3: &STAGE3,
