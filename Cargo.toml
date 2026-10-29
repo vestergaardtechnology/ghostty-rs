@@ -36,8 +36,10 @@ log = "0.4"
 memchr = "2"
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]
+png = "0.18"
 
 [build-dependencies]
 cc = "1"
