@@ -91,7 +91,7 @@ pub mod standin {
     use std::fmt;
 
     use super::Message;
-    use crate::apprt::action::standin::Config;
+    use crate::config::Config;
     use crate::datastruct::BlockingQueue;
 
     /// Error from initializing a derived config.
@@ -146,8 +146,10 @@ pub mod standin {
     }
 
     impl ThreadDerivedConfig {
-        pub fn init(_config: &Config) -> ThreadDerivedConfig {
-            ThreadDerivedConfig::default()
+        pub fn init(config: &Config) -> ThreadDerivedConfig {
+            ThreadDerivedConfig {
+                scrollback_compression: config.scrollback_compression,
+            }
         }
     }
 

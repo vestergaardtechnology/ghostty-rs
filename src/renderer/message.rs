@@ -10,7 +10,7 @@
 //! Stand-in for `terminal.highlight.Flattened` lives in [`standin`]
 //! (TODO(port-dedupe)).
 
-use crate::apprt::action::standin::Config;
+use crate::config::Config;
 use crate::renderer::standin::{
     InitError, RendererDerivedConfig, SharedGrid, SharedGridSet, SharedGridSetKey,
     ThreadDerivedConfig,

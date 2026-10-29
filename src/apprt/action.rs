@@ -31,7 +31,10 @@ use crate::renderer::Health;
 use crate::terminal::mouse::Shape as MouseShape;
 use crate::terminal::osc::{ProgressReport, ProgressReportC};
 
-use self::standin::{Config, ConfigDuration, CoreSurface, Scrollbar, ScrollbarC};
+use crate::config::config::Duration as ConfigDuration;
+use crate::config::Config;
+
+use self::standin::{CoreSurface, Scrollbar, ScrollbarC};
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
@@ -42,50 +45,15 @@ pub mod standin {
         pub rt_surface: *mut crate::apprt::Surface,
 
         /// The current working directory (stand-in state for `pwd`).
-        pub pwd: Option<Vec<u8>>,
+        pub pwd: Option<String>,
     }
 
     impl CoreSurface {
         /// Returns the current working directory, if known. Zig:
         /// `Surface.pwd(alloc)`.
-        pub fn pwd(&self) -> Option<Vec<u8>> {
+        pub fn pwd(&self) -> Option<String> {
             self.pwd.clone()
         }
-    }
-
-    /// TODO(port-dedupe): replace with `crate::config::Config` (config/Config.zig).
-    /// Only the fields used by the apprt/termio/renderer interface files.
-    #[derive(Debug, Clone, Default)]
-    pub struct Config {
-        pub window_inherit_working_directory: bool,
-        pub tab_inherit_working_directory: bool,
-        pub split_inherit_working_directory: bool,
-        pub working_directory: Option<WorkingDirectory>,
-    }
-
-    impl Config {
-        /// Zig: `Config.shallowClone`.
-        pub fn shallow_clone(&self) -> Config {
-            self.clone()
-        }
-    }
-
-    /// TODO(port-dedupe): replace with `crate::config::config::WorkingDirectory`.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum WorkingDirectory {
-        /// Resolve to the current user's home directory during config finalize.
-        Home,
-        /// Inherit the working directory from the launching process.
-        Inherit,
-        /// Use an explicit working directory path.
-        Path(Vec<u8>),
-    }
-
-    /// TODO(port-dedupe): replace with `crate::config::config::Duration`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct ConfigDuration {
-        /// Duration in nanoseconds
-        pub duration: u64,
     }
 
     /// TODO(port-dedupe): replace with `crate::terminal::page_list::Scrollbar`.

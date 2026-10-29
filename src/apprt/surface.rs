@@ -10,10 +10,12 @@
 //!   `Box`es (the receiver takes ownership, as documented in Zig).
 //! * `newConfig` drops the allocator and cannot fail.
 //!
-//! Stand-ins for the core `App` (App.zig) and the terminal stream's
-//! `ResizeWindow` live in [`standin`] (TODO(port-dedupe)).
+//! Stand-ins for the core `App` (App.zig) live in [`standin`]
+//! (TODO(port-dedupe)).
 
-use crate::apprt::action::standin::{Config, CoreSurface, Scrollbar, WorkingDirectory};
+use crate::apprt::action::standin::{CoreSurface, Scrollbar};
+use crate::config::config::WorkingDirectory;
+use crate::config::Config;
 use crate::apprt::structs::{Clipboard, KittyRead, KittyWrite};
 use crate::datastruct::blocking_queue::{Size as QueueSize, Timeout as QueueTimeout};
 use crate::datastruct::MessageData;
@@ -22,7 +24,9 @@ use crate::terminal::mouse::Shape as MouseShape;
 use crate::terminal::osc::color::ColoredTarget;
 use crate::terminal::osc::ProgressReport;
 
-use self::standin::{App, AppMailbox, AppMessage, ResizeWindow};
+use crate::terminal::stream::ResizeWindow;
+
+use self::standin::{App, AppMailbox, AppMessage};
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
@@ -30,15 +34,6 @@ pub mod standin {
     use crate::apprt;
     use crate::apprt::action::standin::CoreSurface;
     use crate::datastruct::BlockingQueue;
-
-    /// TODO(port-dedupe): replace with `crate::terminal::stream::ResizeWindow`
-    /// (`terminal.StreamAction.ResizeWindow`).
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub struct ResizeWindow {
-        pub width: u16,
-        pub height: u16,
-    }
 
     /// TODO(port-dedupe): replace with `crate::app::App` (App.zig).
     #[derive(Debug, Default)]
@@ -449,18 +444,16 @@ mod tests {
     fn new_config_inherits_working_directory() {
         let mut core = CoreSurface {
             rt_surface: std::ptr::null_mut(),
-            pwd: Some(b"/tmp".to_vec()),
+            pwd: Some("/tmp".to_string()),
         };
         let app = App {
             focused_surface: Some(&mut core),
         };
-        let config = Config {
-            window_inherit_working_directory: true,
-            tab_inherit_working_directory: false,
-            ..Default::default()
-        };
+        let mut config = Config::default();
+        config.window_inherit_working_directory = true;
+        config.tab_inherit_working_directory = false;
         let c = new_config(&app, &config, NewSurfaceContext::Window);
-        assert_eq!(Some(WorkingDirectory::Path(b"/tmp".to_vec())), c.working_directory);
+        assert_eq!(Some(WorkingDirectory::Path("/tmp".to_string())), c.working_directory);
         let c = new_config(&app, &config, NewSurfaceContext::Tab);
         assert_eq!(None, c.working_directory);
     }
