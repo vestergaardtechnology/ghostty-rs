@@ -17546,4 +17546,625 @@ mod tests {
             check_cell(page, 1, 1, 0, Wide::SpacerTail);
         }
     }
+
+    /// Write unicode placeholders in cols `xs` of row 0.
+    fn placeholders(page: &Page, xs: core::ops::Range<usize>) {
+        for x in xs {
+            let (row, cell) = rac(page, x, 0);
+            row.set_kitty_virtual_placeholder(true);
+            *cell = cpu(graphics_unicode::PLACEHOLDER);
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_less_cols_copy_kitty_placeholder() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            // Write unicode placeholders
+            placeholders(pg(first(&s)), 0..s.cols as usize - 1);
+        }
+
+        // Resize
+        s.resize(reflow_cols(2)).unwrap();
+        assert_eq!(2, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+        while let Some(offset) = it.next() {
+            for x in 0..s.cols as usize - 1 {
+                let mut offset_copy = offset;
+                offset_copy.x = x as CellCountInt;
+                let (row, _) = pin_rac(offset_copy);
+                assert!(row.kitty_virtual_placeholder());
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_resize_reflow_more_cols_clears_kitty_placeholder() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            // Write unicode placeholders
+            placeholders(pg(first(&s)), 0..s.cols as usize - 1);
+        }
+
+        // Resize smaller then larger
+        s.resize(reflow_cols(2)).unwrap();
+        s.resize(reflow_cols(4)).unwrap();
+        assert_eq!(4, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+        assert!(pin_rac(it.next().unwrap()).0.kitty_virtual_placeholder());
+        assert!(!pin_rac(it.next().unwrap()).0.kitty_virtual_placeholder());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_resize_reflow_wrap_moves_kitty_placeholder() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 2,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        {
+            assert!(s.pages.first == s.pages.last);
+            // Write unicode placeholders
+            placeholders(pg(first(&s)), 2..s.cols as usize - 1);
+        }
+
+        s.resize(reflow_cols(2)).unwrap();
+        assert_eq!(2, s.cols);
+        assert_eq!(2, s.total_rows());
+
+        let mut it = s.row_iterator(Direction::RightDown, pt_active(0, 0), None);
+        assert!(!pin_rac(it.next().unwrap()).0.kitty_virtual_placeholder());
+        assert!(pin_rac(it.next().unwrap()).0.kitty_virtual_placeholder());
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn page_list_reset() {
+        let mut s = init(80, 24);
+        s.reset();
+        assert!(s.viewport == Viewport::Active);
+        assert!(s.pages.first.is_some());
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Active area should be the top
+        assert_eq!(pin_at(first(&s), 0, 0), s.get_top_left(Tag::Active));
+    }
+
+    #[test]
+    fn page_list_reset_invalidates_stale_untracked_refs_even_if_node_memory_is_reused() {
+        let mut s = init(80, 24);
+
+        let mut stale: Vec<(NodePtr, u64)> = Vec::new();
+        let mut reused: Option<(NodePtr, u64)> = None;
+
+        while stale.len() < PAGE_PREHEAT * 4 && reused.is_none() {
+            let old_node = first(&s);
+            let old_serial = n(old_node).serial;
+            assert!(old_serial >= s.page_serial_epoch);
+            assert!(old_serial < s.page_serial);
+            stale.push((old_node, old_serial));
+
+            s.reset();
+
+            let new_node = first(&s);
+            for &(node, serial) in &stale {
+                if node == new_node {
+                    reused = Some((node, serial));
+                    break;
+                }
+            }
+        }
+
+        assert!(reused.is_some());
+        let (old_node, old_serial) = reused.unwrap();
+        let new_node = first(&s);
+        let new_serial = n(new_node).serial;
+
+        // Reset advances the epoch before rebuilding from the node pool. Reject
+        // the stale generation before inspecting its pointer, even when that exact
+        // address now belongs to a new live generation.
+        assert_eq!(old_node, new_node);
+        assert!(old_serial < s.page_serial_epoch);
+        assert!(!s.node_is_valid(old_node, old_serial));
+        assert!(s.node_is_valid(new_node, new_serial));
+        assert!(new_serial >= s.page_serial_epoch);
+        assert!(new_serial < s.page_serial);
+    }
+
+    #[test]
+    fn page_list_reset_across_two_pages() {
+        // Find a cap that makes it so that rows don't fit on one page.
+        let rows = 100;
+        let cap = {
+            let mut cap = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(50) }).unwrap();
+            while cap.rows >= rows {
+                cap = STD_CAPACITY
+                    .adjust(pagepkg::Adjustment {
+                        cols: Some(cap.cols + 50),
+                    })
+                    .unwrap();
+            }
+            cap
+        };
+
+        // Init
+        let mut s = init(cap.cols, rows);
+        s.reset();
+        assert!(s.viewport == Viewport::Active);
+        assert!(s.pages.first.is_some());
+        assert_eq!(s.rows as usize, s.total_rows());
+    }
+
+    #[test]
+    fn page_list_reset_moves_tracked_pins_and_marks_them_as_garbage() {
+        let mut s = init(80, 24);
+
+        // Create a tracked pin into the active area
+        let p = s.track_pin(s.pin(pt_active(42, 12)).unwrap()).unwrap();
+
+        s.reset();
+
+        // Our added pin should now be garbage
+        assert!(tp(p).garbage);
+
+        // Viewport pin should not be garbage because it makes sense.
+        assert!(!vp(&s).garbage);
+
+        s.untrack_pin(p);
+    }
+
+    #[test]
+    fn page_list_clears_history() {
+        let mut s = init(80, 24);
+        s.grow_rows(30).unwrap();
+        s.reset();
+        assert!(s.viewport == Viewport::Active);
+        assert!(s.pages.first.is_some());
+        assert_eq!(s.rows as usize, s.total_rows());
+
+        // Active area should be the top
+        assert_eq!(pin_at(first(&s), 0, 0), s.get_top_left(Tag::Active));
+    }
+
+    #[test]
+    fn page_list_resize_reflow_grapheme_map_capacity_exceeded() {
+        // This test verifies that when reflowing content with many graphemes,
+        // the grapheme map capacity is correctly increased when needed.
+        let mut s = init_opts(Options {
+            cols: 4,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(1, s.total_pages());
+
+        // Get the grapheme capacity from the page. We need more than this many
+        // graphemes in a single destination page to trigger capacity increase
+        // during reflow. Since each source page can only hold this many graphemes,
+        // we create two source pages with graphemes that will merge into one
+        // destination page.
+        let grapheme_capacity = pg(first(&s)).grapheme_capacity();
+        // Use slightly more than half the capacity per page, so combined they
+        // exceed the capacity of a single destination page.
+        let graphemes_per_page = grapheme_capacity / 2 + grapheme_capacity / 4;
+
+        // Grow to the capacity of the first page and add more rows
+        // so that we have two pages total.
+        grow_first_page_full(&mut s, graphemes_per_page);
+        // We now have two pages.
+        assert!(first(&s) != last(&s));
+        assert_eq!(s.pages.last, n(first(&s)).next);
+
+        // Add graphemes to both pages. We add graphemes to rows at the END of the
+        // first page, and graphemes to rows at the START of the second page.
+        // When reflowing to 2 columns, these rows will wrap and stay together
+        // on the same destination page, requiring capacity increase.
+
+        // Add graphemes to the end of the first page (last rows)
+        {
+            let page = pg(first(&s));
+            let start_row = page.size.rows as usize - graphemes_per_page;
+            for i in 0..graphemes_per_page {
+                let y = start_row + i;
+                let (row, cell) = rac(page, 0, y);
+                *cell = cp('A');
+                page.append_grapheme(row, cell, 0x0301).unwrap();
+            }
+        }
+
+        // Add graphemes to the beginning of the second page
+        {
+            let page = pg(last(&s));
+            let count = graphemes_per_page.min(page.size.rows as usize);
+            for y in 0..count {
+                let (row, cell) = rac(page, 0, y);
+                *cell = cp('B');
+                page.append_grapheme(row, cell, 0x0302).unwrap();
+            }
+        }
+
+        // Resize to fewer columns to trigger reflow.
+        // The graphemes from both pages will be copied to destination pages.
+        // They will all end up in a contiguous region of the destination.
+        // If the bug exists (hyperlink_bytes increased instead of grapheme_bytes),
+        // this will fail with GraphemeMapOutOfMemory when we exceed capacity.
+        s.resize(reflow_cols(2)).unwrap();
+
+        // Verify the resize succeeded
+        assert_eq!(2, s.cols);
+    }
+
+    #[test]
+    fn page_list_resize_grow_cols_with_unwrap_fixes_viewport_pin() {
+        // Regression test: after resize/reflow, the viewport pin can end up at a
+        // position where pin.y + rows > total_rows, causing getBottomRight to panic.
+
+        // The plan is to pin viewport in history, then grow columns to unwrap rows.
+        // The unwrap reduces total_rows, but the tracked pin moves to a position
+        // that no longer has enough rows below it for the viewport height.
+        let mut s = init(2, 10);
+
+        // Make sure we have some history, in this case we have 30 rows of history
+        s.grow_rows(30).unwrap();
+        assert_eq!(40, s.total_rows());
+
+        // Fill all rows with wrapped content (pairs that unwrap when cols increase)
+        let mut it = s.page_iterator(Direction::RightDown, pt_screen(0, 0), None);
+        while let Some(chunk) = it.next() {
+            let page = pg(chunk.node);
+            for y in chunk.start as usize..chunk.end as usize {
+                if y % 2 == 0 {
+                    set_wrap(page, y);
+                } else {
+                    set_wrap_cont(page, y);
+                }
+                fill_row(page, y, s.cols as usize, 'A');
+            }
+        }
+
+        // Pin viewport at row 28 (in history, 2 rows before active area at row 30).
+        // After unwrap: row 28 -> row 14, total_rows 40 -> 20, active starts at 10.
+        // Pin at 14 needs rows 14-23, but only 0-19 exist -> overflow.
+        s.scroll(Scroll::Pin(s.pin(pt_screen(0, 28)).unwrap()));
+        assert!(s.viewport == Viewport::Pin);
+        assert!(s.get_bottom_right(Tag::Viewport).is_some());
+
+        // Resize with reflow: unwraps rows, reducing total_rows
+        s.resize(reflow_cols(4)).unwrap();
+        assert_eq!(4, s.cols);
+        assert!(s.total_rows() < 40);
+
+        // Used to panic here, so test that we can get the bottom right.
+        let br_after = s.get_bottom_right(Tag::Viewport);
+        assert!(br_after.is_some());
+    }
+
+    #[test]
+    fn page_list_grow_reuses_non_standard_page_without_leak() {
+        // Create a PageList with 3 * std_size max so we can fit multiple pages
+        // but will still trigger reuse.
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(3 * std_size()),
+            ..Default::default()
+        });
+
+        // Increase the first page capacity to make it non-standard (larger than std_size).
+        while pg(first(&s)).memory.len() <= std_size() {
+            s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+                .unwrap();
+        }
+
+        // The first page should now have non-standard memory size.
+        assert!(pg(first(&s)).memory.len() > std_size());
+
+        // First, fill up the first page's capacity
+        let first_page = first(&s);
+        while n(first_page).rows() < n(first_page).capacity().rows {
+            s.grow().unwrap();
+        }
+
+        // Now grow to create a second page
+        s.grow().unwrap();
+        assert!(s.pages.first != s.pages.last);
+
+        // Continue growing until we exceed max_size AND the last page is full
+        while s.page_size + PagePool::item_size() <= s.limits.max(LimitKey::Bytes)
+            || n(last(&s)).rows() < n(last(&s)).capacity().rows
+        {
+            s.grow().unwrap();
+        }
+
+        // The first page should still be non-standard
+        assert!(pg(first(&s)).memory.len() > std_size());
+
+        // Verify we have enough rows for active area (so prune path isn't skipped)
+        assert!(s.total_rows() >= s.rows as usize);
+
+        // Verify last page is full (so grow will need to allocate/reuse)
+        assert!(pg(last(&s)).size.rows == pg(last(&s)).capacity.rows);
+
+        // Remember the first page memory pointer before the reuse attempt
+        let first_page_ptr = first(&s);
+        let first_page_mem_ptr = pg(first(&s)).memory.ptr();
+
+        // Create a tracked pin pointing to the non-standard first page
+        let tracked_pin = s.track_pin(pin_at(first_page_ptr, 0, 0)).unwrap();
+
+        // Now grow one more time to trigger the reuse path. Since the first page
+        // is non-standard, it should be destroyed (not reused).
+        s.grow().unwrap();
+
+        // After grow, check if the first page is a different one
+        // (meaning the non-standard page was pruned, not reused at the end)
+        // The original first page should no longer be the first page
+        assert!(first(&s) != first_page_ptr);
+
+        // If the non-standard page was properly destroyed and not reused,
+        // the last page should not have the same memory pointer
+        assert!(pg(last(&s)).memory.ptr() != first_page_mem_ptr);
+
+        // The tracked pin should have been moved to the new first page and marked as garbage
+        assert_eq!(first(&s), tp(tracked_pin).node);
+        assert_eq!(0, tp(tracked_pin).x);
+        assert_eq!(0, tp(tracked_pin).y);
+        assert!(tp(tracked_pin).garbage);
+
+        s.untrack_pin(tracked_pin);
+    }
+
+    #[test]
+    fn page_list_grow_non_standard_page_prune_protection() {
+        // This test specifically verifies the fix for the bug where pruning a
+        // non-standard page would cause totalRows() < self.rows.
+        //
+        // Bug trigger conditions (all must be true simultaneously):
+        // 1. first page is non-standard (memory.len > std_size)
+        // 2. page_size + PagePool.item_size > maxSize() (triggers prune consideration)
+        // 3. pages.first != pages.last (have multiple pages)
+        // 4. total_rows >= self.rows (have enough rows for active area)
+        // 5. total_rows - first.size.rows + 1 < self.rows (prune would lose too many)
+
+        // This is kind of magic and likely depends on std_size.
+        let rows_count = 600;
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: rows_count,
+            max_size: Some(std_size()),
+            ..Default::default()
+        });
+
+        // Make the first page non-standard
+        while pg(first(&s)).memory.len() <= std_size() {
+            s.increase_capacity(first(&s), Some(IncreaseCapacity::GraphemeBytes))
+                .unwrap();
+        }
+        assert!(pg(first(&s)).memory.len() > std_size());
+
+        let first_page_node = first(&s);
+        let first_page_cap = n(first_page_node).capacity().rows;
+
+        // Fill first page to capacity
+        while n(first_page_node).rows() < first_page_cap {
+            s.grow().unwrap();
+        }
+
+        // Grow until we have a second page (first page fills up first)
+        while s.pages.first == s.pages.last {
+            s.grow().unwrap();
+        }
+        assert!(s.pages.first != s.pages.last);
+
+        // Fill the second page to capacity so that the next grow() triggers prune
+        let last_node = last(&s);
+        let second_cap = n(last_node).capacity().rows;
+        while n(last_node).rows() < second_cap {
+            s.grow().unwrap();
+        }
+
+        // Now the last page is full. The next grow must either:
+        // 1. Prune the first page and reuse it, OR
+        // 2. Allocate a new page
+        let total = s.total_rows();
+        let would_remain = total - first_page_cap as usize + 1;
+
+        // Verify the bug condition is present: pruning first page would leave < rows
+        assert!(would_remain < s.rows as usize);
+
+        // Verify prune path conditions are met
+        assert!(s.pages.first != s.pages.last);
+        assert!(s.page_size + PagePool::item_size() > s.limits.max(LimitKey::Bytes));
+        assert!(s.total_rows() >= s.rows as usize);
+
+        // Verify last page is at capacity (so grow must prune or allocate new)
+        assert_eq!(second_cap, n(last_node).rows());
+
+        // The next grow should trigger prune consideration.
+        // Without the fix, this would destroy the non-standard first page,
+        // leaving only second_cap + 1 rows, which is < self.rows.
+        s.grow().unwrap();
+
+        // Verify the invariant holds - the fix prevents the destructive prune
+        assert!(s.total_rows() >= s.rows as usize);
+    }
+
+    #[test]
+    fn page_list_resize_no_reflow_more_cols_remaps_pins_in_backfill_path() {
+        // Regression test: when resizeWithoutReflowGrowCols copies rows to a previous
+        // page with spare capacity, tracked pins in those rows must be remapped.
+        // Without the fix, pins become dangling pointers when the original page is destroyed.
+        let cols: CellCountInt = 5;
+        let cap = STD_CAPACITY.adjust(pagepkg::Adjustment { cols: Some(cols) }).unwrap();
+        let mut s = init(cols, cap.rows);
+
+        // Grow until we have two pages.
+        while s.pages.first == s.pages.last {
+            s.grow().unwrap();
+        }
+        let first_page = first(&s);
+        let second_page = last(&s);
+        assert!(first_page != second_page);
+
+        // Trim a history row so the first page has spare capacity.
+        // This triggers the backfill path in resizeWithoutReflowGrowCols.
+        s.erase_history(Some(pt_history(0, 0)));
+        assert!(n(first_page).rows() < n(first_page).capacity().rows);
+
+        // Ensure the resize takes the slow path (new capacity > current capacity).
+        let new_cols: CellCountInt = cols + 1;
+        let adjusted = n(second_page)
+            .capacity()
+            .adjust(pagepkg::Adjustment { cols: Some(new_cols) })
+            .unwrap();
+        assert!(n(second_page).capacity().cols < adjusted.cols);
+
+        // Track a pin in row 0 of the second page. This row will be copied
+        // to the first page during backfill and the pin must be remapped.
+        let tracked = s.track_pin(pin_at(second_page, 0, 0)).unwrap();
+
+        // Write a marker character to the tracked cell so we can verify
+        // the pin points to the correct cell after resize.
+        let marker = 'X' as u32;
+        *pin_rac(*tp(tracked)).1 = cpu(marker);
+
+        s.resize(no_reflow(Some(new_cols), None)).unwrap();
+
+        // Verify the pin points to a valid node still in the page list.
+        let mut found = false;
+        let mut it = s.pages.first;
+        while let Some(node) = it {
+            if node == tp(tracked).node {
+                found = true;
+                break;
+            }
+            it = n(node).next;
+        }
+        assert!(found);
+        assert!(tp(tracked).y < n(tp(tracked).node).rows());
+
+        // Verify the pin still points to the cell with our marker content.
+        let cell = pin_rac(*tp(tracked)).1;
+        assert_eq!(ContentTag::Codepoint, cell.content_tag());
+        assert_eq!(marker, cell.content_codepoint());
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_compact_pool_page_produces_exact_size_heap_page() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // A freshly created page is pool-owned at std_size.
+        let node = first(&s);
+        assert_eq!(Owned::Pool, n(node).owned);
+        assert!(pg(node).memory.len() <= std_size());
+        let original_size = pg(node).size;
+
+        // Compacting it should produce a much smaller exact-size heap page.
+        let new_node = s.compact(node).unwrap().unwrap();
+        assert_eq!(Owned::Heap, n(new_node).owned);
+        assert!(pg(new_node).memory.len() < std_size());
+        assert_eq!(original_size.rows, n(new_node).rows());
+        assert_eq!(original_size.cols, n(new_node).cols());
+        assert_eq!(new_node, first(&s));
+
+        // Our page size accounting should exactly match the compacted
+        // page since it is the only page in the list.
+        assert_eq!(pg(new_node).memory.len(), s.page_size);
+
+        // Compacting again should be a no-op since it is already exact.
+        assert_eq!(None, s.compact(new_node).unwrap());
+    }
+
+    #[test]
+    fn page_list_compact_then_grow_allocates_new_page() {
+        let mut s = init(80, 24);
+
+        // Compact the only page. It now has no spare row capacity.
+        let node = s.compact(first(&s)).unwrap().unwrap();
+        assert_eq!(n(node).rows(), n(node).capacity().rows);
+
+        // Growing must allocate a fresh standard page from the pool,
+        // exercising that a compacted page remains a valid live page.
+        s.grow().unwrap();
+        assert!(s.pages.first != s.pages.last);
+        assert_eq!(Owned::Pool, n(last(&s)).owned);
+        assert_eq!(25, s.total_rows());
+    }
+
+    #[test]
+    fn page_list_compact_then_reset_frees_heap_pages() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Compact the only page so the list contains a sub-std_size
+        // heap-owned page.
+        let node = s.compact(first(&s)).unwrap().unwrap();
+        assert_eq!(Owned::Heap, n(node).owned);
+        assert!(pg(node).memory.len() < std_size());
+
+        // Reset must free the heap page and rebuild from the pool.
+        s.reset();
+        assert_eq!(Owned::Pool, n(first(&s)).owned);
+        assert_eq!(s.rows as usize, s.total_rows());
+    }
+
+    #[test]
+    fn page_list_compact_then_clone() {
+        let mut s = init(80, 24);
+
+        // Write a marker so we can verify contents survive.
+        *cell_at(pg(first(&s)), 1, 2) = cp('X');
+
+        // Compact so the source list contains a sub-std_size heap page.
+        let node = s.compact(first(&s)).unwrap().unwrap();
+        assert_eq!(Owned::Heap, n(node).owned);
+        assert!(pg(node).memory.len() < std_size());
+
+        let s2 = s.clone(clone_opts(pt_screen(0, 0), None)).unwrap();
+        assert_eq!(s.rows as usize, s2.total_rows());
+
+        // Verify the marker survived the clone.
+        assert_eq!('X' as u32, cell_at(pg(first(&s2)), 1, 2).content_codepoint());
+    }
 }
