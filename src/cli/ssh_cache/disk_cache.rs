@@ -72,7 +72,11 @@ impl DiskCache {
     ///
     /// On all platforms, this is `${XDG_STATE_HOME}/ghostty/ssh_cache`.
     pub fn default_path(program: &str) -> Result<PathBuf, Error> {
-        let state_dir = xdg_state(program).ok_or(Error::XdgLookupFailed)?;
+        // TODO(port-dedupe): replace with crate::global::environ_map() and
+        // crate::os::xdg::state once ported.
+        let environ_map = crate::crash::dir::environ_map();
+        let state_dir = crate::crash::dir::xdg::state(&environ_map, Some(program))
+            .map_err(|_| Error::XdgLookupFailed)?;
         Ok(state_dir.join("ssh_cache"))
     }
 
@@ -458,48 +462,6 @@ fn now_seconds() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs() as i64,
         Err(e) => -(e.duration().as_secs() as i64),
-    }
-}
-
-// TODO(port-dedupe): replace with crate::os::xdg::state once ported.
-/// `xdg.state(.{ .subdir = program })`: `$XDG_STATE_HOME/<program>` or
-/// `$HOME/.local/state/<program>`.
-fn xdg_state(subdir: &str) -> Option<PathBuf> {
-    if let Some(env) = std::env::var_os("XDG_STATE_HOME") {
-        if !env.is_empty() {
-            return Some(PathBuf::from(env).join(subdir));
-        }
-    }
-    home_dir().map(|home| home.join(".local/state").join(subdir))
-}
-
-// TODO(port-dedupe): replace with crate::os::homedir::home once ported.
-fn home_dir() -> Option<PathBuf> {
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return Some(PathBuf::from(home));
-        }
-    }
-    // Fall back to the passwd entry.
-    // SAFETY: getpwuid_r is given a properly sized buffer and we only read
-    // pw_dir when the call succeeded and returned a non-null result.
-    unsafe {
-        let mut pw: libc::passwd = std::mem::zeroed();
-        let mut result: *mut libc::passwd = std::ptr::null_mut();
-        let mut buf = [0 as libc::c_char; 4096];
-        let rc = libc::getpwuid_r(
-            libc::getuid(),
-            &mut pw,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        );
-        if rc != 0 || result.is_null() || pw.pw_dir.is_null() {
-            return None;
-        }
-        let dir = std::ffi::CStr::from_ptr(pw.pw_dir);
-        use std::os::unix::ffi::OsStrExt;
-        Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
     }
 }
 

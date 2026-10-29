@@ -441,4 +441,17 @@ mod tests {
         GHOSTTY.encode(&mut buf).unwrap();
         assert!(!buf.is_empty());
     }
+
+    // The Zig code builds this map at comptime (stream_terminal.zig), which
+    // fails the build on unsupported values; check it builds at runtime.
+    #[test]
+    fn xtgettcap_map_builds() {
+        let map = GHOSTTY.xtgettcap_map();
+        assert_eq!(GHOSTTY.capabilities.len() + 3, map.len());
+        assert_eq!(
+            b"\x1bP1+r544E=787465726D2D67686F73747479\x1b\\",
+            map.get(b"544E").unwrap().as_bytes()
+        );
+        assert!(!version().is_empty());
+    }
 }
