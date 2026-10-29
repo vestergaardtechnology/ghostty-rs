@@ -26,6 +26,8 @@ gtk = ["dep:gio", "dep:glib"]
 
 [dependencies]
 base64 = "0.22"
+crossterm = "0.29"
+flate2 = "1"
 getrandom = "0.3"
 gio = { version = "0.21", optional = true }
 glib = { version = "0.21", optional = true }
@@ -37,6 +39,8 @@ memchr = "2"
 png = "0.18"
 serde_json = { version = "1", features = ["preserve_order"] }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [dev-dependencies]
 png = "0.18"
