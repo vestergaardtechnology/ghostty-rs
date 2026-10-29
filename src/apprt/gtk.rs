@@ -49,3 +49,11 @@ pub mod weak_ref;
 #[path = "gtk/winproto.rs"]
 pub mod winproto;
 // @generated-mods-end
+
+// The required comptime API for any apprt.
+// TODO(port-dedupe): `App` (`gtk/App.zig`) and `Surface` (`gtk/Surface.zig`)
+// once ported.
+pub use self::flatpak::resources_dir;
+
+// The exported API, custom for the apprt.
+pub use self::weak_ref::WeakRef;
