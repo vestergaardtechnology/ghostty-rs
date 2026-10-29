@@ -18,6 +18,7 @@ path = "src/main.rs"
 default = []
 
 [dependencies]
+half = "2"
 log = "0.4"
 
 [dev-dependencies]
