@@ -15,7 +15,7 @@ impl Backend {
     /// The Zig version takes the `std.Target` and the wasm target (which
     /// it ignores) as parameters since it runs in the build system; here
     /// the compilation target is known through `cfg`.
-    pub fn default() -> Backend {
+    pub const fn default() -> Backend {
         // Zig: `target.os.tag.isDarwin()`.
         if cfg!(target_vendor = "apple") {
             return Backend::Metal;
@@ -24,11 +24,17 @@ impl Backend {
     }
 
     /// The Zig tag name (used as the build option value).
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Backend::Opengl => "opengl",
             Backend::Metal => "metal",
         }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
