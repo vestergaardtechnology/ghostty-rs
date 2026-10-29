@@ -4,7 +4,10 @@
 
 use std::fmt;
 
-use super::sfnt::{be_struct, Int16, ReadError, Reader, Uint16};
+use std::io::Cursor;
+
+use super::sfnt::{be_struct, Int16, ReadError, Uint16};
+use crate::lib::compat::reader::{self as compat_reader, Endian};
 
 /// Glyph Data Table
 ///
@@ -316,6 +319,12 @@ pub enum SizeError {
     EndOfStream,
 }
 
+impl From<std::io::Error> for SizeError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::from(e).into()
+    }
+}
+
 impl From<ReadError> for SizeError {
     fn from(e: ReadError) -> Self {
         match e {
@@ -346,6 +355,12 @@ pub enum DecodeError {
 
     /// Coordinate delta accumulation overflowed.
     CoordinateOverflow,
+}
+
+impl From<std::io::Error> for DecodeError {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::from(e).into()
+    }
 }
 
 impl From<ReadError> for DecodeError {
@@ -384,8 +399,8 @@ impl<'a> Entry<'a> {
     /// The lifetime of this struct, then, is the same as the
     /// lifetime of the data that is used to initialize it.
     pub fn init(data: &'a [u8]) -> Result<Entry<'a>, ReadError> {
-        let mut reader = Reader::fixed(data);
-        let header: Header = reader.read_be()?;
+        let mut reader = Cursor::new(data);
+        let header: Header = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
         Ok(Entry {
             header,
             data: &data[Header::SIZE..],
@@ -409,7 +424,7 @@ impl<'a> Entry<'a> {
     /// NOTE: Currently produces errors when given composite glyphs
     ///       or any glyphs that have hinting instructions included.
     pub fn size(&self) -> Result<usize, SizeError> {
-        let mut reader = Reader::fixed(self.data);
+        let mut reader = Cursor::new(self.data);
         match self.entry_type() {
             // https://learn.microsoft.com/en-us/typography/opentype/spec/glyf#simple-glyph-description
             Type::Simple => {
@@ -438,7 +453,8 @@ impl<'a> Entry<'a> {
                 // of each contour, in increasing numeric order.
                 let mut max_point_index: isize = -1;
                 for _ in 0..num_contours {
-                    let index = reader.read_be::<Uint16>()? as isize;
+                    let index =
+                        compat_reader::reader_int::<_, Uint16>(&mut reader, Endian::Big)? as isize;
                     // The endpoints are supposed to monotonically increase.
                     if index <= max_point_index {
                         return Err(SizeError::EndPointsOutOfOrder);
@@ -453,7 +469,8 @@ impl<'a> Entry<'a> {
                 // If instructionLength is zero, no instructions
                 // are present for this glyph, and this field is
                 // followed directly by the flags field.
-                let instructions_length = reader.read_be::<Uint16>()?;
+                let instructions_length =
+                    compat_reader::reader_int::<_, Uint16>(&mut reader, Endian::Big)?;
 
                 // Since we don't have code that validates instruction
                 // byte code, we just reject all glyphs that contain any.
@@ -486,7 +503,7 @@ impl<'a> Entry<'a> {
                 let mut x_coords_len: usize = 0;
                 let mut y_coords_len: usize = 0;
                 while (i as isize) <= max_point_index {
-                    let flag = SimpleFlags::from_bits(reader.read_byte()?);
+                    let flag = SimpleFlags::from_bits(compat_reader::read_byte(&mut reader)?);
 
                     // Determine how many bytes the x and y coordinates will
                     // be represented with in the corresponding arrays, add
@@ -506,7 +523,7 @@ impl<'a> Entry<'a> {
                         // that count, and the x_coords_len and y_coords_len
                         // must be increased by the correct number of bytes
                         // as well.
-                        let repeat_count = reader.read_byte()? as usize;
+                        let repeat_count = compat_reader::read_byte(&mut reader)? as usize;
                         i += repeat_count;
                         x_coords_len += repeat_count * flag.x_bytes() as usize;
                         y_coords_len += repeat_count * flag.y_bytes() as usize;
@@ -532,7 +549,7 @@ impl<'a> Entry<'a> {
                 // We determined the length of this section (in bytes)
                 // above while processing the flags, so that we can just
                 // skip that many bytes to validate this field.
-                reader.read_skip_bytes(x_coords_len)?;
+                compat_reader::read_skip_bytes(&mut reader, x_coords_len as u64)?;
 
                 // uint8 or int16 yCoordinates[variable]
                 //
@@ -543,7 +560,7 @@ impl<'a> Entry<'a> {
                 // We determined the length of this section (in bytes)
                 // above while processing the flags, so that we can just
                 // skip that many bytes to validate this field.
-                reader.read_skip_bytes(y_coords_len)?;
+                compat_reader::read_skip_bytes(&mut reader, y_coords_len as u64)?;
             }
 
             Type::Composite => {
@@ -558,7 +575,7 @@ impl<'a> Entry<'a> {
         }
 
         // No issues found, the glyf entry is valid, return its length.
-        Ok(Header::SIZE + reader.seek)
+        Ok(Header::SIZE + reader.position() as usize)
     }
 
     /// Decode this simple glyph entry into an owned outline.
@@ -572,7 +589,7 @@ impl<'a> Entry<'a> {
             Type::Composite => return Err(DecodeError::CompositeNotSupported),
         }
 
-        let mut reader = Reader::fixed(self.data);
+        let mut reader = Cursor::new(self.data);
 
         // A zero-contour glyph may be header-only. See size for the
         // reason for the hardcoded 2 here.
@@ -590,7 +607,8 @@ impl<'a> Entry<'a> {
         // If we have no contours, then the only possible remaining
         // field is instructionLength. Instructions are not supported.
         if num_contours == 0 {
-            let instructions_length = reader.read_be::<Uint16>()?;
+            let instructions_length =
+                compat_reader::reader_int::<_, Uint16>(&mut reader, Endian::Big)?;
             if instructions_length > 0 {
                 return Err(DecodeError::InstructionsNotSupported);
             }
@@ -610,7 +628,7 @@ impl<'a> Entry<'a> {
             // with the valid index. The final endpoint tells us our point
             // count, since endpoints are stored as inclusive point indices.
             for end_point in end_points.iter_mut() {
-                let index = reader.read_be::<Uint16>()?;
+                let index = compat_reader::reader_int::<_, Uint16>(&mut reader, Endian::Big)?;
                 if index as isize <= prev_end_point {
                     return Err(DecodeError::EndPointsOutOfOrder);
                 }
@@ -623,7 +641,7 @@ impl<'a> Entry<'a> {
         };
 
         // Instructions are not supported.
-        let instructions_length = reader.read_be::<Uint16>()?;
+        let instructions_length = compat_reader::reader_int::<_, Uint16>(&mut reader, Endian::Big)?;
         if instructions_length > 0 {
             return Err(DecodeError::InstructionsNotSupported);
         }
@@ -640,12 +658,12 @@ impl<'a> Entry<'a> {
         {
             let mut point_i: usize = 0;
             while point_i < point_count {
-                let flag = SimpleFlags::from_bits(reader.read_byte()?);
+                let flag = SimpleFlags::from_bits(compat_reader::read_byte(&mut reader)?);
                 flags[point_i] = flag;
                 point_i += 1;
 
                 if flag.repeat {
-                    let repeat_count = reader.read_byte()? as usize;
+                    let repeat_count = compat_reader::read_byte(&mut reader)? as usize;
                     if point_i + repeat_count > point_count {
                         return Err(DecodeError::TooManyPoints);
                     }
@@ -663,12 +681,12 @@ impl<'a> Entry<'a> {
         for (flag, point) in flags.iter().zip(points.iter_mut()) {
             let dx: i32 = if flag.x_short {
                 if flag.x_repeat_or_sign {
-                    reader.read_byte()? as i32
+                    compat_reader::read_byte(&mut reader)? as i32
                 } else {
-                    -(reader.read_byte()? as i32)
+                    -(compat_reader::read_byte(&mut reader)? as i32)
                 }
             } else if !flag.x_repeat_or_sign {
-                reader.read_be::<Int16>()? as i32
+                compat_reader::reader_int::<_, Int16>(&mut reader, Endian::Big)? as i32
             } else {
                 0
             };
@@ -682,12 +700,12 @@ impl<'a> Entry<'a> {
         for (flag, point) in flags.iter().zip(points.iter_mut()) {
             let dy: i32 = if flag.y_short {
                 if flag.y_repeat_or_sign {
-                    reader.read_byte()? as i32
+                    compat_reader::read_byte(&mut reader)? as i32
                 } else {
-                    -(reader.read_byte()? as i32)
+                    -(compat_reader::read_byte(&mut reader)? as i32)
                 }
             } else if !flag.y_repeat_or_sign {
-                reader.read_be::<Int16>()? as i32
+                compat_reader::reader_int::<_, Int16>(&mut reader, Endian::Big)? as i32
             } else {
                 0
             };
@@ -770,9 +788,10 @@ mod tests {
     use super::super::sfnt::Sfnt;
     use super::*;
 
-    // TODO(port-dedupe): replace with
-    // crate::terminal::build_options artifact == Artifact::Lib.
-    const ARTIFACT_IS_LIB: bool = false;
+    use crate::terminal::build_options::{self, Artifact};
+
+    /// `@import("terminal_options").artifact == .lib`
+    const ARTIFACT_IS_LIB: bool = matches!(build_options::ARTIFACT, Artifact::Lib);
 
     /// Port of `testAppendInt` (big-endian append).
     macro_rules! append_int {

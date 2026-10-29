@@ -50,3 +50,7 @@ pub use self::target::Target;
 pub use self::tinyio::TinyIo;
 pub use self::types::{Buffer, String};
 pub use self::union::CRepr;
+/// `lib.Struct` (a `#[macro_export]` macro, see [`r#struct`]).
+pub use crate::lib_struct as Struct;
+/// `lib.TaggedUnion` (a `#[macro_export]` macro, see [`union`]).
+pub use crate::lib_tagged_union as TaggedUnion;

@@ -10,6 +10,7 @@
 use std::borrow::Cow;
 
 use super::key::Mods;
+use crate::pkg::oniguruma as oni;
 
 /// A clickable link definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,12 +96,13 @@ impl Highlight {
 
 impl Link {
     /// Returns a new oni.Regex that can be used to match the link.
-    pub fn oni_regex(&self) -> Result<oni::Regex, oni::Error> {
+    pub fn oni_regex(&self) -> Result<oni::Regex, oni::errors::Error> {
         oni::Regex::init(
             &self.regex,
-            oni::OPTION_NONE,
+            oni::types::Option::default(),
             oni::Encoding::utf8(),
             oni::Syntax::default(),
+            None,
         )
     }
 
@@ -118,131 +120,6 @@ impl Link {
         self.action == other.action
             && self.highlight == other.highlight
             && self.regex[..] == other.regex[..]
-    }
-}
-
-/// Minimal stand-in for the oniguruma bindings.
-///
-/// TODO(port-dedupe): replace with the `pkg/oniguruma` port
-/// (`oni.Regex`, `oni.Encoding.utf8`, `oni.Syntax.default`, `oni.Error`).
-pub mod oni {
-    use std::ffi::{c_int, c_uint, c_void};
-    use std::ptr;
-
-    #[repr(C)]
-    pub struct OnigEncodingType {
-        _private: [u8; 0],
-    }
-
-    #[repr(C)]
-    pub struct OnigSyntaxType {
-        _private: [u8; 0],
-    }
-
-    type OnigRegex = *mut c_void;
-
-    #[link(name = "onig")]
-    extern "C" {
-        static mut OnigEncodingUTF8: OnigEncodingType;
-        static mut OnigSyntaxOniguruma: OnigSyntaxType;
-
-        fn onig_new(
-            reg: *mut OnigRegex,
-            pattern: *const u8,
-            pattern_end: *const u8,
-            option: c_uint,
-            enc: *mut OnigEncodingType,
-            syntax: *mut OnigSyntaxType,
-            einfo: *mut c_void,
-        ) -> c_int;
-        fn onig_free(reg: OnigRegex);
-        fn onig_initialize(encodings: *mut *mut OnigEncodingType, n: c_int) -> c_int;
-    }
-
-    /// `ONIG_OPTION_NONE`
-    pub const OPTION_NONE: c_uint = 0;
-
-    /// An oniguruma error code (always negative).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Error(pub c_int);
-
-    impl std::fmt::Display for Error {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "oniguruma error {}", self.0)
-        }
-    }
-
-    impl std::error::Error for Error {}
-
-    pub struct Encoding;
-
-    impl Encoding {
-        /// `ONIG_ENCODING_UTF8`
-        pub fn utf8() -> *mut OnigEncodingType {
-            // Taking the address of an extern static is safe; never read here.
-            ptr::addr_of_mut!(OnigEncodingUTF8)
-        }
-    }
-
-    pub struct Syntax;
-
-    impl Syntax {
-        /// `ONIG_SYNTAX_ONIGURUMA`
-        pub fn default() -> *mut OnigSyntaxType {
-            // Taking the address of an extern static is safe; never read here.
-            ptr::addr_of_mut!(OnigSyntaxOniguruma)
-        }
-    }
-
-    /// Initialize oniguruma with the given encodings (`oni.init`).
-    pub fn init(encs: &[*mut OnigEncodingType]) -> Result<(), Error> {
-        let mut encs = encs.to_vec();
-        // SAFETY: the pointers are valid encoding statics.
-        let rc = unsafe { onig_initialize(encs.as_mut_ptr(), encs.len() as c_int) };
-        if rc < 0 {
-            return Err(Error(rc));
-        }
-        Ok(())
-    }
-
-    /// A compiled regular expression; freed on drop.
-    pub struct Regex {
-        value: OnigRegex,
-    }
-
-    impl Regex {
-        pub fn init(
-            pattern: &[u8],
-            options: c_uint,
-            enc: *mut OnigEncodingType,
-            syntax: *mut OnigSyntaxType,
-        ) -> Result<Regex, Error> {
-            let mut value: OnigRegex = ptr::null_mut();
-            // SAFETY: pattern range is valid for the duration of the call;
-            // enc/syntax are valid oniguruma statics; einfo may be null.
-            let rc = unsafe {
-                onig_new(
-                    &mut value,
-                    pattern.as_ptr(),
-                    pattern.as_ptr().add(pattern.len()),
-                    options,
-                    enc,
-                    syntax,
-                    ptr::null_mut(),
-                )
-            };
-            if rc < 0 {
-                return Err(Error(rc));
-            }
-            Ok(Regex { value })
-        }
-    }
-
-    impl Drop for Regex {
-        fn drop(&mut self) {
-            // SAFETY: value was created by onig_new and is freed once.
-            unsafe { onig_free(self.value) }
-        }
     }
 }
 

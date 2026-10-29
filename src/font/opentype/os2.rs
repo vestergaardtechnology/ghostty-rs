@@ -4,7 +4,10 @@
 
 use std::fmt;
 
-use super::sfnt::{self, be_struct, Fword, Int16, ReadBe, ReadError, Reader, Tag, Ufword, Uint16, Uint32, Uint8};
+use std::io::{self, Cursor, Read};
+
+use super::sfnt::{self, be_struct, Fword, Int16, ReadError, Tag, Ufword, Uint16, Uint32, Uint8};
+use crate::lib::compat::reader::{self as compat_reader, Endian, ReadEndian};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FsSelection {
@@ -79,9 +82,9 @@ impl FsSelection {
     }
 }
 
-impl ReadBe for FsSelection {
-    fn read_be(r: &mut Reader<'_>) -> Result<Self, ReadError> {
-        Ok(Self::from_bits(Uint16::read_be(r)?))
+impl ReadEndian for FsSelection {
+    fn read_endian<R: Read + ?Sized>(r: &mut R, endian: Endian) -> io::Result<Self> {
+        Ok(Self::from_bits(Uint16::read_endian(r, endian)?))
     }
 }
 
@@ -270,6 +273,12 @@ impl From<ReadError> for Os2Error {
     }
 }
 
+impl From<std::io::Error> for Os2Error {
+    fn from(e: std::io::Error) -> Self {
+        ReadError::from(e).into()
+    }
+}
+
 impl fmt::Display for Os2Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -440,16 +449,16 @@ pub struct Os2 {
 impl Os2 {
     /// Parse the table from raw data.
     pub fn init(data: &[u8]) -> Result<Os2, Os2Error> {
-        let mut reader = Reader::fixed(data);
+        let mut reader = Cursor::new(data);
 
-        let version: Uint16 = reader.read_be()?;
+        let version: Uint16 = compat_reader::reader_int(&mut reader, Endian::Big)?;
 
         // Return to the start, cause the version is part of the struct.
-        reader.seek = 0;
+        reader.set_position(0);
 
         match version {
             5 => {
-                let table: Os2V5 = reader.read_be()?;
+                let table: Os2V5 = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
                 Ok(Os2 {
                     version: table.version,
                     x_avg_char_width: table.x_avg_char_width,
@@ -493,7 +502,7 @@ impl Os2 {
                 })
             }
             4 | 3 | 2 => {
-                let table: Os2V4_3_2 = reader.read_be()?;
+                let table: Os2V4_3_2 = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
                 Ok(Os2 {
                     version: table.version,
                     x_avg_char_width: table.x_avg_char_width,
@@ -536,7 +545,7 @@ impl Os2 {
                 })
             }
             1 => {
-                let table: Os2V1 = reader.read_be()?;
+                let table: Os2V1 = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
                 Ok(Os2 {
                     version: table.version,
                     x_avg_char_width: table.x_avg_char_width,
@@ -574,7 +583,7 @@ impl Os2 {
                 })
             }
             0 => {
-                let table: Os2V0 = reader.read_be()?;
+                let table: Os2V0 = compat_reader::read_struct_endian(&mut reader, Endian::Big)?;
                 Ok(Os2 {
                     version: table.version,
                     x_avg_char_width: table.x_avg_char_width,

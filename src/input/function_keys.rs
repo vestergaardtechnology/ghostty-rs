@@ -595,9 +595,10 @@ pub static KEYS: KeyEntryArray = {
 mod tests {
     use super::*;
 
-    /// TODO(port-dedupe): replace with
-    /// `crate::terminal::build_options::ARTIFACT` (`.ghostty` vs `.lib`).
-    const ARTIFACT_IS_GHOSTTY: bool = true;
+    use crate::terminal::build_options::{self, Artifact};
+
+    /// `build_options.artifact == .ghostty`
+    const ARTIFACT_IS_GHOSTTY: bool = matches!(build_options::ARTIFACT, Artifact::Ghostty);
 
     /// TODO(port-dedupe): replace with
     /// `crate::termio::message::Message::WriteReq::Small::MAX`
