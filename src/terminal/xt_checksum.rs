@@ -414,25 +414,36 @@ mod tests {
         // Only the first row, the whole width. The space is omitted and the
         // unwritten cells are skipped.
         let sel = req(1, 0, 1, 0).selection(&s.pages, None);
-        assert_eq!(0u16.wrapping_sub((b'a' + b'b') as u16), compute(s, sel, Flags::default()));
+        assert_eq!(
+            0u16.wrapping_sub((b'a' + b'b') as u16),
+            compute(s, sel, Flags::default())
+        );
         assert_eq!((b'a' + b'b') as u16, compute(s, sel, flags(|f| f.positive = true)));
 
         // Untrimmed counts the space and the undrawn cells as spaces.
         assert_eq!(
             b'a' as u16 + b'b' as u16 + b' ' as u16 * 8,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.no_trim = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.no_trim = true;
+                })
+            )
         );
 
         // Undrawn cells are spaces, which are then trimmed.
         assert_eq!(
             (b'a' + b'b') as u16,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.undrawn = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.undrawn = true;
+                })
+            )
         );
     }
 
@@ -476,7 +487,8 @@ mod tests {
     fn xt_checksum_attributes() {
         let mut t = term();
         t.set_attribute(sgr::Attribute::Bold).unwrap();
-        t.set_attribute(sgr::Attribute::Underline(sgr::Underline::Single)).unwrap();
+        t.set_attribute(sgr::Attribute::Underline(sgr::Underline::Single))
+            .unwrap();
         t.print_string("a").unwrap();
         t.set_attribute(sgr::Attribute::Unset).unwrap();
         t.set_attribute(sgr::Attribute::Inverse).unwrap();
@@ -495,10 +507,14 @@ mod tests {
         );
         assert_eq!(
             (b'a' + b'b') as u16,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.no_attributes = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.no_attributes = true;
+                })
+            )
         );
     }
 
@@ -525,10 +541,14 @@ mod tests {
         assert_eq!(0x69u16 + 0x1B, compute(s, sel, flags(|f| f.positive = true)));
         assert_eq!(
             0xE9u16 + 0x20AC,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.full = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.full = true;
+                })
+            )
         );
     }
 
@@ -542,10 +562,14 @@ mod tests {
         assert_eq!(0x1Bu16 + 0x1B, compute(s, sel, flags(|f| f.positive = true)));
         assert_eq!(
             0x6A4Bu16,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.full = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.full = true;
+                })
+            )
         );
     }
 
@@ -560,18 +584,26 @@ mod tests {
         assert_eq!(b'e' as u16, compute(s, sel, flags(|f| f.positive = true)));
         assert_eq!(
             b'e' as u16 + 0x301,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.no_trim = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.no_trim = true;
+                })
+            )
         );
         assert_eq!(
             b'e' as u16,
-            compute(s, sel, flags(|f| {
-                f.positive = true;
-                f.no_trim = true;
-                f.full = true;
-            }))
+            compute(
+                s,
+                sel,
+                flags(|f| {
+                    f.positive = true;
+                    f.no_trim = true;
+                    f.full = true;
+                })
+            )
         );
     }
 }
