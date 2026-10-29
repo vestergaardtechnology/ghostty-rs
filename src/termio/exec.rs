@@ -2775,3 +2775,733 @@ pub mod shell_integration_standin {
         }
     }
 }
+
+/// A test harness that runs an [`Exec`] backend under a real
+/// [`crate::termio::Thread`] with the stand-in `Termio` as a test double.
+#[cfg(all(test, unix))]
+pub(crate) mod testing {
+    use std::ptr::NonNull;
+    use std::time::{Duration, Instant};
+
+    use super::{Config, Exec};
+    use crate::apprt;
+    use crate::apprt::surface::standin::{AppMailbox, AppMessage, AppQueue};
+    use crate::apprt::surface::Message as SurfaceMessage;
+    use crate::config::Command as ConfigCommand;
+    use crate::global::xev;
+    use crate::lib::tinyio::{Mutex, TinyIo};
+    use crate::renderer;
+    use crate::renderer::state::standin::Terminal;
+    use crate::termio::standin::{Termio, TermioDerivedConfig};
+    use crate::termio::{Backend, Mailbox, Message, Thread};
+
+    struct SendPtr<T>(*mut T);
+    // SAFETY: test-only hand-off of pointers whose targets outlive the
+    // spawned thread (it is joined in `Harness::stop`).
+    unsafe impl<T> Send for SendPtr<T> {}
+    impl<T> SendPtr<T> {
+        fn get(self) -> *mut T {
+            self.0
+        }
+    }
+
+    /// Everything a running termio thread needs, heap-allocated so that
+    /// the pointers between the pieces stay valid.
+    pub struct Harness {
+        pub mutex: Box<Mutex>,
+        pub terminal: Box<Terminal>,
+        pub state: Box<renderer::State>,
+        pub rt_app: Box<apprt::App>,
+        pub app_queue: Box<AppQueue>,
+        pub io: Box<Termio>,
+        pub thread: Box<Thread>,
+        pub stop: xev::Async,
+        pub handle: Option<std::thread::JoinHandle<()>>,
+        /// Surface messages received so far.
+        pub messages: Vec<SurfaceMessage>,
+    }
+
+    /// An exec config running `argv` directly with a minimal environment.
+    pub fn direct_config(argv: &[&str]) -> Config {
+        let mut env = super::EnvMap::new();
+        env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
+        Config {
+            command: Some(ConfigCommand::Direct(
+                argv.iter().map(|a| (*a).into()).collect(),
+            )),
+            env,
+            shell_integration: crate::config::config::ShellIntegration::None,
+            term: "xterm-256color".into(),
+            ..Config::default()
+        }
+    }
+
+    impl Harness {
+        /// Build the termio for `cfg` without starting the thread.
+        pub fn new(cfg: Config) -> Harness {
+            let mut mutex = Box::new(Mutex::new());
+            let mut terminal = Box::new(Terminal::default());
+            let mut state = Box::new(renderer::State::new(
+                NonNull::from(&mut *mutex),
+                NonNull::from(&mut *terminal),
+            ));
+            let rt_app = Box::new(apprt::App::default());
+            let app_queue = Box::new(AppQueue::new());
+
+            let mut backend = Backend::Exec(Exec::init(cfg).unwrap());
+            backend.init_terminal(&mut terminal);
+
+            let io = Box::new(Termio {
+                backend,
+                config: TermioDerivedConfig::default(),
+                renderer_state: &mut *state,
+                renderer_wakeup: xev::Async::init().unwrap(),
+                surface_mailbox: apprt::surface::Mailbox {
+                    surface: std::ptr::null_mut(),
+                    app: AppMailbox {
+                        rt_app: &*rt_app,
+                        mailbox: &*app_queue,
+                    },
+                },
+                size: renderer::Size::default(),
+                mailbox: Mailbox::init_spsc().unwrap(),
+                processed: Vec::new(),
+                resizes: Vec::new(),
+                synchronized_output_resets: 0,
+            });
+
+            let thread = Box::new(Thread::init().unwrap());
+            let stop = thread.stop;
+            Harness {
+                mutex,
+                terminal,
+                state,
+                rt_app,
+                app_queue,
+                io,
+                thread,
+                stop,
+                handle: None,
+                messages: Vec::new(),
+            }
+        }
+
+        /// Start the termio thread.
+        pub fn start(&mut self) {
+            let thread = SendPtr(&mut *self.thread as *mut Thread);
+            let io = SendPtr(&mut *self.io as *mut Termio);
+            self.handle = Some(
+                std::thread::Builder::new()
+                    .name("io".into())
+                    .spawn(move || {
+                        let thread = thread.get();
+                        let io = io.get();
+                        // SAFETY: both outlive the thread (joined in `stop`).
+                        unsafe { (*thread).thread_main(io) };
+                    })
+                    .unwrap(),
+            );
+        }
+
+        pub fn io_ptr(&mut self) -> *mut Termio {
+            &mut *self.io
+        }
+
+        /// Queue a message to the termio thread (from the "surface").
+        pub fn send(&mut self, msg: Message) {
+            let io = self.io_ptr();
+            // SAFETY: the mailbox is thread-safe.
+            let mailbox = unsafe { &(*io).mailbox };
+            mailbox.send(msg, None);
+            mailbox.notify();
+        }
+
+        /// Run `f` on the termio while holding the renderer mutex (which
+        /// protects the test-double state).
+        pub fn with_io<R>(&mut self, f: impl FnOnce(&Termio) -> R) -> R {
+            let io = self.io_ptr();
+            self.mutex.lock_uncancelable(TinyIo);
+            // SAFETY: the inspected fields are protected by the mutex.
+            let r = f(unsafe { &*io });
+            self.mutex.unlock(TinyIo);
+            r
+        }
+
+        /// A copy of the output processed so far.
+        pub fn processed(&mut self) -> Vec<u8> {
+            self.with_io(|io| io.processed.clone())
+        }
+
+        /// Wait until the processed output contains `needle`.
+        pub fn wait_output(&mut self, needle: &str) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let out = String::from_utf8_lossy(&self.processed()).into_owned();
+                if out.contains(needle) {
+                    return out;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {needle:?}, got {out:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Move the queued surface messages into `messages`.
+        pub fn collect_messages(&mut self) {
+            while let Some(m) = self.app_queue.pop() {
+                match m {
+                    AppMessage::SurfaceMessage { message, .. } => self.messages.push(message),
+                    other => panic!("unexpected app message {other:?}"),
+                }
+            }
+        }
+
+        /// Collect surface messages, waiting until `pred` matches one.
+        pub fn wait_message(&mut self, pred: impl Fn(&SurfaceMessage) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                self.collect_messages();
+                if self.messages.iter().any(&pred) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for a message, got {:?}",
+                    self.messages
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Wait until `pred` holds on the termio (under the renderer mutex).
+        pub fn wait_io(&mut self, pred: impl Fn(&Termio) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.with_io(&pred) {
+                assert!(Instant::now() < deadline, "timed out waiting for termio state");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Stop and join the termio thread.
+        pub fn stop(&mut self) {
+            if let Some(h) = self.handle.take() {
+                self.stop.notify().unwrap();
+                h.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.stop();
+            self.io.renderer_wakeup.deinit();
+            self.io.deinit();
+            self.thread.deinit();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fail_passwd() -> Result<PasswdEntry, &'static str> {
+        // Failed passwd entry means we can't construct a macOS
+        // login command and falls back to POSIX behavior.
+        Err("Fail")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn testuser_passwd() -> Result<PasswdEntry, &'static str> {
+        Ok(PasswdEntry {
+            name: Some("testuser".into()),
+            ..Default::default()
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exec_command_darwin_shell_command() {
+        let result =
+            exec_command(&configpkg::Command::Shell("foo bar baz".into()), testuser_passwd).unwrap();
+
+        assert_eq!(8, result.len());
+        assert_eq!(result[0], "/usr/bin/login");
+        assert_eq!(result[1], "-flp");
+        assert_eq!(result[2], "testuser");
+        assert_eq!(result[3], "/bin/bash");
+        assert_eq!(result[4], "--noprofile");
+        assert_eq!(result[5], "--norc");
+        assert_eq!(result[6], "-c");
+        assert_eq!(result[7], "exec -l foo bar baz");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exec_command_darwin_direct_command() {
+        let result = exec_command(
+            &configpkg::Command::Direct(vec!["foo".into(), "bar baz".into()]),
+            testuser_passwd,
+        )
+        .unwrap();
+
+        assert_eq!(5, result.len());
+        assert_eq!(result[0], "/usr/bin/login");
+        assert_eq!(result[1], "-flp");
+        assert_eq!(result[2], "testuser");
+        assert_eq!(result[3], "foo");
+        assert_eq!(result[4], "bar baz");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_command_shell_command_empty_passwd() {
+        let result = exec_command(&configpkg::Command::Shell("foo bar baz".into()), || {
+            // Empty passwd entry means we can't construct a macOS
+            // login command and falls back to POSIX behavior.
+            Ok::<_, &str>(PasswdEntry::default())
+        })
+        .unwrap();
+
+        assert_eq!(3, result.len());
+        assert_eq!(result[0], "/bin/sh");
+        assert_eq!(result[1], "-c");
+        assert_eq!(result[2], "foo bar baz");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_command_shell_command_error_passwd() {
+        let result =
+            exec_command(&configpkg::Command::Shell("foo bar baz".into()), fail_passwd).unwrap();
+
+        assert_eq!(3, result.len());
+        assert_eq!(result[0], "/bin/sh");
+        assert_eq!(result[1], "-c");
+        assert_eq!(result[2], "foo bar baz");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_command_direct_command_error_passwd() {
+        let result = exec_command(
+            &configpkg::Command::Direct(vec!["foo".into(), "bar baz".into()]),
+            fail_passwd,
+        )
+        .unwrap();
+
+        assert_eq!(2, result.len());
+        assert_eq!(result[0], "foo");
+        assert_eq!(result[1], "bar baz");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn exec_command_direct_command_config_freed() {
+        let command_arena = configpkg::Command::Direct(vec!["foo".into(), "bar baz".into()]);
+        let command = command_arena.clone();
+
+        let result = exec_command(&command, fail_passwd).unwrap();
+
+        drop(command);
+        drop(command_arena);
+
+        assert_eq!(2, result.len());
+        assert_eq!(result[0], "foo");
+        assert_eq!(result[1], "bar baz");
+    }
+
+    #[cfg(windows)]
+    fn empty_passwd() -> Result<PasswdEntry, &'static str> {
+        Ok(PasswdEntry::default())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exec_command_windows_bare_cmd_exe_resolves_via_comspec() {
+        let result = exec_command(&configpkg::Command::Shell("cmd.exe".into()), empty_passwd).unwrap();
+
+        assert_eq!(1, result.len());
+
+        // Expect COMSPEC if available, otherwise the documented fallback.
+        let expected = std::env::var("COMSPEC")
+            .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+        assert_eq!(expected, result[0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exec_command_windows_bare_non_cmd_shell_is_passed_through() {
+        let result =
+            exec_command(&configpkg::Command::Shell("pwsh.exe".into()), empty_passwd).unwrap();
+
+        assert_eq!(1, result.len());
+        assert_eq!("pwsh.exe", result[0]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exec_command_windows_shell_with_args_is_split_on_whitespace() {
+        let result = exec_command(&configpkg::Command::Shell("wsl ~".into()), empty_passwd).unwrap();
+
+        assert_eq!(2, result.len());
+        assert_eq!("wsl", result[0]);
+        assert_eq!("~", result[1]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exec_command_windows_direct_command_is_passed_through_unchanged() {
+        let result = exec_command(
+            &configpkg::Command::Direct(vec![
+                "C:\\tools\\foo.exe".into(),
+                "arg with spaces".into(),
+            ]),
+            empty_passwd,
+        )
+        .unwrap();
+
+        assert_eq!(2, result.len());
+        assert_eq!("C:\\tools\\foo.exe", result[0]);
+        assert_eq!("arg with spaces", result[1]);
+    }
+
+    /// Zig runs init under a failing allocator to check that the env is
+    /// freed on every failure path. Rust ownership makes that automatic
+    /// (init takes the env by value), so this checks that init consumes
+    /// the env, builds the subprocess environment from it and frees it.
+    #[test]
+    fn init_frees_the_env_when_it_fails() {
+        let config = configpkg::Config::default();
+
+        let mut env = EnvMap::new();
+        env.insert("HOME".into(), "/home/ghostty".into());
+        env.insert("SHELL".into(), "/bin/sh".into());
+
+        let mut exec = Exec::init(Config {
+            env,
+            resources_dir: None,
+            term: "xterm-ghostty".into(),
+            rt_pre_exec_info: command::RtPreExecInfo::init(&config),
+            rt_post_fork_info: command::RtPostForkInfo::init(&config),
+            ..Config::default()
+        })
+        .unwrap();
+
+        let env = exec.subprocess.env.as_ref().unwrap();
+        assert_eq!(Some("/home/ghostty"), env.get("HOME").map(String::as_str));
+        assert_eq!(Some("/bin/sh"), env.get("SHELL").map(String::as_str));
+        exec.deinit();
+        assert!(exec.subprocess.env.is_none());
+    }
+
+    // Extra (not in Zig): the subprocess environment setup.
+    #[cfg(unix)]
+    #[test]
+    fn init_env() {
+        let mut env = EnvMap::new();
+        env.insert("VTE_VERSION".into(), "7000".into());
+        env.insert("PATH".into(), "/usr/bin".into());
+        let mut env_override = RepeatableStringMap::default();
+        env_override.map.push(("FOO".into(), "bar".into()));
+
+        let sp = Subprocess::init(Config {
+            env,
+            env_override,
+            resources_dir: Some("/opt/ghostty/share/ghostty".into()),
+            term: "xterm-ghostty".into(),
+            working_directory: Some("/tmp".into()),
+            cursor_blink: Some(false),
+            ..Config::default()
+        })
+        .unwrap();
+
+        let env = sp.env.as_ref().unwrap();
+        let get = |k: &str| env.get(k).map(String::as_str);
+        assert_eq!(Some("/opt/ghostty/share/ghostty"), get("GHOSTTY_RESOURCES_DIR"));
+        assert_eq!(Some("xterm-ghostty"), get("TERM"));
+        assert_eq!(Some("truecolor"), get("COLORTERM"));
+        assert_eq!(Some("/opt/ghostty/share/terminfo"), get("TERMINFO"));
+        assert_eq!(Some("ghostty"), get("TERM_PROGRAM"));
+        assert_eq!(Some(build_config::VERSION_STRING), get("TERM_PROGRAM_VERSION"));
+        assert_eq!(None, get("VTE_VERSION"));
+        assert_eq!(Some("bar"), get("FOO"));
+        assert_eq!(Some("/tmp"), get("PWD"));
+        assert_eq!(Some("cursor:steady,path,title"), get("GHOSTTY_SHELL_FEATURES"));
+
+        // Our binary dir is appended to the PATH.
+        let exe = std::env::current_exe().unwrap();
+        let exe_dir = exe.parent().unwrap().to_str().unwrap();
+        assert_eq!(Some(exe_dir), get("GHOSTTY_BIN_DIR"));
+        assert_eq!(Some(format!("/usr/bin:{exe_dir}").as_str()), get("PATH"));
+
+        // Without a command, the default shell is wrapped in /bin/sh.
+        if !internal_os::is_flatpak() {
+            assert_eq!(vec!["/bin/sh", "-c", "sh"], sp.args);
+        }
+        assert_eq!(Some("/tmp"), sp.cwd.as_deref());
+    }
+
+    // Extra (not in Zig): no resources dir falls back to xterm-256color.
+    #[test]
+    fn init_env_no_resources_dir() {
+        let sp = Subprocess::init(Config {
+            term: "xterm-ghostty".into(),
+            ..Config::default()
+        })
+        .unwrap();
+        let env = sp.env.as_ref().unwrap();
+        assert_eq!(Some("xterm-256color"), env.get("TERM").map(String::as_str));
+        assert_eq!(None, env.get("TERMINFO"));
+        assert_eq!(None, env.get("GHOSTTY_RESOURCES_DIR"));
+    }
+
+    // Extra (not in Zig): helpers.
+    #[test]
+    fn append_env_helpers() {
+        assert_eq!("b", append_env("", "b"));
+        assert_eq!(format!("a{PATH_DELIMITER}b"), append_env("a", "b"));
+        assert_eq!(format!("{PATH_DELIMITER}b"), append_env_always("", "b"));
+        assert_eq!(Some("/a"), dirname("/a/b"));
+        assert_eq!(Some("/a"), dirname("/a/b/"));
+        assert_eq!(Some("/"), dirname("/a"));
+        assert_eq!(None, dirname("a"));
+        assert_eq!(None, dirname("/"));
+        assert_eq!("`a`, `b c`", format_args_list(&["a".into(), "b c".into()]));
+    }
+
+    // Extra (not in Zig): the write pool hands out stable, reused items.
+    #[test]
+    fn memory_pool_reuse() {
+        let mut pool: MemoryPool<Write> = MemoryPool::default();
+        let a = pool.create();
+        let b = pool.create();
+        assert_ne!(a, b);
+        pool.destroy(a);
+        assert_eq!(a, pool.create());
+        pool.deinit();
+    }
+
+    // Extra (not in Zig): start a subprocess on a pty, resize it (clamping
+    // to u16) and stop it.
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_start_resize_stop() {
+        let mut sp =
+            Subprocess::init(testing::direct_config(&["/bin/sh", "-c", "sleep 10"])).unwrap();
+        sp.resize(
+            renderer::GridSize {
+                columns: 100,
+                rows: 40,
+            },
+            renderer::ScreenSize {
+                width: 1000,
+                height: 800,
+            },
+        )
+        .unwrap();
+        let fds = sp.start().unwrap();
+        assert_eq!(fds.read, fds.write);
+        assert!(sp.env.is_none());
+        assert!(matches!(sp.process, Some(Process::ForkExec(_))));
+        let size = sp.pty.as_ref().unwrap().get_size().unwrap();
+        assert_eq!(
+            (40, 100, 1000, 800),
+            (size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel)
+        );
+
+        sp.resize(
+            renderer::GridSize {
+                columns: 120,
+                rows: 50,
+            },
+            renderer::ScreenSize {
+                width: 100_000,
+                height: 900,
+            },
+        )
+        .unwrap();
+        let size = sp.pty.as_ref().unwrap().get_size().unwrap();
+        assert_eq!(
+            (50, 120, u16::MAX, 900),
+            (size.ws_row, size.ws_col, size.ws_xpixel, size.ws_ypixel)
+        );
+
+        assert!(matches!(
+            sp.get_process_info(ProcessInfo::ForegroundPid),
+            Some(ProcessInfoValue::ForegroundPid(_))
+        ));
+
+        // Stopping kills the process group and reaps the child.
+        sp.stop();
+        assert!(sp.process.is_none());
+        sp.deinit();
+    }
+
+    // Extra (not in Zig): a command that can't be started leaves no pty
+    // behind.
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_start_failure_cleans_up() {
+        let mut sp = Subprocess::init(testing::direct_config(&["/bin/s\0h"])).unwrap();
+        assert_eq!(Err(Error::InvalidArgument), sp.start().map(|_| ()));
+        assert!(sp.pty.is_none());
+        assert!(sp.process.is_none());
+        sp.deinit();
+    }
+
+    // Extra (not in Zig): run a command on a pty under the termio thread,
+    // read its output and observe its exit.
+    #[cfg(unix)]
+    #[test]
+    fn exec_reads_output_and_observes_exit() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            // The read thread stops at the pty hangup even if output is
+            // still buffered (like Zig), so give it time to read first.
+            "printf 'hello from the pty'; sleep 0.2; exit 3",
+        ]));
+        h.start();
+        h.wait_output("hello from the pty");
+        h.wait_message(|m| matches!(m, SurfaceMessage::ChildExited(e) if e.exit_code == 3));
+        h.stop();
+    }
+
+    // Extra (not in Zig): bulk output goes through the gather pipeline
+    // intact and in order.
+    #[cfg(unix)]
+    #[test]
+    fn exec_reads_bulk_output() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "i=0; while [ $i -lt 5000 ]; do echo \"line $i\"; i=$((i+1)); done; echo DONE; sleep 0.5",
+        ]));
+        h.start();
+        let out = h.wait_output("DONE");
+        let lines: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("line ")).collect();
+        assert_eq!(5000, lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            assert_eq!(format!("line {i}"), *l);
+        }
+        h.wait_message(|m| matches!(m, SurfaceMessage::ChildExited(e) if e.exit_code == 0));
+        h.stop();
+    }
+
+    // Extra (not in Zig): writes queued through the mailbox reach the child.
+    #[cfg(unix)]
+    #[test]
+    fn exec_queue_write() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "read line; echo \"got:$line\"; sleep 0.5",
+        ]));
+        h.start();
+        h.send(crate::termio::Message::write_req(b"abc\n"));
+        h.wait_output("got:abc");
+        h.wait_message(|m| matches!(m, SurfaceMessage::ChildExited(e) if e.exit_code == 0));
+
+        // Writes after the exit are dropped.
+        h.send(crate::termio::Message::write_req(b"ignored\n"));
+        h.stop();
+    }
+
+    // Extra (not in Zig): a write larger than one pooled buffer is chunked
+    // and arrives in order.
+    #[cfg(unix)]
+    #[test]
+    fn exec_queue_write_chunks() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "read line; echo \"len:${#line}:$line\"; sleep 0.5",
+        ]));
+        h.start();
+        let payload: String = (0..300).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        h.send(crate::termio::Message::write_req(format!("{payload}\n").as_bytes()));
+        h.wait_output(&format!("len:300:{payload}"));
+        h.stop();
+    }
+
+    // Extra (not in Zig): linefeed mode turns \r into \r\n.
+    #[cfg(unix)]
+    #[test]
+    fn exec_queue_write_linefeed() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "read a; read b; echo \"[$a|$b]\"; sleep 0.5",
+        ]));
+        h.start();
+        h.send(crate::termio::Message::LinefeedMode(true));
+        // With linefeed mode "1\r" is "1\r\n": two lines, "1" and "".
+        h.send(crate::termio::Message::write_req(b"1\r"));
+        h.wait_output("[1|]");
+        h.stop();
+    }
+
+    // Extra (not in Zig): the termios timer reports password input.
+    #[cfg(unix)]
+    #[test]
+    fn exec_password_input() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "stty -echo; echo off; sleep 1; stty echo; echo on; sleep 1",
+        ]));
+        h.start();
+        h.wait_message(|m| matches!(m, SurfaceMessage::PasswordInput(true)));
+        h.wait_message(|m| matches!(m, SurfaceMessage::PasswordInput(false)));
+        let inputs: Vec<bool> = h
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                SurfaceMessage::PasswordInput(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vec![true, false], inputs);
+        h.stop();
+    }
+
+    // Extra (not in Zig): stopping the thread while the child is still
+    // running kills it and joins the read thread.
+    #[cfg(unix)]
+    #[test]
+    fn exec_stop_running_child() {
+        let mut h = testing::Harness::new(testing::direct_config(&[
+            "/bin/sh",
+            "-c",
+            "echo ready; sleep 30",
+        ]));
+        h.start();
+        h.wait_output("ready");
+        let start = Instant::now();
+        h.stop();
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    // Extra (not in Zig): the standin shell features match the Zig order.
+    #[test]
+    fn shell_features() {
+        let mut env = EnvMap::new();
+        shell_integration::setup_features(&mut env, ShellIntegrationFeatures::default(), true);
+        assert_eq!(
+            Some("cursor:blink,path,title"),
+            env.get("GHOSTTY_SHELL_FEATURES").map(String::as_str)
+        );
+
+        let mut env = EnvMap::new();
+        let none = ShellIntegrationFeatures {
+            cursor: false,
+            sudo: false,
+            title: false,
+            ssh_env: false,
+            ssh_terminfo: false,
+            path: false,
+        };
+        shell_integration::setup_features(&mut env, none, true);
+        assert!(env.get("GHOSTTY_SHELL_FEATURES").is_none());
+    }
+}
