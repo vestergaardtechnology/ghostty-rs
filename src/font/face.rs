@@ -1,6 +1,6 @@
 //! Port of `src/font/face.zig`.
 //!
-//! STATUS: partial — only `Variation` (+ its tests) is ported; the `Face` alias, `DesiredSize`, etc. are missing.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "face/coretext.rs"]
@@ -10,6 +10,158 @@ pub mod freetype;
 #[path = "face/web_canvas.rs"]
 pub mod web_canvas;
 // @generated-mods-end
+
+/// Face implementation for the compile options.
+///
+/// Zig switches on `options.backend`; the backends are tied to the target
+/// here (see `crate::font::OPTIONS`): `freetype`, `freetype_windows`,
+/// `fontconfig_freetype` and `coretext_freetype` use [`freetype::Face`],
+/// the CoreText backends use `coretext::Face` and `web_canvas` uses
+/// `web_canvas::Face`.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
+pub type Face = freetype::Face;
+
+/// Face implementation for the compile options.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub type Face = coretext::Face;
+
+/// Face implementation for the compile options.
+#[cfg(target_arch = "wasm32")]
+pub type Face = web_canvas::Face;
+
+const _: () = {
+    // Keep the `Face` alias in sync with the configured backend.
+    let has_ft = crate::font::OPTIONS.backend.has_freetype();
+    let is_ft = cfg!(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")));
+    assert!(has_ft == is_ft);
+};
+
+/// If a DPI can't be calculated, this DPI is used. This is probably
+/// wrong on modern devices so it is highly recommended you get the DPI
+/// using whatever platform method you can.
+pub const DEFAULT_DPI: u16 = if cfg!(target_os = "macos") { 72 } else { 96 };
+
+/// These are the flags to customize how freetype loads fonts. This is
+/// only non-void if the freetype backend is enabled.
+///
+/// NOTE: in Zig this is `void` when the backend has no FreeType; the
+/// (tiny) struct is always available here so that options can be built
+/// uniformly. Only the FreeType face reads it.
+pub type FreetypeLoadFlags = config::FreetypeLoadFlags;
+
+pub const FREETYPE_LOAD_FLAGS_DEFAULT: FreetypeLoadFlags = FreetypeLoadFlags::DEFAULT;
+
+/// Minimal stand-in for the parts of `src/config/Config.zig` used here.
+// TODO(port-dedupe): replace with crate::config::FreetypeLoadFlags once
+// src/config/config.rs is ported.
+pub mod config {
+    /// See freetype-load-flag
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct FreetypeLoadFlags {
+        // The defaults here at the time of writing this match the defaults
+        // for Freetype itself. Ghostty hasn't made any opinionated changes
+        // to these defaults. (Strictly speaking, `light` isn't FreeType's
+        // own default, but appears to be the effective default with most
+        // Fontconfig-aware software using FreeType, so until Ghostty
+        // implements Fontconfig support we default to `light`.)
+        pub hinting: bool,
+        pub force_autohint: bool,
+        pub monochrome: bool,
+        pub autohint: bool,
+        pub light: bool,
+    }
+
+    impl FreetypeLoadFlags {
+        pub const DEFAULT: FreetypeLoadFlags = FreetypeLoadFlags {
+            hinting: true,
+            force_autohint: false,
+            monochrome: false,
+            autohint: true,
+            light: true,
+        };
+    }
+
+    impl Default for FreetypeLoadFlags {
+        fn default() -> Self {
+            Self::DEFAULT
+        }
+    }
+}
+
+/// Error returned by the faces' `name` functions (Zig `Allocator.Error`):
+/// the name had to be copied into the caller's buffer and didn't fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameError {
+    OutOfMemory,
+}
+
+impl std::fmt::Display for NameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OutOfMemory")
+    }
+}
+
+impl std::error::Error for NameError {}
+
+/// Options for initializing a font face.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Options {
+    pub size: DesiredSize,
+    pub freetype_load_flags: FreetypeLoadFlags,
+}
+
+impl Options {
+    /// Options with the given size and default values for everything
+    /// else (Zig `.{ .size = size }`).
+    pub const fn new(size: DesiredSize) -> Options {
+        Options {
+            size,
+            freetype_load_flags: FREETYPE_LOAD_FLAGS_DEFAULT,
+        }
+    }
+}
+
+impl From<DesiredSize> for Options {
+    fn from(size: DesiredSize) -> Options {
+        Options::new(size)
+    }
+}
+
+/// The desired size for loading a font.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "gtk", derive(glib::Boxed))]
+#[cfg_attr(feature = "gtk", boxed_type(name = "GhosttyFontDesiredSize"))]
+pub struct DesiredSize {
+    // Desired size in points
+    pub points: f32,
+
+    // The DPI of the screen so we can convert points to pixels.
+    pub xdpi: u16,
+    pub ydpi: u16,
+}
+
+impl DesiredSize {
+    /// A size in points at the default DPI (Zig `.{ .points = points }`).
+    pub const fn new(points: f32) -> DesiredSize {
+        DesiredSize {
+            points,
+            xdpi: DEFAULT_DPI,
+            ydpi: DEFAULT_DPI,
+        }
+    }
+
+    // Converts points to pixels
+    pub fn pixels(self) -> f32 {
+        // 1 point = 1/72 inch
+        (self.points * self.ydpi as f32) / 72.0
+    }
+
+    /// Make this a valid gobject if we're in a GTK environment.
+    #[cfg(feature = "gtk")]
+    pub fn get_gobject_type() -> glib::Type {
+        <DesiredSize as glib::prelude::StaticType>::static_type()
+    }
+}
 
 /// A font variation setting. The best documentation for this I know of
 /// is actually the CSS font-variation-settings property on MDN:
@@ -84,5 +236,19 @@ mod tests {
         assert_eq!(1936486004u32, id.to_bits());
         assert_eq!(b"slnt", &id.str());
         assert_eq!(id, VariationId::from_bits(1936486004));
+    }
+
+    #[test]
+    fn desired_size_pixels() {
+        // Not in the Zig source; checks the default DPI and conversion.
+        let size = DesiredSize::new(12.0);
+        assert_eq!(DEFAULT_DPI, size.xdpi);
+        assert_eq!(DEFAULT_DPI, size.ydpi);
+        let size = DesiredSize {
+            points: 12.0,
+            xdpi: 96,
+            ydpi: 96,
+        };
+        assert_eq!(16.0, size.pixels());
     }
 }

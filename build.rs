@@ -4,6 +4,18 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     pkg_c_libraries();
+    stb();
+}
+
+/// The vendored nothings/stb headers (`src/stb`), compiled from
+/// `src/stb/stb.c` as `src/build/SharedDeps.zig` does.
+fn stb() {
+    println!("cargo:rerun-if-changed=src/stb");
+    cc::Build::new()
+        .include("src/stb")
+        .file("src/stb/stb.c")
+        .warnings(false)
+        .compile("stb");
 }
 
 /// C libraries wrapped by `pkg/` (freetype, harfbuzz, fontconfig, oniguruma,
