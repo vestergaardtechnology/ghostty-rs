@@ -1,6 +1,6 @@
 //! Port of `src/terminal/PageList.zig`.
 //!
-//! STATUS: partial — implementation ported; tests being ported.
+//! STATUS: ported
 //!
 //! Maintains a linked list of pages to make up a terminal screen
 //! and provides higher level operations on top of those pages to
@@ -18166,5 +18166,925 @@ mod tests {
 
         // Verify the marker survived the clone.
         assert_eq!('X' as u32, cell_at(pg(first(&s2)), 1, 2).content_codepoint());
+    }
+
+    #[test]
+    fn page_list_compact_oversized_page() {
+        let mut s = init(80, 24);
+
+        // Grow until we have multiple pages
+        let page1_node = first(&s);
+        pg(page1_node).pause_integrity_checks(true);
+        for _ in 0..(n(page1_node).capacity().rows - n(page1_node).rows()) {
+            s.grow().unwrap();
+        }
+        pg(page1_node).pause_integrity_checks(false);
+        s.grow().unwrap();
+        assert!(s.pages.first != s.pages.last);
+
+        let mut node = first(&s);
+
+        // Write content to verify it's preserved
+        {
+            let page = pg(node);
+            for y in 0..page.size.rows as usize {
+                for x in 0..s.cols as usize {
+                    *cell_at(page, x, y) = cpu((x + y * s.cols as usize) as u32);
+                }
+            }
+        }
+
+        // Create a tracked pin on this page
+        let tracked = s.track_pin(pin_at(node, 5, 10)).unwrap();
+
+        // Make the page oversized
+        while pg(node).memory.len() <= std_size() {
+            node = s.increase_capacity(node, Some(IncreaseCapacity::GraphemeBytes)).unwrap();
+        }
+        assert!(pg(node).memory.len() > std_size());
+        let oversized_len = pg(node).memory.len();
+        let original_size = pg(node).size;
+        let second_node = next(node);
+
+        // Set dirty flag after increaseCapacity
+        pg(node).dirty = true;
+
+        // Compact the page
+        let new_node = s.compact(node).unwrap();
+        assert!(new_node.is_some());
+        let new_node = new_node.unwrap();
+
+        // Verify memory is smaller
+        assert!(pg(new_node).memory.len() < oversized_len);
+
+        // Verify size preserved
+        assert_eq!(original_size.rows, n(new_node).rows());
+        assert_eq!(original_size.cols, n(new_node).cols());
+
+        // Verify dirty flag preserved
+        assert!(pg(new_node).dirty);
+
+        // Verify linked list integrity
+        assert_eq!(new_node, first(&s));
+        assert_eq!(None, n(new_node).prev);
+        assert_eq!(Some(second_node), n(new_node).next);
+        assert_eq!(Some(new_node), n(second_node).prev);
+
+        // Verify pin updated correctly
+        assert_eq!(new_node, tp(tracked).node);
+        assert_eq!(5, tp(tracked).x);
+        assert_eq!(10, tp(tracked).y);
+
+        // Verify content preserved
+        let page = pg(new_node);
+        for y in 0..page.size.rows as usize {
+            for x in 0..s.cols as usize {
+                assert_eq!((x + y * s.cols as usize) as u32, cell_at(page, x, y).content_codepoint());
+            }
+        }
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_destroyed_pool_page_reuse_is_zeroed() {
+        let mut s = init(80, 24);
+
+        // Create a page and scribble over its entire backing memory,
+        // then destroy it so the buffer returns to the pool free list.
+        let node = s.create_page(CreatePage::cap(initial_capacity(80))).unwrap();
+        pg(node).size.rows = 1;
+        let mem_ptr = pg(node).memory.ptr();
+        mem(pg(node)).fill(0xAA);
+        s.destroy_node(node);
+
+        // Reusing the buffer must produce a fully valid, zeroed page.
+        let node2 = s.create_page(CreatePage::cap(initial_capacity(80))).unwrap();
+        assert_eq!(mem_ptr, pg(node2).memory.ptr());
+        pg(node2).size.rows = n(node2).capacity().rows;
+
+        let cells_len = n(node2).capacity().cols as usize * n(node2).capacity().rows as usize;
+        let page = pg(node2);
+        let cells = unsafe { core::slice::from_raw_parts(page.cells.ptr(page.memory), cells_len) };
+        assert!(cells.iter().all(|c| c.to_bits() == 0));
+        page.assert_integrity();
+        s.destroy_node(node2);
+    }
+
+    #[test]
+    fn page_list_increase_capacity_from_zero_capacity_dimensions() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Compact the only page. A plain page has no styled, grapheme,
+        // or hyperlink content so the exact capacity is zero in every
+        // managed dimension.
+        let mut node = s.compact(first(&s)).unwrap().unwrap();
+        assert_eq!(0, n(node).capacity().styles);
+        assert_eq!(0, n(node).capacity().grapheme_bytes);
+        assert_eq!(0, n(node).capacity().string_bytes);
+        assert_eq!(0, n(node).capacity().hyperlink_bytes);
+
+        // Increasing each dimension from zero must actually grow it.
+        // Regression: 0 * 2 == 0 used to "succeed" without growing,
+        // which turned caller retry loops into infinite loops.
+        node = s.increase_capacity(node, Some(IncreaseCapacity::Styles)).unwrap();
+        assert!(n(node).capacity().styles > 0);
+        node = s.increase_capacity(node, Some(IncreaseCapacity::GraphemeBytes)).unwrap();
+        assert!(n(node).capacity().grapheme_bytes > 0);
+        node = s.increase_capacity(node, Some(IncreaseCapacity::StringBytes)).unwrap();
+        assert!(n(node).capacity().string_bytes > 0);
+        node = s.increase_capacity(node, Some(IncreaseCapacity::HyperlinkBytes)).unwrap();
+        assert!(n(node).capacity().hyperlink_bytes > 0);
+
+        // Increasing a non-zero dimension still doubles.
+        let styles = n(node).capacity().styles;
+        node = s.increase_capacity(node, Some(IncreaseCapacity::Styles)).unwrap();
+        assert_eq!(styles * 2, n(node).capacity().styles);
+    }
+
+    #[test]
+    fn page_list_compact_after_increase_capacity() {
+        let mut s = init_opts(Options {
+            cols: 80,
+            rows: 24,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let mut node = first(&s);
+
+        // Grow the page capacity. The content is unchanged, so compaction
+        // should always shrink it back down to an exact-size heap page.
+        node = s.increase_capacity(node, Some(IncreaseCapacity::GraphemeBytes)).unwrap();
+        let grown_len = pg(node).memory.len();
+
+        let new_node = s.compact(node).unwrap().unwrap();
+        assert_eq!(Owned::Heap, n(new_node).owned);
+        assert!(pg(new_node).memory.len() < grown_len);
+        assert!(pg(new_node).memory.len() < std_size());
+    }
+
+    fn split_list() -> PageList {
+        init_opts(Options {
+            cols: 10,
+            rows: 10,
+            max_size: Some(0),
+            ..Default::default()
+        })
+    }
+
+    /// Row y gets codepoint y at x = 0.
+    fn mark_rows(page: &Page) {
+        for y in 0..page.size.rows as usize {
+            *cell_at(page, 0, y) = cpu(y as u32);
+        }
+    }
+
+    #[test]
+    fn page_list_split_at_middle_row() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Write content to rows: row 0 gets codepoint 0, row 1 gets 1, etc.
+        mark_rows(page);
+
+        // Split at row 5 (middle)
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        // Verify two pages exist
+        assert!(s.pages.first.is_some());
+        assert!(n(first(&s)).next.is_some());
+
+        let first_page = pg(first(&s));
+        let second_page = pg(next(first(&s)));
+
+        // First page should have rows 0-4 (5 rows)
+        assert_eq!(5, first_page.size.rows);
+        // Second page should have rows 5-9 (5 rows)
+        assert_eq!(5, second_page.size.rows);
+
+        // Verify content in first page is preserved (rows 0-4 have codepoints 0-4)
+        for y in 0..5 {
+            assert_eq!(y as u32, cell_at(first_page, 0, y).content_codepoint());
+        }
+
+        // Verify content in second page (original rows 5-9, now at y=0-4)
+        for y in 0..5 {
+            assert_eq!(y as u32 + 5, cell_at(second_page, 0, y).content_codepoint());
+        }
+    }
+
+    #[test]
+    fn page_list_split_at_row_0_is_no_op() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Write content to all rows
+        mark_rows(page);
+
+        // Split at row 0 should be a no-op
+        s.split(pin_at(first(&s), 0, 0)).unwrap();
+
+        // Verify only one page exists (no split occurred)
+        assert!(s.pages.first.is_some());
+        assert!(n(first(&s)).next.is_none());
+
+        // Verify all content is still in the original page
+        assert_eq!(10, page.size.rows);
+        for y in 0..10 {
+            assert_eq!(y as u32, cell_at(page, 0, y).content_codepoint());
+        }
+    }
+
+    #[test]
+    fn page_list_split_at_last_row() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Write content to all rows
+        mark_rows(page);
+
+        // Split at last row (row 9)
+        s.split(pin_at(first(&s), 0, 9)).unwrap();
+
+        // Verify two pages exist
+        assert!(s.pages.first.is_some());
+        assert!(n(first(&s)).next.is_some());
+
+        let first_page = pg(first(&s));
+        let second_page = pg(next(first(&s)));
+
+        // First page should have 9 rows
+        assert_eq!(9, first_page.size.rows);
+        // Second page should have 1 row
+        assert_eq!(1, second_page.size.rows);
+
+        // Verify content in second page (original row 9, now at y=0)
+        assert_eq!(9, cell_at(second_page, 0, 0).content_codepoint());
+    }
+
+    #[test]
+    fn page_list_split_single_row_page_returns_out_of_space() {
+        // Initialize with 1 row
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 1,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        let result = s.split(pin_at(first(&s), 0, 0));
+
+        assert_eq!(Err(SplitError::OutOfSpace), result);
+    }
+
+    #[test]
+    fn page_list_split_moves_tracked_pins() {
+        let mut s = split_list();
+
+        // Track a pin at row 7
+        let tracked = s.track_pin(pin_at(first(&s), 3, 7)).unwrap();
+
+        // Split at row 5
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        // The tracked pin should now be in the second page
+        assert!(tp(tracked).node == next(first(&s)));
+        // y should be adjusted: was 7, split at 5, so new y = 7 - 5 = 2
+        assert_eq!(2, tp(tracked).y);
+        // x should remain unchanged
+        assert_eq!(3, tp(tracked).x);
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_split_tracked_pin_before_split_point_unchanged() {
+        let mut s = split_list();
+
+        let original_node = first(&s);
+
+        // Track a pin at row 2 (before the split point)
+        let tracked = s.track_pin(pin_at(original_node, 5, 2)).unwrap();
+
+        // Split at row 5
+        s.split(pin_at(original_node, 0, 5)).unwrap();
+
+        // The tracked pin should remain in the original page
+        assert!(tp(tracked).node == first(&s));
+        // y and x should be unchanged
+        assert_eq!(2, tp(tracked).y);
+        assert_eq!(5, tp(tracked).x);
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_split_tracked_pin_at_split_point_moves_to_new_page() {
+        let mut s = split_list();
+
+        let original_node = first(&s);
+
+        // Track a pin at the exact split point (row 5)
+        let tracked = s.track_pin(pin_at(original_node, 4, 5)).unwrap();
+
+        // Split at row 5
+        s.split(pin_at(original_node, 0, 5)).unwrap();
+
+        // The tracked pin should be in the new page
+        assert!(tp(tracked).node == next(first(&s)));
+        // y should be 0 since it was at the split point: 5 - 5 = 0
+        assert_eq!(0, tp(tracked).y);
+        // x should remain unchanged
+        assert_eq!(4, tp(tracked).x);
+
+        s.untrack_pin(tracked);
+    }
+
+    #[test]
+    fn page_list_split_multiple_tracked_pins_across_regions() {
+        let mut s = split_list();
+
+        let original_node = first(&s);
+
+        // Track multiple pins in different regions
+        let pin_before = s.track_pin(pin_at(original_node, 0, 1)).unwrap();
+        let pin_at_split = s.track_pin(pin_at(original_node, 2, 5)).unwrap();
+        let pin_after1 = s.track_pin(pin_at(original_node, 3, 7)).unwrap();
+        let pin_after2 = s.track_pin(pin_at(original_node, 8, 9)).unwrap();
+
+        // Split at row 5
+        s.split(pin_at(original_node, 0, 5)).unwrap();
+
+        let first_page = first(&s);
+        let second_page = next(first_page);
+
+        // Pin before split point stays in original page
+        assert!(tp(pin_before).node == first_page);
+        assert_eq!(1, tp(pin_before).y);
+        assert_eq!(0, tp(pin_before).x);
+
+        // Pin at split point moves to new page with y=0
+        assert!(tp(pin_at_split).node == second_page);
+        assert_eq!(0, tp(pin_at_split).y);
+        assert_eq!(2, tp(pin_at_split).x);
+
+        // Pins after split point move to new page with adjusted y
+        assert!(tp(pin_after1).node == second_page);
+        assert_eq!(2, tp(pin_after1).y); // 7 - 5 = 2
+        assert_eq!(3, tp(pin_after1).x);
+
+        assert!(tp(pin_after2).node == second_page);
+        assert_eq!(4, tp(pin_after2).y); // 9 - 5 = 4
+        assert_eq!(8, tp(pin_after2).x);
+
+        s.untrack_pin(pin_after2);
+        s.untrack_pin(pin_after1);
+        s.untrack_pin(pin_at_split);
+        s.untrack_pin(pin_before);
+    }
+
+    #[test]
+    fn page_list_split_tracked_viewport_pin_in_split_region_moves_correctly() {
+        let mut s = split_list();
+
+        let original_node = first(&s);
+
+        // Set viewport_pin to row 7 (after split point)
+        tp(s.viewport_pin).node = original_node;
+        tp(s.viewport_pin).y = 7;
+        tp(s.viewport_pin).x = 6;
+
+        // Split at row 5
+        s.split(pin_at(original_node, 0, 5)).unwrap();
+
+        // viewport_pin should be in the new page
+        assert!(vp(&s).node == next(first(&s)));
+        // y should be adjusted: 7 - 5 = 2
+        assert_eq!(2, vp(&s).y);
+        // x should remain unchanged
+        assert_eq!(6, vp(&s).x);
+    }
+
+    #[test]
+    fn page_list_split_middle_page_preserves_linked_list_order() {
+        // Create a single page with 12 rows
+        let mut s = init_opts(Options {
+            cols: 10,
+            rows: 12,
+            max_size: Some(0),
+            ..Default::default()
+        });
+
+        // Split at row 4 to create: page1 (rows 0-3), page2 (rows 4-11)
+        let first_node = first(&s);
+        s.split(pin_at(first_node, 0, 4)).unwrap();
+
+        // Now we have 2 pages
+        let page1 = first(&s);
+        let page2 = next(first(&s));
+        assert_eq!(4, n(page1).rows());
+        assert_eq!(8, n(page2).rows());
+
+        // Split page2 at row 4 to create: page1 -> page2 (rows 0-3) -> page3 (rows 4-7)
+        s.split(pin_at(page2, 0, 4)).unwrap();
+
+        // Now we have 3 pages
+        let first_n = first(&s);
+        let middle = next(first_n);
+        let last_n = next(middle);
+
+        // Verify linked list order: first -> middle -> last
+        assert_eq!(page1, first_n);
+        assert_eq!(page2, middle);
+        assert_eq!(last(&s), last_n);
+
+        // Verify prev pointers
+        assert!(n(first_n).prev.is_none());
+        assert_eq!(first_n, prev(middle));
+        assert_eq!(middle, prev(last_n));
+
+        // Verify next pointers
+        assert_eq!(middle, next(first_n));
+        assert_eq!(last_n, next(middle));
+        assert!(n(last_n).next.is_none());
+
+        // Verify row counts
+        assert_eq!(4, n(first_n).rows());
+        assert_eq!(4, n(middle).rows());
+        assert_eq!(4, n(last_n).rows());
+    }
+
+    #[test]
+    fn page_list_split_last_page_makes_new_page_the_last() {
+        // Create a single page with 10 rows
+        let mut s = split_list();
+
+        // Split to create 2 pages first
+        let first_node = first(&s);
+        s.split(pin_at(first_node, 0, 5)).unwrap();
+
+        // Now split the last page
+        let last_before_split = last(&s);
+        assert_eq!(5, n(last_before_split).rows());
+
+        s.split(pin_at(last_before_split, 0, 2)).unwrap();
+
+        // The new page should be the new last
+        let new_last = last(&s);
+        assert!(new_last != last_before_split);
+        assert_eq!(last_before_split, prev(new_last));
+        assert!(n(new_last).next.is_none());
+
+        // Verify row counts: original last has 2 rows, new last has 3 rows
+        assert_eq!(2, n(last_before_split).rows());
+        assert_eq!(3, n(new_last).rows());
+    }
+
+    #[test]
+    fn page_list_split_first_page_keeps_original_as_first() {
+        // Create 2 pages by splitting
+        let mut s = split_list();
+
+        let original_first = first(&s);
+        s.split(pin_at(original_first, 0, 5)).unwrap();
+
+        // Get second page (created by first split)
+        let second_page = next(first(&s));
+
+        // Now split the first page again
+        s.split(pin_at(first(&s), 0, 2)).unwrap();
+
+        // Original first should still be first
+        assert_eq!(original_first, first(&s));
+        assert!(n(first(&s)).prev.is_none());
+
+        // New page should be inserted between first and second
+        let inserted = next(first(&s));
+        assert!(inserted != second_page);
+        assert_eq!(second_page, next(inserted));
+
+        // Verify row counts: first has 2, inserted has 3, second has 5
+        assert_eq!(2, n(first(&s)).rows());
+        assert_eq!(3, n(inserted).rows());
+        assert_eq!(5, n(second_page).rows());
+    }
+
+    #[test]
+    fn page_list_split_preserves_wrap_flags() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Set wrap flags on rows that will be in the second page after split
+        // Row 5: wrap = true (this is the start of a wrapped line)
+        // Row 6: wrap_continuation = true (this continues the wrap)
+        // Row 7: wrap = true, wrap_continuation = true (wrapped and continues)
+        set_wrap(page, 5);
+        set_wrap_cont(page, 6);
+        set_wrap(page, 7);
+        set_wrap_cont(page, 7);
+
+        // Split at row 5
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        let second_page = pg(next(first(&s)));
+
+        // Verify wrap flags are preserved in new page
+        // Original row 5 is now row 0 in second page
+        assert!(row_at(second_page, 0).wrap());
+        assert!(!row_at(second_page, 0).wrap_continuation());
+
+        // Original row 6 is now row 1 in second page
+        assert!(!row_at(second_page, 1).wrap());
+        assert!(row_at(second_page, 1).wrap_continuation());
+
+        // Original row 7 is now row 2 in second page
+        assert!(row_at(second_page, 2).wrap());
+        assert!(row_at(second_page, 2).wrap_continuation());
+    }
+
+    #[test]
+    fn page_list_split_preserves_styled_cells() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Create a style and apply it to cells in rows 5-7 (which will be in the second page)
+        let mut style = stylepkg::Style::default();
+        style.flags.bold = true;
+        let style_id = unsafe { page.styles.add(page.memory, style) }.unwrap();
+
+        for y in 5..8 {
+            let (row, cell) = rac(page, 0, y);
+            let mut c = cp('S');
+            c.set_style_id(style_id);
+            *cell = c;
+            row.set_styled(true);
+            unsafe { page.styles.use_(page.memory, style_id) };
+        }
+        // Release the extra ref from add
+        unsafe { page.styles.release(page.memory, style_id) };
+
+        // Split at row 5
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        let first_page = pg(first(&s));
+        let second_page = pg(next(first(&s)));
+
+        // First page should have no styles (all styled rows moved to second page)
+        assert_eq!(0, first_page.styles.count());
+
+        // Second page should have exactly 1 style (the bold style, used by 3 cells)
+        assert_eq!(1, second_page.styles.count());
+
+        // Verify styled cells are preserved in new page
+        for y in 0..3 {
+            let (row, cell) = rac(second_page, 0, y);
+            assert_eq!('S' as u32, cell.content_codepoint());
+            assert!(cell.style_id() != 0);
+
+            let got_style = unsafe { &*second_page.styles.get(second_page.memory, cell.style_id()) };
+            assert!(got_style.flags.bold);
+            assert!(row.styled());
+        }
+    }
+
+    #[test]
+    fn page_list_split_preserves_grapheme_clusters() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Add a grapheme cluster to row 6 (will be row 1 in second page after split at 5)
+        {
+            let (row, cell) = rac(page, 0, 6);
+            *cell = cpu(0x1F468); // Man emoji
+            page.set_graphemes(
+                row,
+                cell,
+                &[
+                    0x200D,  // ZWJ
+                    0x1F469, // Woman emoji
+                ],
+            )
+            .unwrap();
+        }
+
+        // Split at row 5
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        let first_page = pg(first(&s));
+        let second_page = pg(next(first(&s)));
+
+        // First page should have no graphemes (the grapheme row moved to second page)
+        assert_eq!(0, first_page.grapheme_count());
+
+        // Second page should have exactly 1 grapheme
+        assert_eq!(1, second_page.grapheme_count());
+
+        // Verify grapheme is preserved in new page (original row 6 is now row 1)
+        {
+            let (row, cell) = rac(second_page, 0, 1);
+            assert_eq!(0x1F468, cell.content_codepoint());
+            assert!(row.grapheme());
+
+            let cps = second_page.lookup_grapheme(cell).unwrap();
+            assert_eq!(2, cps.len());
+            assert_eq!(0x200D, cps[0]);
+            assert_eq!(0x1F469, cps[1]);
+        }
+    }
+
+    #[test]
+    fn page_list_split_preserves_hyperlinks() {
+        let mut s = split_list();
+
+        let page = pg(first(&s));
+
+        // Add a hyperlink to row 7 (will be row 2 in second page after split at 5)
+        let hyperlink_id = page
+            .insert_hyperlink(&hl_link(hyperlink::HyperlinkId::Implicit(0), b"https://example.com"))
+            .unwrap();
+        {
+            let (row, cell) = rac(page, 0, 7);
+            *cell = cp('L');
+            page.set_hyperlink(row, cell, hyperlink_id).unwrap();
+        }
+
+        // Split at row 5
+        s.split(pin_at(first(&s), 0, 5)).unwrap();
+
+        let first_page = pg(first(&s));
+        let second_page = pg(next(first(&s)));
+
+        // First page should have no hyperlinks (the hyperlink row moved to second page)
+        assert_eq!(0, first_page.hyperlink_set.count());
+
+        // Second page should have exactly 1 hyperlink
+        assert_eq!(1, second_page.hyperlink_set.count());
+
+        // Verify hyperlink is preserved in new page (original row 7 is now row 2)
+        {
+            let cell = cell_at(second_page, 0, 2);
+            assert_eq!('L' as u32, cell.content_codepoint());
+            assert!(cell.hyperlink());
+
+            let link_id = second_page.lookup_hyperlink(cell).unwrap();
+            let link = unsafe { &*second_page.hyperlink_set.get(second_page.memory, link_id) };
+            assert_eq!(b"https://example.com", unsafe { link.uri.slice(second_page.memory) });
+        }
+    }
+
+    fn mark_row_metadata(row: &mut Row) {
+        row.set_wrap(true);
+        row.set_wrap_continuation(true);
+        row.set_semantic_prompt(SemanticPrompt::Prompt);
+    }
+
+    fn assert_default_row(row: &Row) {
+        assert!(!row.wrap());
+        assert!(!row.wrap_continuation());
+        assert_eq!(SemanticPrompt::None, row.semantic_prompt());
+    }
+
+    fn list_row<'a>(c: &Cell) -> &'a mut Row {
+        unsafe { &mut *c.row }
+    }
+
+    #[test]
+    fn page_list_erase_row_recycled_row_has_default_metadata() {
+        let mut s = init(5, 3);
+
+        // Simulate the top row being part of a soft-wrapped, prompt-marked
+        // line. Erasing it recycles its Row storage as the new blank
+        // bottom row, which must not retain any of this metadata.
+        mark_row_metadata(list_row(&s.get_cell(pt_active(0, 0)).unwrap()));
+
+        s.erase_row(pt_active(0, 0));
+
+        assert_default_row(list_row(&s.get_cell(pt_active(0, 2)).unwrap()));
+    }
+
+    #[test]
+    fn page_list_erase_row_bounded_recycled_row_has_default_metadata() {
+        // A limit smaller than the remaining rows in the page exercises
+        // the bounded-rotate branch; a larger limit exercises the fallback
+        // branch that clears the final row after a full rotation.
+        for limit in [1usize, 10] {
+            let mut s = init(5, 3);
+
+            mark_row_metadata(list_row(&s.get_cell(pt_active(0, 0)).unwrap()));
+
+            s.erase_row_bounded(pt_active(0, 0), limit);
+
+            let recycled_y = limit.min(2);
+            assert_default_row(list_row(&s.get_cell(pt_active(0, recycled_y as u32)).unwrap()));
+        }
+    }
+
+    #[test]
+    fn page_list_erase_active_regrown_rows_have_default_metadata() {
+        let mut s = init(5, 3);
+
+        // Mark the rows that will be erased. eraseActive retires their
+        // storage into unused page capacity and then regrows the active
+        // area, re-exposing the same Row storage via the grow() fast path.
+        for y in 0..2 {
+            mark_row_metadata(list_row(&s.get_cell(pt_active(0, y)).unwrap()));
+        }
+
+        s.erase_active(1);
+
+        for y in 0..3 {
+            assert_default_row(list_row(&s.get_cell(pt_active(0, y)).unwrap()));
+        }
+    }
+
+    fn bg_palette_cell(idx: u8) -> PCell {
+        let mut c = PCell::default();
+        c.set_content_tag(ContentTag::BgColorPalette);
+        c.set_content_color_palette(idx);
+        c
+    }
+
+    #[test]
+    fn page_list_split_retired_rows_have_default_state() {
+        let mut s = init(5, 10);
+
+        // Put metadata and a background-colored (non-zero, but text-free)
+        // cell on a row that the split will move to the new page. The
+        // retired Row storage on the source page goes back into unused
+        // capacity that grow() re-exposes without clearing.
+        {
+            let c = s.get_cell(pt_active(0, 7)).unwrap();
+            let row = list_row(&c);
+            row.set_wrap(true);
+            row.set_semantic_prompt(SemanticPrompt::Prompt);
+            unsafe { *c.cell = bg_palette_cell(42) };
+        }
+
+        let node = first(&s);
+        s.split(s.pin(pt_active(0, 5)).unwrap()).unwrap();
+
+        // The source page was truncated to 5 rows; peek at the retired
+        // storage beyond size.rows.
+        let page = pg(node);
+        assert_eq!(5, page.size.rows);
+        let rows = page.rows.ptr(page.memory);
+        for y in 5..10 {
+            let row = unsafe { *rows.add(y) };
+            assert!(!row.wrap());
+            assert!(!row.wrap_continuation());
+            assert_eq!(SemanticPrompt::None, row.semantic_prompt());
+            let cells = unsafe { core::slice::from_raw_parts(row.cells().ptr(page.memory), page.size.cols as usize) };
+            for cell in cells {
+                assert!(cell.is_zero());
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_resize_trimmed_rows_have_default_state() {
+        let mut s = init(5, 5);
+
+        // A trailing blank row has no text, so shrinking rows trims it,
+        // but it can still carry metadata (e.g. a blank prompt
+        // continuation line) and background-colored cells. Trimming
+        // retires the storage into unused capacity that grow()
+        // re-exposes without clearing.
+        {
+            let c = s.get_cell(pt_active(0, 4)).unwrap();
+            let row = list_row(&c);
+            row.set_wrap_continuation(true);
+            row.set_semantic_prompt(SemanticPrompt::PromptContinuation);
+            unsafe { *c.cell = bg_palette_cell(42) };
+        }
+
+        s.resize(no_reflow(None, Some(4))).unwrap();
+        s.resize(no_reflow(None, Some(5))).unwrap();
+
+        {
+            let c = s.get_cell(pt_active(0, 4)).unwrap();
+            assert_default_row(list_row(&c));
+            assert!(unsafe { (*c.cell).is_zero() });
+        }
+    }
+
+    /// Stand-in for Zig's `std.heap.FixedBufferAllocator`: a bump allocator
+    /// over a fixed backing buffer that never frees.
+    struct FixedBufferAllocator {
+        base: *mut u8,
+        len: usize,
+        end_index: std::sync::atomic::AtomicUsize,
+    }
+
+    // SAFETY: test-only; the atomic index makes concurrent use sound.
+    unsafe impl Sync for FixedBufferAllocator {}
+
+    unsafe impl GlobalAlloc for FixedBufferAllocator {
+        unsafe fn alloc(&self, layout: AllocLayout) -> *mut u8 {
+            use std::sync::atomic::Ordering;
+            let start = self.end_index.load(Ordering::Relaxed);
+            let aligned = (self.base as usize + start).next_multiple_of(layout.align()) - self.base as usize;
+            if aligned + layout.size() > self.len {
+                return core::ptr::null_mut();
+            }
+            self.end_index.store(aligned + layout.size(), Ordering::Relaxed);
+            unsafe { self.base.add(aligned) }
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: AllocLayout) {}
+    }
+
+    #[test]
+    fn page_list_memory_pool_never_touches_idle_page_memory() {
+        let preheat = PAGE_PREHEAT;
+
+        // Back the page allocator with memory we can inspect.
+        let backing = AlignedBuf::new(preheat * std_size());
+        let backing_mem = backing.memory();
+        let fba: &'static FixedBufferAllocator = Box::leak(Box::new(FixedBufferAllocator {
+            base: backing_mem.ptr(),
+            len: backing_mem.len(),
+            end_index: std::sync::atomic::AtomicUsize::new(0),
+        }));
+
+        let mut pool = MemoryPool::init(Allocator::GLOBAL, Allocator::new(fba), preheat).unwrap();
+
+        // Preheat allocated exactly the items.
+        let end_index = || fba.end_index.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(preheat * std_size(), end_index());
+
+        // Lay the sentinel down after preheat. The sentinel must differ
+        // from Zig's 0xAA undefined pattern so that any write is visible.
+        let sentinel: u8 = 0x5A;
+        mem_of(backing_mem).fill(sentinel);
+
+        // Every preheated item is handed out untouched and without going
+        // back to the page allocator, and destroying it doesn't touch it.
+        let mut items: Vec<PagePoolItemPtr> = Vec::new();
+        for _ in 0..preheat {
+            let item = pool.pages.create().unwrap();
+            assert_eq!(preheat * std_size(), end_index());
+            assert!(unsafe { pool_item(item) }.iter().all(|&b| b == sentinel));
+            items.push(item);
+        }
+        for item in items {
+            pool.pages.destroy(item);
+        }
+        assert!(mem_of(backing_mem).iter().all(|&b| b == sentinel));
+
+        drop(pool);
+        drop(backing);
+    }
+
+    fn mem_of<'a>(m: PageMemory) -> &'a mut [u8] {
+        unsafe { m.as_mut_slice() }
+    }
+
+    #[test]
+    fn page_list_memory_pool_fast_path_does_not_allocate() {
+        let counting = FailingAllocator::leak(usize::MAX);
+
+        let mut pool = MemoryPool::init(Allocator::GLOBAL, counting.allocator(), PAGE_PREHEAT).unwrap();
+        assert_eq!(PAGE_PREHEAT, counting.allocations());
+
+        // Cycle a few thousand pages through the preheated items. As long
+        // as no more than the preheat are live at once, create is a
+        // free-list pop and never touches the page allocator.
+        let mut items: Vec<PagePoolItemPtr> = Vec::with_capacity(PAGE_PREHEAT + 2);
+        for _ in 0..1024 {
+            for _ in 0..PAGE_PREHEAT {
+                items.push(pool.pages.create().unwrap());
+            }
+            for item in items.drain(..) {
+                pool.pages.destroy(item);
+            }
+        }
+        assert_eq!(PAGE_PREHEAT, counting.allocations());
+        assert_eq!(0, counting.deallocations());
+
+        // Going past the preheat allocates the extra items once; they are
+        // recycled from then on.
+        let extra_len = PAGE_PREHEAT + 2;
+        for _ in 0..1024 {
+            for _ in 0..extra_len {
+                items.push(pool.pages.create().unwrap());
+            }
+            for item in items.drain(..) {
+                pool.pages.destroy(item);
+            }
+        }
+        assert_eq!(extra_len, counting.allocations());
+        assert_eq!(0, counting.deallocations());
     }
 }
