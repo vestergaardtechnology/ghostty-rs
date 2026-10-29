@@ -5077,3 +5077,645 @@ fn get_sentinel_cstr(storage: &[u8]) -> Option<&CStr> {
     }
     CStr::from_bytes_until_nul(storage).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::page_list;
+
+    // ----- test helpers (Rust-only) -----
+
+    fn init<C, R>(cols: C, rows: R) -> Terminal
+    where
+        C: TryInto<CellCountInt>,
+        R: TryInto<CellCountInt>,
+    {
+        Terminal::init(Options::new(cols.try_into().ok().unwrap(), rows.try_into().ok().unwrap())).unwrap()
+    }
+
+    fn coord<X: TryInto<CellCountInt>, Y: TryInto<u32>>(x: X, y: Y) -> Coordinate {
+        Coordinate {
+            x: x.try_into().ok().unwrap(),
+            y: y.try_into().ok().unwrap(),
+        }
+    }
+
+    fn scr<X: TryInto<CellCountInt>, Y: TryInto<u32>>(x: X, y: Y) -> Point {
+        Point::Screen(coord(x, y))
+    }
+
+    fn act<X: TryInto<CellCountInt>, Y: TryInto<u32>>(x: X, y: Y) -> Point {
+        Point::Active(coord(x, y))
+    }
+
+    fn vp<X: TryInto<CellCountInt>, Y: TryInto<u32>>(x: X, y: Y) -> Point {
+        Point::Viewport(coord(x, y))
+    }
+
+    #[allow(dead_code)]
+    fn hist<X: TryInto<CellCountInt>, Y: TryInto<u32>>(x: X, y: Y) -> Point {
+        Point::History(coord(x, y))
+    }
+
+    /// The page of a page_list::Cell.
+    #[allow(dead_code)]
+    fn lc_page<'a>(lc: &page_list::Cell) -> &'a mut Page {
+        nd(lc.node).page()
+    }
+    #[test]
+    fn terminal_setcursorpos_saturates_overflowing_origin_offsets() {
+        let mut t = init(10, 10);
+
+        t.scrolling_region = ScrollingRegion {
+            top: 2,
+            bottom: 7,
+            left: 3,
+            right: 8,
+        };
+        t.modes.set(Mode::Origin, true);
+
+        t.set_cursor_pos(usize::MAX, usize::MAX);
+        assert_eq!(8, t.screens.active.cursor.x);
+        assert_eq!(7, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_setcursorrow_and_setcursorcol_in_origin_mode() {
+        let mut t = init(10, 10);
+
+        t.scrolling_region = ScrollingRegion {
+            top: 2,
+            bottom: 7,
+            left: 3,
+            right: 8,
+        };
+        t.modes.set(Mode::Origin, true);
+        t.set_cursor_pos(2, 2);
+
+        // Only the requested coordinate changes, relative to the margins.
+        t.set_cursor_col(1);
+        assert_eq!(3, t.screens.active.cursor.x);
+        assert_eq!(3, t.screens.active.cursor.y);
+
+        t.set_cursor_row(1);
+        assert_eq!(3, t.screens.active.cursor.x);
+        assert_eq!(2, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_cursorrowrelative_and_cursorcolrelative_in_origin_mode() {
+        let mut t = init(10, 10);
+
+        t.scrolling_region = ScrollingRegion {
+            top: 2,
+            bottom: 7,
+            left: 3,
+            right: 8,
+        };
+        t.modes.set(Mode::Origin, true);
+        t.set_cursor_pos(2, 2);
+
+        t.cursor_col_relative(2);
+        assert_eq!(6, t.screens.active.cursor.x);
+        assert_eq!(3, t.screens.active.cursor.y);
+
+        t.cursor_row_relative(2);
+        assert_eq!(6, t.screens.active.cursor.x);
+        assert_eq!(5, t.screens.active.cursor.y);
+
+        // Large moves stop at the edges of the scrolling region.
+        t.cursor_col_relative(100);
+        t.cursor_row_relative(100);
+        assert_eq!(8, t.screens.active.cursor.x);
+        assert_eq!(7, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_cursorrowrelative_and_cursorcolrelative_stop_at_screen_edge() {
+        let mut t = init(10, 10);
+
+        t.set_cursor_pos(3, 4);
+        t.cursor_col_relative(2);
+        t.cursor_row_relative(1);
+        assert_eq!(5, t.screens.active.cursor.x);
+        assert_eq!(3, t.screens.active.cursor.y);
+
+        t.cursor_col_relative(usize::MAX);
+        t.cursor_row_relative(usize::MAX);
+        assert_eq!(9, t.screens.active.cursor.x);
+        assert_eq!(9, t.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_input_with_no_control_characters() {
+        let mut t = init(40, 40);
+
+        // Basic grid writing
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(5, t.screens.active.cursor.x);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hello", str);
+        }
+
+        // The first row should be dirty
+        assert!(t.is_dirty(scr(5, 0)));
+        assert!(!t.is_dirty(scr(5, 1)));
+    }
+
+    #[test]
+    fn terminal_input_with_basic_wraparound() {
+        let mut t = init(5, 40);
+
+        // Basic grid writing
+        for c in "helloworldabc12".chars() { t.print(c as u32).unwrap(); }
+        assert_eq!(2, t.screens.active.cursor.y);
+        assert_eq!(4, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("hello\nworld\nabc12", str);
+        }
+    }
+
+    #[test]
+    fn terminal_input_with_basic_wraparound_dirty() {
+        let mut t = init(5, 40);
+
+        for c in "hello".chars() { t.print(c as u32).unwrap(); }
+        assert!(t.is_dirty(scr(4, 0)));
+        t.clear_dirty();
+        t.print('w' as u32).unwrap();
+
+        // Old row is dirty because cursor moved from there
+        assert!(t.is_dirty(scr(4, 0)));
+        assert!(t.is_dirty(scr(0, 1)));
+    }
+
+    #[test]
+    fn terminal_input_that_forces_scroll() {
+        let mut t = init(1, 5);
+
+        // Basic grid writing
+        for c in "abcdef".chars() { t.print(c as u32).unwrap(); }
+        assert_eq!(4, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!("b\nc\nd\ne\nf", str);
+        }
+    }
+
+    #[test]
+    fn terminal_input_unique_style_per_cell() {
+        let mut t = init(30, 30);
+
+        for y in 0..t.rows {
+            for x in 0..t.cols {
+                t.set_cursor_pos(y as usize, x as usize);
+                t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+                    r: x as _,
+                    g: y as _,
+                    b: 0,
+                }))
+                .unwrap();
+                t.print('x' as u32).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_input_glitch_text() {
+        let glitch = include_bytes!("res/glitch.txt");
+        let mut t = init(30, 30);
+
+        // Get our initial grapheme capacity.
+        let grapheme_cap = {
+            let page = nd(t.screens.active.pages.pages.first.unwrap());
+            page.capacity().grapheme_bytes
+        };
+
+        // Print glitch text until our capacity changes
+        loop {
+            let page = nd(t.screens.active.pages.pages.first.unwrap());
+            if page.capacity().grapheme_bytes != grapheme_cap { break; }
+            t.print_string(glitch).unwrap();
+        }
+
+        // We're testing to make sure that grapheme capacity gets increased.
+        let page = nd(t.screens.active.pages.pages.first.unwrap());
+        assert!(page.capacity().grapheme_bytes > grapheme_cap);
+    }
+
+    #[test]
+    fn terminal_zero_width_character_at_start() {
+        let mut t = init(80, 80);
+
+        // This used to crash the terminal. This is not allowed so we should
+        // just ignore it.
+        t.print(0x200D).unwrap();
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+
+        // Should not be dirty since we changed nothing.
+        assert!(!t.is_dirty(scr(0, 0)));
+    }
+
+    // https://github.com/ghostty-org/ghostty/pull/12581
+    #[test]
+    fn terminal_zero_width_character_attaches_to_pending_wrap_cell() {
+        let mut t = init(2, 2);
+
+        // Disable grapheme clustering to exercise the fallback path.
+        t.modes.set(Mode::GraphemeCluster, false);
+
+        t.print('x' as u32).unwrap();
+        t.print('å' as u32).unwrap();
+        t.print(0x0332).unwrap(); // Combining low line.
+
+        let str = t.plain_string().unwrap();
+        assert_eq!("xå̲", str);
+    }
+
+    #[test]
+    fn terminal_caps_zero_width_codepoints_attached_to_one_cell() {
+        let mut t = init(2, 2);
+
+        t.modes.set(Mode::GraphemeCluster, false);
+        t.print('A' as u32).unwrap();
+
+        let initial_capacity = nd(tp(t.screens.active.cursor.page_pin).node).capacity().grapheme_bytes;
+        for _ in 0..pagepkg::GRAPHEME_MAX_LEN * 4 { t.print(0x0301).unwrap(); }
+
+        let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+        assert_eq!(
+            pagepkg::GRAPHEME_MAX_LEN,
+            nd(list_cell.node).page().lookup_grapheme(cl(list_cell.cell)).unwrap().len(),
+        );
+        assert_eq!(
+            initial_capacity,
+            nd(list_cell.node).capacity().grapheme_bytes,
+        );
+    }
+
+    // https://github.com/mitchellh/ghostty/issues/1400
+    #[test]
+    fn terminal_print_single_very_long_line() {
+        let mut t = init(5, 5);
+
+        // This would crash for issue 1400. So the assertion here is
+        // that we simply do not crash.
+        for _ in 0..1000 { t.print('x' as u32).unwrap(); }
+    }
+
+    #[test]
+    fn terminal_print_wide_char() {
+        let mut t = init(80, 80);
+
+        t.print(0x1F600).unwrap(); // Smiley face
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F600, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_wide_char_at_edge_creates_spacer_head() {
+        let mut t = init(10, 10);
+
+        t.set_cursor_pos(1, 10);
+        t.print(0x1F600).unwrap(); // Smiley face
+        assert_eq!(1, t.screens.active.cursor.y);
+        assert_eq!(2, t.screens.active.cursor.x);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(9, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerHead, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F600, cell.content_codepoint());
+            assert_eq!(Wide::Wide, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 1)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(Wide::SpacerTail, cell.wide());
+        }
+
+        // Our first row just had a spacer head added which does not affect
+        // rendering so only the place where the wide char was printed
+        // should be marked.
+        // BUT old row is dirty because cursor moved from there
+        assert!(t.is_dirty(scr(0, 0)));
+        assert!(t.is_dirty(scr(0, 1)));
+    }
+
+    #[test]
+    fn terminal_print_wide_char_with_1_column_width() {
+        let mut t = init(1, 2);
+
+        t.print('😀' as u32).unwrap(); // 0x1F600
+
+        // This prints a space so we should be dirty.
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_wide_char_in_single_width_terminal() {
+        let mut t = init(1, 80);
+
+        t.print(0x1F600).unwrap(); // Smiley face
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert!(t.screens.active.cursor.pending_wrap);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_over_wide_char_at_0_0() {
+        let mut t = init(80, 80);
+
+        t.print(0x1F600).unwrap(); // Smiley face
+        t.set_cursor_pos(0, 0);
+        t.print('A' as u32).unwrap();
+
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(1, t.screens.active.cursor.x);
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('A' as u32, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+        assert!(!t.is_dirty(scr(0, 1)));
+    }
+
+    #[test]
+    fn terminal_print_over_wide_char_at_col_0_corrupts_previous_row() {
+        // Crash found by AFL++ fuzzer (afl-out/stream/default/crashes/id:000002).
+        //
+        // printCell, when overwriting a wide cell with a narrow cell at x<=1
+        // and y>0, sets the last cell of the previous row to .narrow — even
+        // when that cell is a .spacer_tail rather than a .spacer_head. This
+        // orphans the .wide cell at cols-2.
+        let mut t = init(10, 3);
+
+        // Fill rows 0 and 1 with wide chars (5 per row on a 10-col terminal).
+        for _ in 0..10 { t.print(0x4E2D).unwrap(); }
+
+        // Move cursor to row 1, col 0 (on top of a wide char) and print a
+        // narrow character. This triggers printCell's .wide branch which
+        // corrupts row 0's last cell: col 9 changes from .spacer_tail to
+        // .narrow, orphaning the .wide at col 8.
+        t.set_cursor_pos(2, 1);
+        t.print('A' as u32).unwrap();
+
+        // Row 1, col 0 should be narrow (we just overwrote the wide char).
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 1)).unwrap();
+            assert_eq!(Wide::Narrow, cl(list_cell.cell).wide());
+        }
+        // Row 0, col 8 should still be .wide (the last wide char on the row).
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(8, 0)).unwrap();
+            assert_eq!(Wide::Wide, cl(list_cell.cell).wide());
+        }
+        // Row 0, col 9 must remain .spacer_tail to pair with the .wide at col 8.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(9, 0)).unwrap();
+            assert_eq!(Wide::SpacerTail, cl(list_cell.cell).wide());
+        }
+    }
+
+    #[test]
+    fn terminal_print_over_wide_spacer_tail() {
+        let mut t = init(5, 5);
+
+        t.print('橋' as u32).unwrap();
+        t.set_cursor_pos(1, 2);
+        t.print('X' as u32).unwrap();
+
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!('X' as u32, cell.content_codepoint());
+            assert_eq!(Wide::Narrow, cell.wide());
+        }
+
+        {
+            let str = t.plain_string().unwrap();
+            assert_eq!(" X", str);
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_over_wide_char_with_bold() {
+        let mut t = init(80, 80);
+
+        t.set_attribute(sgr::Attribute::Bold).unwrap();
+        t.print(0x1F600).unwrap(); // Smiley face
+        // verify we have styles in our style map
+        {
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+        }
+
+        // Go back and overwrite with no style
+        t.set_cursor_pos(0, 0);
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('A' as u32).unwrap(); // Smiley face
+
+        // verify our style is gone
+        {
+            let page = cursor_page(t.screens.active);
+            assert_eq!(0, page.styles.count());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_over_wide_char_with_bg_color() {
+        let mut t = init(80, 80);
+
+        t.set_attribute(sgr::Attribute::DirectColorBg(color::Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        })).unwrap();
+        t.print(0x1F600).unwrap(); // Smiley face
+        // verify we have styles in our style map
+        {
+            let page = cursor_page(t.screens.active);
+            assert_eq!(1, page.styles.count());
+        }
+
+        // Go back and overwrite with no style
+        t.set_cursor_pos(0, 0);
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.print('A' as u32).unwrap(); // Smiley face
+
+        // verify our style is gone
+        {
+            let page = cursor_page(t.screens.active);
+            assert_eq!(0, page.styles.count());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_print_multicodepoint_grapheme_disabled_mode_2027() {
+        let mut t = init(80, 80);
+
+        // https://github.com/mitchellh/ghostty/issues/289
+        // This is: 👨‍👩‍👧 (which may or may not render correctly)
+        t.print(0x1F468).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F469).unwrap();
+        t.print(0x200D).unwrap();
+        t.print(0x1F467).unwrap();
+
+        // We should have 6 cells taken up
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(6, t.screens.active.cursor.x);
+
+        // Assert various properties about our screen to verify
+        // we have all expected cells.
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(0, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F468, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(1, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+            assert!(nd(list_cell.node).page().lookup_grapheme(cell).is_none());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(2, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F469, cell.content_codepoint());
+            assert!(cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            let cps = nd(list_cell.node).page().lookup_grapheme(cell).unwrap();
+            assert_eq!(1, cps.len());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(3, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+            assert!(nd(list_cell.node).page().lookup_grapheme(cell).is_none());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(4, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0x1F467, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::Wide, cell.wide());
+            assert!(nd(list_cell.node).page().lookup_grapheme(cell).is_none());
+        }
+        {
+            let list_cell = t.screens.active.pages.get_cell(scr(5, 0)).unwrap();
+            let cell = cl(list_cell.cell);
+            assert_eq!(0, cell.content_codepoint());
+            assert!(!cell.has_grapheme());
+            assert_eq!(Wide::SpacerTail, cell.wide());
+            assert!(nd(list_cell.node).page().lookup_grapheme(cell).is_none());
+        }
+
+        assert!(t.is_dirty(scr(0, 0)));
+    }
+
+    #[test]
+    fn terminal_enabling_grapheme_mode_handles_stored_breaks() {
+        let mut t = init(5, 1);
+
+        t.modes.set(Mode::GraphemeCluster, false);
+        t.print('a' as u32).unwrap();
+        t.print(0x200B).unwrap(); // Zero width space is stored on the prior cell.
+
+        t.modes.set(Mode::GraphemeCluster, true);
+        t.print(0x0301).unwrap();
+
+        let str = t.plain_string().unwrap();
+        assert_eq!(&b"a\xE2\x80\x8B\xCC\x81"[..], str.as_bytes());
+    }
+
+    // Terminal.print receives one codepoint at a time, so it can't use
+    // unicode.graphemeWidth directly; that API requires a complete buffered
+    // cluster or string end. This keeps the streaming printer's cursor advance
+    // in sync with the buffered measurement API for representative clusters.
+    fn expect_grapheme_width_parity(cps: &[u32]) {
+        let mut t = init(80, 5);
+
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        let mut expected: usize = 0;
+        let mut i: usize = 0;
+        while i < cps.len() {
+            let result = unicode::grapheme_width(&cps[i..]);
+            assert!(result.len > 0);
+            i += result.len;
+            expected += result.width as usize;
+        }
+
+        for &cp in cps {
+            t.print(cp).unwrap();
+        }
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(expected, t.screens.active.cursor.x as usize);
+    }
+
+}
