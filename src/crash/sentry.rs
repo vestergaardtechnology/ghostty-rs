@@ -255,33 +255,6 @@ impl Transport {
     }
 }
 
-// TODO(port-dedupe): replace with crate::build_config once ported. These are
-// the values of the Ghostty application build on the current target.
-#[cfg(feature = "sentry")]
-mod build_config {
-    pub const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
-    pub const MODE_STRING: &str = if cfg!(debug_assertions) {
-        "Debug"
-    } else {
-        "ReleaseFast"
-    };
-    pub const APP_RUNTIME: &str = if cfg!(target_os = "macos") {
-        "none"
-    } else {
-        "gtk"
-    };
-    pub const FONT_BACKEND: &str = if cfg!(target_os = "macos") {
-        "coretext"
-    } else {
-        "fontconfig_freetype"
-    };
-    pub const RENDERER: &str = if cfg!(target_os = "macos") {
-        "metal"
-    } else {
-        "opengl"
-    };
-}
-
 /// The parts that require the Sentry native SDK C library.
 #[cfg(feature = "sentry")]
 mod native {
@@ -290,6 +263,7 @@ mod native {
     use std::sync::{Mutex, OnceLock};
     use std::thread::JoinHandle;
 
+    use crate::build_config;
     use crate::pkg::sentry::c;
     use crate::pkg::sentry::{set_tag, Value};
 
@@ -376,9 +350,9 @@ mod native {
 
         // Setup some basic tags that we always want present
         set_tag("build-mode", build_config::MODE_STRING);
-        set_tag("app-runtime", build_config::APP_RUNTIME);
-        set_tag("font-backend", build_config::FONT_BACKEND);
-        set_tag("renderer", build_config::RENDERER);
+        set_tag("app-runtime", build_config::APP_RUNTIME.as_str());
+        set_tag("font-backend", build_config::FONT_BACKEND.as_str());
+        set_tag("renderer", build_config::RENDERER.as_str());
 
         // Log some information about sentry
         log::debug!(target: "sentry", "sentry initialized database={}", cache_dir.display());

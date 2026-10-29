@@ -23,9 +23,9 @@
 //! * Flatpak host-command execution (`build_config::FLATPAK`) is compiled
 //!   out exactly like a non-flatpak Zig build: [`FlatpakHostCommand`] is the
 //!   empty struct Zig uses in that case.
-//! * The apprt `pre_exec`/`post_fork` hooks are not wired up yet
-//!   (TODO(port-dedupe): `crate::apprt::gtk::{pre_exec, post_fork}` are not
-//!   ported); the infos are still passed through to `Command`.
+//! * The apprt `pre_exec`/`post_fork` hooks are
+//!   [`command::RT_PRE_EXEC`]/[`command::RT_POST_FORK`] (the GTK runtime's
+//!   hooks with the `gtk` feature, none otherwise).
 //! * The terminal fields Exec reads (`cols`, `rows`, `width_px`,
 //!   `height_px`, `flags.password_input`, `setPwd`) go through
 //!   [`terminal_standin`] until `Terminal` is ported (TODO(port-dedupe)).
@@ -1035,8 +1035,8 @@ impl Default for Config {
             working_directory: None,
             resources_dir: None,
             term: String::new(),
-            rt_pre_exec_info: command::RtPreExecInfo::default(),
-            rt_post_fork_info: command::RtPostForkInfo::default(),
+            rt_pre_exec_info: command::rt_pre_exec_info_unset(),
+            rt_post_fork_info: command::rt_post_fork_info_unset(),
         }
     }
 }
@@ -1432,11 +1432,9 @@ impl Subprocess {
             } else {
                 Some(os_pre_exec_callback)
             },
-            // TODO(port-dedupe): `apprt.runtime.pre_exec.preExec` and
-            // `post_fork.postFork` once the GTK apprt hooks are ported.
-            rt_pre_exec: None,
+            rt_pre_exec: command::RT_PRE_EXEC,
             rt_pre_exec_info: self.rt_pre_exec_info,
-            rt_post_fork: None,
+            rt_post_fork: command::RT_POST_FORK,
             rt_post_fork_info: self.rt_post_fork_info,
             data: self as *mut Subprocess as *mut c_void,
             pid: None,

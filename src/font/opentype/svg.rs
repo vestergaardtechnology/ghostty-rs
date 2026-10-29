@@ -156,13 +156,18 @@ mod tests {
     fn svg() {
         let test_font = crate::font::embedded::JULIA_MONO;
 
-        // TODO(port-dedupe): the Zig test loads the table through
-        // `font.Library`/`font.Face.copyTable` (FreeType's
-        // FT_Load_Sfnt_Table), which returns the same raw table bytes as
-        // reading it out of the SFNT directory. Switch to
-        // crate::font::Face::copy_table once face/freetype is ported.
-        let font = super::super::sfnt::Sfnt::init(test_font).unwrap();
-        let table = font.get_table(b"SVG ").unwrap().to_vec();
+        let lib = crate::font::Library::init().unwrap();
+        let face = crate::font::Face::init(
+            lib.clone(),
+            test_font,
+            crate::font::face::Options::new(crate::font::face::DesiredSize::new(12.0)),
+        )
+        .unwrap();
+
+        #[cfg(not(target_os = "macos"))]
+        let table = face.copy_table(b"SVG ").unwrap().unwrap();
+        #[cfg(target_os = "macos")]
+        let table = face.copy_table(b"SVG ").unwrap();
 
         let svg = Svg::init(&table).unwrap();
         assert_eq!(11482, svg.start_glyph_id);

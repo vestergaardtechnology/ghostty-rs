@@ -164,7 +164,7 @@ fn write_bash_completions(writer: &mut String) {
             continue;
         }
 
-        let bash_name = action.name.replace('-', "_");
+        let bash_name = action.name().replace('-', "_");
         writer.push_str(&format!("{PAD2}local {bash_name}=\""));
 
         {
@@ -197,9 +197,9 @@ fn write_bash_completions(writer: &mut String) {
         }
 
         // bash doesn't allow variable names containing '-' so replace them
-        let bash_name = action.name.replace('-', "_");
+        let bash_name = action.name().replace('-', "_");
 
-        writer.push_str(&format!("{PAD3}+{})\n", action.name));
+        writer.push_str(&format!("{PAD3}+{})\n", action.name()));
         writer.push_str(&format!("{PAD4}case $prev in\n"));
         for opt in action.options {
             if opt.name.starts_with('_') {
@@ -255,7 +255,7 @@ fn write_bash_completions(writer: &mut String) {
 "#);
 
     for action in ACTIONS {
-        writer.push_str(&format!("{PAD1}topLevel+=\" +{}\"\n", action.name));
+        writer.push_str(&format!("{PAD1}topLevel+=\" +{}\"\n", action.name()));
     }
 
     writer.push_str(r#"

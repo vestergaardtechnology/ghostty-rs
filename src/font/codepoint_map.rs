@@ -64,6 +64,26 @@ impl CodepointMap {
         self.descriptors.push(entry.descriptor);
     }
 
+    /// The codepoint ranges, in insertion order (Zig
+    /// `list.items(.range)`).
+    pub fn ranges(&self) -> &[[u32; 2]] {
+        &self.ranges
+    }
+
+    /// The descriptors, in insertion order (Zig
+    /// `list.items(.descriptor)`).
+    pub fn descriptors(&self) -> &[discovery::Descriptor] {
+        &self.descriptors
+    }
+
+    /// The entry at index `i` (Zig `list.get(i)`).
+    pub fn entry(&self, i: usize) -> Entry {
+        Entry {
+            range: self.ranges[i],
+            descriptor: self.descriptors[i].clone(),
+        }
+    }
+
     /// Get a descriptor for a codepoint.
     pub fn get(&self, cp: u32) -> Option<&discovery::Descriptor> {
         let items = &self.ranges;

@@ -594,14 +594,6 @@ impl std::fmt::Display for ModifierParseError {
 
 impl std::error::Error for ModifierParseError {}
 
-/// Formatter used by [`Modifier::format_entry`] (the config formatter's
-/// `formatEntry([]const u8, value)`).
-// TODO(port-dedupe): replace with the config entry formatter from
-// crate::config (config.zig `entryFormatter`) once config is ported.
-pub trait EntryFormatter {
-    fn format_entry_str(&mut self, value: &str) -> std::fmt::Result;
-}
-
 /// Zig's `std.fmt.parseInt`/`parseFloat` accept `_` between digits; strip
 /// them (only when they are between two digits) so we accept the same
 /// inputs. Returns `None` if an underscore is misplaced.
@@ -709,10 +701,13 @@ impl Modifier {
     }
 
     /// Used by config formatter
-    pub fn format_entry<F: EntryFormatter>(&self, formatter: &mut F) -> std::fmt::Result {
+    pub fn format_entry(
+        &self,
+        formatter: &mut crate::config::formatter::EntryFormatter<'_>,
+    ) -> Result<(), crate::config::formatter::Error> {
         match *self {
-            Modifier::Percent(v) => formatter.format_entry_str(&format!("{}%", (v - 1.0) * 100.0)),
-            Modifier::Absolute(v) => formatter.format_entry_str(&format!("{}", v)),
+            Modifier::Percent(v) => formatter.format_entry(format!("{}%", (v - 1.0) * 100.0).as_str()),
+            Modifier::Absolute(v) => formatter.format_entry(format!("{}", v).as_str()),
         }
     }
 
@@ -820,22 +815,7 @@ impl std::str::FromStr for Key {
 mod tests {
     use super::*;
 
-    // TODO(port-dedupe): replace with crate::config::entry_formatter.
-    struct TestEntryFormatter<'a> {
-        name: &'static str,
-        out: &'a mut String,
-    }
-
-    impl EntryFormatter for TestEntryFormatter<'_> {
-        fn format_entry_str(&mut self, value: &str) -> std::fmt::Result {
-            use std::fmt::Write;
-            writeln!(self.out, "{} = {}", self.name, value)
-        }
-    }
-
-    fn entry_formatter<'a>(name: &'static str, out: &'a mut String) -> TestEntryFormatter<'a> {
-        TestEntryFormatter { name, out }
-    }
+    use crate::config::formatter::entry_formatter;
 
     #[test]
     fn format_config_percent() {

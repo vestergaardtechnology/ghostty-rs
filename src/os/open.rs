@@ -6,30 +6,9 @@ use std::fmt;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 
-// TODO(port-dedupe): replace with `crate::build_config::SNAP` once
-// build_config is ported. The default Ghostty build is not a snap build.
-const BUILD_SNAP: bool = false;
+use crate::build_config;
 
-// TODO(port-dedupe): replace with `crate::apprt::action::OpenUrl::Kind`
-// once apprt/action is ported. Values must match
-// ghostty_action_open_url_kind_e.
-/// Where the URL came from, used to decide how to open it.
-///
-/// `Text` and `Html` come from Ghostty itself and can be opened directly.
-/// `Unknown` and `Osc8` may come from terminal output, which any program
-/// can control, so apprts must check them before opening.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub enum OpenUrlKind {
-    /// Untrusted. The source is unknown.
-    Unknown,
-    /// The URL is known to be a text file.
-    Text,
-    /// The URL is known to be an HTML file.
-    Html,
-    /// Untrusted. The URL came from an OSC 8 hyperlink.
-    Osc8,
-}
+pub use crate::apprt::action::OpenUrlKind;
 
 #[derive(Debug)]
 pub enum OpenError {
@@ -99,7 +78,7 @@ pub fn open(kind: OpenUrlKind, url: &str) -> Result<(), OpenError> {
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
-    if BUILD_SNAP {
+    if build_config::SNAP {
         // In the snap on Linux the launcher exports LD_LIBRARY_PATH
         // pointing at the snap's bundled libraries. Leaking this into
         // child process can can be problematic, so let's drop it from the

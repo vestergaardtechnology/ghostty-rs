@@ -6,16 +6,21 @@ use std::fmt;
 use std::fs::File;
 use std::path::Path;
 
-/// Errors from looking up the XDG directories (Zig `xdg.config` errors).
+/// Errors from looking up the default config directories (Zig: the
+/// inferred error sets of `xdg.config` and `macos.appSupportDir`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XdgError {
-    NoHomeDir,
+    Xdg(crate::os::xdg::Error),
+    #[cfg(target_os = "macos")]
+    AppSupportDir(crate::os::macos::AppSupportDirError),
 }
 
 impl fmt::Display for XdgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            XdgError::NoHomeDir => f.write_str("error.NoHomeDir"),
+            XdgError::Xdg(e) => write!(f, "{e}"),
+            #[cfg(target_os = "macos")]
+            XdgError::AppSupportDir(e) => write!(f, "{e}"),
         }
     }
 }
@@ -45,22 +50,18 @@ pub(crate) fn path_join(parts: &[&str]) -> String {
     result
 }
 
-/// Get the XDG user config directory joined with `subdir`.
-// TODO(port-dedupe): replace with crate::os::xdg::config (which also falls
-// back to the passwd database for the home directory).
+/// Get the XDG user config directory joined with `subdir`
+/// (`internal_os.xdg.config` with the global environment).
 pub(crate) fn xdg_config(subdir: &str) -> Result<String, XdgError> {
-    // First check the env var.
-    if let Ok(env) = std::env::var("XDG_CONFIG_HOME") {
-        if !env.is_empty() {
-            return Ok(path_join(&[&env, subdir]));
-        }
-    }
-
-    // Get our home dir
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => Ok(path_join(&[&home, ".config", subdir])),
-        _ => Err(XdgError::NoHomeDir),
-    }
+    let environ_map = crate::global::environ_map();
+    crate::os::xdg::config(
+        &environ_map,
+        crate::os::xdg::Options {
+            subdir: Some(subdir),
+            ..Default::default()
+        },
+    )
+    .map_err(XdgError::Xdg)
 }
 
 /// Default path for the XDG home configuration file.
@@ -93,20 +94,10 @@ pub fn preferred_xdg_path() -> Result<String, XdgError> {
 }
 
 /// Return the path to the macOS Application Support directory with the
-/// given sub path joined.
-// TODO(port-dedupe): replace with crate::os::macos::app_support_dir (which
-// asks NSFileManager for the directory).
+/// given sub path joined (`internal_os.macos.appSupportDir`).
 #[cfg(target_os = "macos")]
 fn app_support_dir(sub_path: &str) -> Result<String, XdgError> {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => Ok(path_join(&[
-            &home,
-            "Library/Application Support",
-            "com.mitchellh.ghostty",
-            sub_path,
-        ])),
-        _ => Err(XdgError::NoHomeDir),
-    }
+    crate::os::macos::app_support_dir(sub_path).map_err(XdgError::AppSupportDir)
 }
 
 /// Default path for the macOS Application Support configuration file.

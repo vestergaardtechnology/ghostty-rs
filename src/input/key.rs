@@ -1338,8 +1338,8 @@ impl Key {
     /// Returns the cimgui key constant for this key.
     #[cfg(feature = "inspector")]
     pub fn imgui_key(self) -> Option<c_int> {
-        use cimgui::c;
-        Some(match self {
+        use crate::pkg::dcimgui::c;
+        let key = match self {
             Key::KeyA => c::ImGuiKey_A,
             Key::KeyB => c::ImGuiKey_B,
             Key::KeyC => c::ImGuiKey_C,
@@ -1527,7 +1527,8 @@ impl Key {
             | Key::Paste => return None,
 
             Key::Unidentified => return None,
-        })
+        };
+        Some(key as c_int)
     }
 
     /// true if this key is one of the left or right versions of super (MacOS)
@@ -1637,126 +1638,6 @@ pub const fn ctrl_or_super(mods: Mods) -> Mods {
     }
 
     copy
-}
-
-/// Stand-in for the Dear ImGui key constants used by the inspector.
-///
-/// TODO(port-dedupe): replace with the `pkg/dcimgui` bindings
-/// (`cimgui.c.ImGuiKey_*`). Values are from `imgui.h` (`enum ImGuiKey_`).
-#[cfg(feature = "inspector")]
-#[allow(non_upper_case_globals)]
-mod cimgui {
-    pub mod c {
-        use std::os::raw::c_int;
-
-        pub const ImGuiKey_NamedKey_BEGIN: c_int = 512;
-        pub const ImGuiKey_Tab: c_int = 512;
-        pub const ImGuiKey_LeftArrow: c_int = 513;
-        pub const ImGuiKey_RightArrow: c_int = 514;
-        pub const ImGuiKey_UpArrow: c_int = 515;
-        pub const ImGuiKey_DownArrow: c_int = 516;
-        pub const ImGuiKey_PageUp: c_int = 517;
-        pub const ImGuiKey_PageDown: c_int = 518;
-        pub const ImGuiKey_Home: c_int = 519;
-        pub const ImGuiKey_End: c_int = 520;
-        pub const ImGuiKey_Insert: c_int = 521;
-        pub const ImGuiKey_Delete: c_int = 522;
-        pub const ImGuiKey_Backspace: c_int = 523;
-        pub const ImGuiKey_Space: c_int = 524;
-        pub const ImGuiKey_Enter: c_int = 525;
-        pub const ImGuiKey_Escape: c_int = 526;
-        pub const ImGuiKey_LeftCtrl: c_int = 527;
-        pub const ImGuiKey_LeftShift: c_int = 528;
-        pub const ImGuiKey_LeftAlt: c_int = 529;
-        pub const ImGuiKey_LeftSuper: c_int = 530;
-        pub const ImGuiKey_RightCtrl: c_int = 531;
-        pub const ImGuiKey_RightShift: c_int = 532;
-        pub const ImGuiKey_RightAlt: c_int = 533;
-        pub const ImGuiKey_RightSuper: c_int = 534;
-        pub const ImGuiKey_Menu: c_int = 535;
-        pub const ImGuiKey_0: c_int = 536;
-        pub const ImGuiKey_1: c_int = 537;
-        pub const ImGuiKey_2: c_int = 538;
-        pub const ImGuiKey_3: c_int = 539;
-        pub const ImGuiKey_4: c_int = 540;
-        pub const ImGuiKey_5: c_int = 541;
-        pub const ImGuiKey_6: c_int = 542;
-        pub const ImGuiKey_7: c_int = 543;
-        pub const ImGuiKey_8: c_int = 544;
-        pub const ImGuiKey_9: c_int = 545;
-        pub const ImGuiKey_A: c_int = 546;
-        pub const ImGuiKey_B: c_int = 547;
-        pub const ImGuiKey_C: c_int = 548;
-        pub const ImGuiKey_D: c_int = 549;
-        pub const ImGuiKey_E: c_int = 550;
-        pub const ImGuiKey_F: c_int = 551;
-        pub const ImGuiKey_G: c_int = 552;
-        pub const ImGuiKey_H: c_int = 553;
-        pub const ImGuiKey_I: c_int = 554;
-        pub const ImGuiKey_J: c_int = 555;
-        pub const ImGuiKey_K: c_int = 556;
-        pub const ImGuiKey_L: c_int = 557;
-        pub const ImGuiKey_M: c_int = 558;
-        pub const ImGuiKey_N: c_int = 559;
-        pub const ImGuiKey_O: c_int = 560;
-        pub const ImGuiKey_P: c_int = 561;
-        pub const ImGuiKey_Q: c_int = 562;
-        pub const ImGuiKey_R: c_int = 563;
-        pub const ImGuiKey_S: c_int = 564;
-        pub const ImGuiKey_T: c_int = 565;
-        pub const ImGuiKey_U: c_int = 566;
-        pub const ImGuiKey_V: c_int = 567;
-        pub const ImGuiKey_W: c_int = 568;
-        pub const ImGuiKey_X: c_int = 569;
-        pub const ImGuiKey_Y: c_int = 570;
-        pub const ImGuiKey_Z: c_int = 571;
-        pub const ImGuiKey_F1: c_int = 572;
-        pub const ImGuiKey_F2: c_int = 573;
-        pub const ImGuiKey_F3: c_int = 574;
-        pub const ImGuiKey_F4: c_int = 575;
-        pub const ImGuiKey_F5: c_int = 576;
-        pub const ImGuiKey_F6: c_int = 577;
-        pub const ImGuiKey_F7: c_int = 578;
-        pub const ImGuiKey_F8: c_int = 579;
-        pub const ImGuiKey_F9: c_int = 580;
-        pub const ImGuiKey_F10: c_int = 581;
-        pub const ImGuiKey_F11: c_int = 582;
-        pub const ImGuiKey_F12: c_int = 583;
-        // ImGuiKey_F13..ImGuiKey_F24 = 584..595
-        pub const ImGuiKey_Apostrophe: c_int = 596;
-        pub const ImGuiKey_Comma: c_int = 597;
-        pub const ImGuiKey_Minus: c_int = 598;
-        pub const ImGuiKey_Period: c_int = 599;
-        pub const ImGuiKey_Slash: c_int = 600;
-        pub const ImGuiKey_Semicolon: c_int = 601;
-        pub const ImGuiKey_Equal: c_int = 602;
-        pub const ImGuiKey_LeftBracket: c_int = 603;
-        pub const ImGuiKey_Backslash: c_int = 604;
-        pub const ImGuiKey_RightBracket: c_int = 605;
-        pub const ImGuiKey_GraveAccent: c_int = 606;
-        pub const ImGuiKey_CapsLock: c_int = 607;
-        pub const ImGuiKey_ScrollLock: c_int = 608;
-        pub const ImGuiKey_NumLock: c_int = 609;
-        pub const ImGuiKey_PrintScreen: c_int = 610;
-        pub const ImGuiKey_Pause: c_int = 611;
-        pub const ImGuiKey_Keypad0: c_int = 612;
-        pub const ImGuiKey_Keypad1: c_int = 613;
-        pub const ImGuiKey_Keypad2: c_int = 614;
-        pub const ImGuiKey_Keypad3: c_int = 615;
-        pub const ImGuiKey_Keypad4: c_int = 616;
-        pub const ImGuiKey_Keypad5: c_int = 617;
-        pub const ImGuiKey_Keypad6: c_int = 618;
-        pub const ImGuiKey_Keypad7: c_int = 619;
-        pub const ImGuiKey_Keypad8: c_int = 620;
-        pub const ImGuiKey_Keypad9: c_int = 621;
-        pub const ImGuiKey_KeypadDecimal: c_int = 622;
-        pub const ImGuiKey_KeypadDivide: c_int = 623;
-        pub const ImGuiKey_KeypadMultiply: c_int = 624;
-        pub const ImGuiKey_KeypadSubtract: c_int = 625;
-        pub const ImGuiKey_KeypadAdd: c_int = 626;
-        pub const ImGuiKey_KeypadEnter: c_int = 627;
-        pub const ImGuiKey_KeypadEqual: c_int = 628;
-    }
 }
 
 #[cfg(test)]

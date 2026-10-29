@@ -140,8 +140,7 @@ impl Face {
         let traits = ct_font.get_symbolic_traits();
 
         let hb_font = if HARFBUZZ_SHAPER {
-            // SAFETY: valid CTFont.
-            let mut hb_font = match unsafe { harfbuzz::coretext::create_font(ct_font.as_ptr()) } {
+            let mut hb_font = match harfbuzz::coretext::create_font(&ct_font) {
                 Ok(v) => v,
                 Err(err) => {
                     ct_font.release();

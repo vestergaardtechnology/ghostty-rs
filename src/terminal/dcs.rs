@@ -3,8 +3,6 @@
 //! STATUS: ported
 //!
 //! Port notes / deviations:
-//! - `terminal.DCS` (`Parser.Action.DCS`) lives in the unported, concurrently
-//!   owned `Parser.zig`; [`Dcs`] is a local stand-in.
 //! - `terminal.Terminal` is not ported yet, so [`Decrqss::encode`] takes any
 //!   [`DecrqssTerminal`] (the handful of terminal queries it needs) instead
 //!   of `*Terminal`. The DECRQSS encoding tests use a minimal test terminal
@@ -26,15 +24,7 @@ use crate::terminal::tmux::{ControlNotification, ControlParser};
 const LOG_TARGET: &str = "terminal_dcs";
 
 /// `Parser.Action.DCS`.
-///
-/// TODO(port-dedupe): replace with the DCS action type from
-/// `crate::terminal::parser` (`Parser.Action.DCS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Dcs<'a> {
-    pub intermediates: &'a [u8],
-    pub params: &'a [u16],
-    pub r#final: u8,
-}
+pub use crate::terminal::parser::Dcs;
 
 /// `Terminal.ScrollingRegion`.
 ///

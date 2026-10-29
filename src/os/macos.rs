@@ -8,9 +8,7 @@ use std::ffi::{c_int, c_uint, c_ulong, CStr};
 use std::fmt;
 use std::path::Path;
 
-// TODO(port-dedupe): replace with `crate::build_config::BUNDLE_ID` once
-// build_config is ported.
-const BUNDLE_ID: &str = "com.mitchellh.ghostty";
+use crate::build_config::BUNDLE_ID;
 
 /// Minimal Objective-C runtime bindings used by the `os` module.
 ///

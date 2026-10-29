@@ -17,11 +17,12 @@
 
 #![cfg(target_os = "macos")]
 
-use std::ffi::{c_char, c_ulong, c_void, CStr};
+use std::ffi::{c_ulong, c_void};
 use std::fmt;
 
 use super::key::Mods;
 use super::keycodes::ENTRIES as CODES;
+use crate::pkg::macos::foundation;
 
 pub struct Keymap {
     /// The current input source that is selected for the keyboard. This can
@@ -102,14 +103,14 @@ impl Keymap {
 
     pub fn deinit(&self) {
         // SAFETY: source was returned by a Copy function and is owned by us.
-        unsafe { CFRelease(self.source as *const c_void) };
+        unsafe { foundation::cf_release(self.source as *mut c_void) };
     }
 
     /// Reload the keymap. This must be called if the user changes their
     /// keyboard layout.
     pub fn reload(&mut self) -> Result<(), Error> {
         // SAFETY: source was returned by a Copy function and is owned by us.
-        unsafe { CFRelease(self.source as *const c_void) };
+        unsafe { foundation::cf_release(self.source as *mut c_void) };
         self.reinit()
     }
 
@@ -128,24 +129,10 @@ impl Keymap {
         }
 
         // Convert the CFStringRef to a C string into our buffer.
-        // TODO(port-dedupe): replace with crate::pkg::macos::foundation::String::cstring
-        // SAFETY: id_raw is a CFStringRef; buf is valid for buf.len() bytes.
-        let ok = unsafe {
-            CFStringGetCString(
-                id_raw as CFStringRef,
-                buf.as_mut_ptr() as *mut c_char,
-                buf.len() as CFIndex,
-                K_CF_STRING_ENCODING_UTF8,
-            )
-        };
-        if ok == 0 {
-            return Err(Error::OutOfMemory);
-        }
-        // SAFETY: CFStringGetCString wrote a NUL-terminated string into buf.
-        let len = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
-            .to_bytes()
-            .len();
-        Ok(&buf[..len])
+        // SAFETY: the input source ID property is a CFStringRef.
+        let id = unsafe { foundation::String::from_ptr(id_raw) }.ok_or(Error::OutOfMemory)?;
+        id.cstring(buf, foundation::StringEncoding::Utf8)
+            .ok_or(Error::OutOfMemory)
     }
 
     /// Reinit reinitializes the keymap. It assumes that all the memory associated
@@ -168,7 +155,9 @@ impl Keymap {
 
             // The CFDataRef contains a UCKeyboardLayout pointer
             // SAFETY: data_raw is a CFDataRef owned by the input source.
-            unsafe { CFDataGetBytePtr(data_raw as CFDataRef) as *const UCKeyboardLayout }
+            let data = unsafe { foundation::Data::from_ptr(data_raw) }
+                .ok_or(Error::GetInputSourceFailed)?;
+            data.get_pointer() as *const UCKeyboardLayout
         };
 
         if cfg!(debug_assertions) {
@@ -346,12 +335,7 @@ struct UCKeyboardLayout {
     _private: [u8; 0],
 }
 
-// TODO(port-dedupe): replace with crate::pkg::macos::foundation (CFString,
-// CFData, CFRelease).
-type CFStringRef = *const c_void;
-type CFDataRef = *const c_void;
-type CFIndex = isize;
-const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+type CFStringRef = *const foundation::String;
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -374,18 +358,6 @@ extern "C" {
     static kTISPropertyLocalizedName: CFStringRef;
     static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
     static kTISPropertyInputSourceID: CFStringRef;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    fn CFRelease(cf: *const c_void);
-    fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
-    fn CFStringGetCString(
-        s: CFStringRef,
-        buffer: *mut c_char,
-        buffer_size: CFIndex,
-        encoding: u32,
-    ) -> u8;
 }
 
 const K_UC_KEY_ACTION_DOWN: u16 = 0;

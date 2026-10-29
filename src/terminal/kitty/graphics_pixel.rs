@@ -8,11 +8,8 @@
 //! frame composition (a=c). See graphics_animation.rs for the
 //! animation model built on top of them.
 //!
-//! The Zig version uses wuffs' pixel swizzler for the conversions and the
-//! source-over blend. The Rust port implements the same swizzles directly
-//! (see [`swizzle`]), reproducing wuffs' arithmetic exactly.
-
 use super::graphics_command::{Background, CompositionMode, Format};
+use crate::pkg::wuffs::swizzle;
 
 /// Convert pixel data in the given format to a freshly allocated RGBA
 /// buffer. The input is not modified.
@@ -21,14 +18,25 @@ use super::graphics_command::{Background, CompositionMode, Format};
 /// pixel; image loading validates data length against the image
 /// dimensions before storing it.
 pub fn rgba_from_format(format: Format, data: &[u8]) -> Vec<u8> {
-    match format {
-        Format::Rgba => data.to_vec(),
+    let result = match format {
+        Format::Rgba => return data.to_vec(),
         Format::Rgb => swizzle::rgb_to_rgba(data),
         Format::Gray => swizzle::g_to_rgba(data),
         Format::GrayAlpha => swizzle::ga_to_rgba(data),
 
         // PNG is decoded to RGBA during image loading.
         Format::Png => unreachable!(),
+    };
+
+    match result {
+        Ok(v) => v,
+        // Allocation failure aborts in Rust (Zig returns OutOfMemory).
+        Err(crate::pkg::wuffs::Error::OutOfMemory) => {
+            std::alloc::handle_alloc_error(std::alloc::Layout::new::<u8>())
+        }
+        // These are fixed, supported swizzles; wuffs cannot fail to
+        // run them.
+        Err(_) => unreachable!(),
     }
 }
 
@@ -145,86 +153,6 @@ fn compose_row(dst: &mut [u8], src: &[u8], mode: CompositionMode) {
     match mode {
         CompositionMode::Overwrite => dst.copy_from_slice(src),
         CompositionMode::AlphaBlend => swizzle::rgba_src_over(dst, src),
-    }
-}
-
-// TODO(port-dedupe): replace with crate::pkg::wuffs::swizzle once ported
-// (pkg/** is owned by a concurrent port).
-/// The wuffs swizzles used above, reimplemented with wuffs' arithmetic.
-pub mod swizzle {
-    /// `Y` -> `RGBA_PREMUL`
-    pub fn g_to_rgba(src: &[u8]) -> Vec<u8> {
-        let mut dst = Vec::with_capacity(src.len() * 4);
-        for &g in src {
-            dst.extend_from_slice(&[g, g, g, 0xFF]);
-        }
-        dst
-    }
-
-    /// `YA_NONPREMUL` -> `RGBA_NONPREMUL`
-    pub fn ga_to_rgba(src: &[u8]) -> Vec<u8> {
-        let mut dst = Vec::with_capacity(src.len() / 2 * 4);
-        for px in src.chunks_exact(2) {
-            dst.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
-        }
-        dst
-    }
-
-    /// `RGB` -> `RGBA_PREMUL`
-    pub fn rgb_to_rgba(src: &[u8]) -> Vec<u8> {
-        let mut dst = Vec::with_capacity(src.len() / 3 * 4);
-        for px in src.chunks_exact(3) {
-            dst.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
-        }
-        dst
-    }
-
-    /// `RGBA_NONPREMUL` src-over `RGBA_NONPREMUL`, in place on `dst`.
-    ///
-    /// This is wuffs'
-    /// `swizzle_rgba_nonpremul__rgba_nonpremul__src_over`: the math is done
-    /// in 16-bit color, converting the destination to premultiplied alpha,
-    /// blending, and converting back.
-    pub fn rgba_src_over(dst: &mut [u8], src: &[u8]) {
-        let len = (dst.len() / 4).min(src.len() / 4);
-        for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)).take(len) {
-            // Extract 16-bit color components.
-            let mut da = 0x101 * u32::from(d[3]);
-            let mut dr = 0x101 * u32::from(d[0]);
-            let mut dg = 0x101 * u32::from(d[1]);
-            let mut db = 0x101 * u32::from(d[2]);
-            let sa = 0x101 * u32::from(s[3]);
-            let sr = 0x101 * u32::from(s[0]);
-            let sg = 0x101 * u32::from(s[1]);
-            let sb = 0x101 * u32::from(s[2]);
-
-            // Calculate the inverse of the src-alpha: how much of the dst to keep.
-            let ia = 0xFFFF - sa;
-
-            // Convert dst from nonpremul to premul.
-            dr = (dr * da) / 0xFFFF;
-            dg = (dg * da) / 0xFFFF;
-            db = (db * da) / 0xFFFF;
-
-            // Calculate the output pixel.
-            da = sa + ((da * ia) / 0xFFFF);
-            dr = ((sr * sa) + (dr * ia)) / 0xFFFF;
-            dg = ((sg * sa) + (dg * ia)) / 0xFFFF;
-            db = ((sb * sa) + (db * ia)) / 0xFFFF;
-
-            // Convert dst from premul to nonpremul.
-            if da != 0 {
-                dr = (dr * 0xFFFF) / da;
-                dg = (dg * 0xFFFF) / da;
-                db = (db * 0xFFFF) / da;
-            }
-
-            // Convert from 16-bit color to 8-bit color.
-            d[0] = (dr >> 8) as u8;
-            d[1] = (dg >> 8) as u8;
-            d[2] = (db >> 8) as u8;
-            d[3] = (da >> 8) as u8;
-        }
     }
 }
 
