@@ -102,7 +102,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
         let max: usize = 'max: {
             for i in 0..cells.len() {
                 let rev_i = cells.len() - i - 1;
-                if !cells[rev_i].raw.is_empty() {
+                if !cells.raw[rev_i].is_empty() {
                     break 'max rev_i + 1;
                 }
             }
@@ -112,7 +112,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
 
         // Invisible cells don't have any glyphs rendered,
         // so we explicitly skip them in the shaping process.
-        while self.i < max && (cells[self.i].raw.has_styling() && cells[self.i].style.flags.invisible) {
+        while self.i < max && (cells.raw[self.i].has_styling() && cells.style[self.i].flags.invisible) {
             self.i += 1;
         }
 
@@ -131,8 +131,8 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
         let mut hasher = Hasher::init(0);
 
         // Let's get our style that we'll expect for the run.
-        let style: TermStyle = if cells[self.i].raw.has_styling() {
-            cells[self.i].style
+        let style: TermStyle = if cells.raw[self.i].has_styling() {
+            cells.style[self.i]
         } else {
             TermStyle::default_value()
         };
@@ -145,7 +145,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
             // with identical content but different starting positions in the
             // row produce the same hash, enabling cache reuse.
             let cluster = j - self.i;
-            let cell: &page::Cell = &cells[j].raw;
+            let cell: &page::Cell = &cells.raw[j];
 
             // If we have a selection and we're at a boundary point, then
             // we break the run here.
@@ -174,7 +174,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
             // one color when the two components have different styling.
             if j > self.i {
                 'style: {
-                    let prev_cell = cells[j - 1].raw;
+                    let prev_cell = cells.raw[j - 1];
 
                     // If the prev cell and this cell are both plain
                     // codepoints then we check if they are commonly "bad"
@@ -213,7 +213,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
                     // styles but any other change results in a new run.
                     let c1 = comparable_style(style);
                     let c2 = comparable_style(if cell.has_styling() {
-                        cells[j].style
+                        cells.style[j]
                     } else {
                         TermStyle::default_value()
                     });
@@ -243,7 +243,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
             let presentation: Option<Presentation> = if cell.has_grapheme() {
                 // We only check the FIRST codepoint because I believe the
                 // presentation format must be directly adjacent to the codepoint.
-                let cps = &cells[j].grapheme;
+                let cps = cells.grapheme(j);
                 assert(!cps.is_empty());
                 if cps[0] == 0xFE0E {
                     Some(Presentation::Text)
@@ -303,7 +303,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
                 // If we find a font that supports this entire grapheme
                 // then we use that.
                 if let Some(idx) =
-                    self.index_for_cell(cell, &cells[j].grapheme, font_style, presentation)?
+                    self.index_for_cell(cell, cells.grapheme(j), font_style, presentation)?
                 {
                     break 'font_info FontInfo { idx, fallback: None };
                 }
@@ -366,7 +366,7 @@ impl<'a, H: RunIteratorHook> RunIterator<'a, H> {
                 cluster as u32,
             );
             if cell.has_grapheme() {
-                for &cp in &cells[j].grapheme {
+                for &cp in cells.grapheme(j) {
                     // Do not send presentation modifiers
                     if cp == 0xFE0E || cp == 0xFE0F {
                         continue;

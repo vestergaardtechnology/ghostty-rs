@@ -274,18 +274,18 @@ pub mod wasm {
         // `terminal.Terminal` and iterates its rows; until the terminal is
         // ported this builds a single row of narrow cells directly.
         let s = std::str::from_utf8(s).map_err(|e| e.to_string())?;
-        let cells: Vec<shape::RenderCell> = s
-            .chars()
-            .map(|c| shape::RenderCell {
+        let mut cells = crate::terminal::render::Cells::default();
+        for c in s.chars() {
+            cells.append(crate::terminal::render::Cell {
                 raw: crate::terminal::page::Cell::init(c as u32),
                 ..Default::default()
-            })
-            .collect();
+            });
+        }
 
         // Iterate over the rows and print out all the runs we get.
         let y: usize = 0;
         let mut iter = this.run_iterator(RunOptions {
-            cells: &cells,
+            cells: cells.slice(),
             ..RunOptions::new(grid)
         });
         while let Some(run) = iter.next().map_err(|e| e.to_string())? {

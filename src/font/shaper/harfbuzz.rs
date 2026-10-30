@@ -3,8 +3,8 @@
 //! STATUS: ported
 //!
 //! The Zig tests build `terminal.Terminal` and `terminal.RenderState`
-//! instances, which are not ported yet; those tests are ported below but
-//! gated with `#[cfg(any())]` (see `TODO(port-terminal)`).
+//! instances and feed them through a VT stream (the test stream handler in
+//! `terminal::render::test_vt`, TODO(port-dedupe): `Terminal::vt_stream`).
 
 use crate::font::collection::{GetFaceError, Index};
 use crate::font::shape::{self, Cell, FeatureList, RunOptions, TextRun, DEFAULT_FEATURES};
@@ -475,7 +475,8 @@ mod tests {
     use crate::font::embedded;
     use crate::font::face::{DesiredSize, Face};
     use crate::font::library::Library;
-    use crate::font::shape::RenderCell;
+    use crate::terminal::render::test_vt::VtStreamExt;
+    use crate::terminal::render::{Cell as RenderCell, Cells};
     use crate::font::shared_grid::SharedGrid;
     use crate::font::{Style, OPTIONS};
     use crate::terminal::page;
@@ -636,15 +637,17 @@ mod tests {
 
     /// Build render cells for a row of plain narrow codepoints (Rust-only
     /// helper: the Zig tests get cells from a terminal render state).
-    fn plain_cells(s: &str, cols: usize) -> Vec<RenderCell> {
-        let mut cells: Vec<RenderCell> = s
-            .chars()
-            .map(|c| RenderCell {
+    fn plain_cells(s: &str, cols: usize) -> Cells {
+        let mut cells = Cells::default();
+        for c in s.chars() {
+            cells.append(RenderCell {
                 raw: page::Cell::init(c as u32),
                 ..Default::default()
-            })
-            .collect();
-        cells.resize_with(cols.max(cells.len()), RenderCell::default);
+            });
+        }
+        while cells.len() < cols {
+            cells.append(RenderCell::default());
+        }
         cells
     }
 
@@ -659,7 +662,7 @@ mod tests {
         {
             let cells = plain_cells("ABCD   EFG", 10);
             let mut it = testdata.shaper.run_iterator(RunOptions {
-                cells: &cells,
+                cells: cells.slice(),
                 ..RunOptions::new(grid)
             });
             let mut count = 0;
@@ -676,7 +679,7 @@ mod tests {
         for (s, n) in [(">=", 2u16), ("===", 3)] {
             let cells = plain_cells(s, 5);
             let mut it = testdata.shaper.run_iterator(RunOptions {
-                cells: &cells,
+                cells: cells.slice(),
                 ..RunOptions::new(grid)
             });
             let mut count = 0;
@@ -693,7 +696,7 @@ mod tests {
         {
             let cells = plain_cells("\u{2500}\u{2501}", 10);
             let mut it = testdata.shaper.run_iterator(RunOptions {
-                cells: &cells,
+                cells: cells.slice(),
                 ..RunOptions::new(grid)
             });
             let mut count = 0;
@@ -723,7 +726,7 @@ mod tests {
                 count
             };
             let base = RunOptions {
-                cells: &cells,
+                cells: cells.slice(),
                 ..RunOptions::new(grid)
             };
             assert_eq!(1, count_runs(&mut testdata.shaper, base));
@@ -739,20 +742,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Ported Zig tests. They need terminal::Terminal, its vtStream and
+    // Ported Zig tests. They use terminal::Terminal, its vtStream and
     // terminal::RenderState.
-    // TODO(port-terminal): enable when terminal::Terminal is ported
     // -----------------------------------------------------------------
 
     /// Zig: `state.row_data.get(row).cells.slice()` converted to the
     /// shaper's cell type.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
-    fn row_cells(state: &crate::terminal::RenderState, row: usize) -> Vec<RenderCell> {
-        state.row_data.get(row).cells.slice().to_vec()
+    fn row_cells(state: &crate::terminal::RenderState, row: usize) -> Cells {
+        state.row_data.cells[row].clone()
     }
 
     /// Zig: `Terminal.init(io, alloc, .{ .cols, .rows })`.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     fn new_terminal(cols: u16, rows: u16) -> crate::terminal::Terminal {
         crate::terminal::Terminal::init(crate::terminal::terminal::Options {
             cols,
@@ -764,8 +764,7 @@ mod tests {
 
     /// Zig: build a terminal, feed `input` through its vt stream, update a
     /// render state and return the cells of `row`.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
-    fn terminal_row(cols: u16, rows: u16, inputs: &[&[u8]], row: usize) -> Vec<RenderCell> {
+    fn terminal_row(cols: u16, rows: u16, inputs: &[&[u8]], row: usize) -> Cells {
         let mut t = new_terminal(cols, rows);
         {
             let mut s = t.vt_stream();
@@ -774,17 +773,16 @@ mod tests {
             }
         }
         let mut state = crate::terminal::RenderState::empty();
-        state.update(&mut t).unwrap();
+        state.update(&mut t);
         row_cells(&state, row)
     }
 
     /// Count the runs of a row (shaping each one), the most common
     /// pattern in the Zig tests.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
-    fn count_runs(testdata: &mut TestShaper, opts_fn: impl FnOnce(RunOptions<'_>) -> RunOptions<'_>, cells: &[RenderCell]) -> usize {
+    fn count_runs(testdata: &mut TestShaper, opts_fn: impl FnOnce(RunOptions<'_>) -> RunOptions<'_>, cells: &Cells) -> usize {
         let grid: &SharedGrid = &testdata.grid;
         let mut it = testdata.shaper.run_iterator(opts_fn(RunOptions {
-            cells,
+            cells: cells.slice(),
             ..RunOptions::new(grid)
         }));
         let mut count = 0;
@@ -795,7 +793,6 @@ mod tests {
         count
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn run_iterator() {
         let mut testdata = test_shaper();
@@ -806,7 +803,7 @@ mod tests {
 
             // Get our run iterator
             let grid: &SharedGrid = &testdata.grid;
-            let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+            let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
             let mut count = 0;
             while it.next().unwrap().is_some() {
                 count += 1;
@@ -819,7 +816,7 @@ mod tests {
             let cells = terminal_row(10, 3, &[b"ABCD   EFG"], 0);
 
             let grid: &SharedGrid = &testdata.grid;
-            let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+            let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
             let mut count = 0;
             while it.next().unwrap().is_some() {
                 count += 1;
@@ -833,7 +830,7 @@ mod tests {
 
             // Get our run iterator
             let grid: &SharedGrid = &testdata.grid;
-            let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+            let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
             let mut count = 0;
             while it.next().unwrap().is_some() {
                 count += 1;
@@ -845,7 +842,6 @@ mod tests {
         }
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn run_iterator_empty_cells_with_background_set() {
         let mut testdata = test_shaper();
@@ -863,24 +859,24 @@ mod tests {
             for x in [1, 2] {
                 let list_cell = t
                     .screens
-                    .active()
+                    .active
                     .pages
                     .get_cell(crate::terminal::point::Point::Active(crate::terminal::point::Coordinate { x, y: 0 }))
                     .unwrap();
-                let cell = list_cell.cell;
-                // SAFETY: the pin points at a live cell.
-                unsafe {
-                    *cell = page::Cell::init_bg_rgb(crate::terminal::color::Rgb { r: 0xFF, g: 0, b: 0 });
-                }
+                let mut cell = page::Cell::default();
+                cell.set_content_tag(page::ContentTag::BgColorRgb);
+                cell.set_content_color_rgb(crate::terminal::color::Rgb { r: 0xFF, g: 0, b: 0 });
+                // SAFETY: the list cell points at a live cell.
+                unsafe { *list_cell.cell = cell };
             }
 
             let mut state = crate::terminal::RenderState::empty();
-            state.update(&mut t).unwrap();
+            state.update(&mut t);
             let cells = row_cells(&state, 0);
 
             // Get our run iterator
             let grid: &SharedGrid = &testdata.grid;
-            let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+            let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
             {
                 let run = it.next().unwrap().unwrap();
                 assert_eq!(3, it.hooks.shaper.hb_buf.get_length());
@@ -891,7 +887,6 @@ mod tests {
         }
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape() {
         let mut testdata = test_shaper();
@@ -906,7 +901,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -918,12 +913,11 @@ mod tests {
 
     /// Shared body of the ligature tests: every run has `run_cells` cells
     /// and shapes into one glyph; there is exactly one run.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     fn expect_single_lig(testdata: &mut TestShaper, input: &[u8], run_cells: u16) {
         let cells = terminal_row(5, 3, &[input], 0);
 
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -936,7 +930,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_inconsolata_ligs() {
         let mut testdata = test_shaper();
@@ -945,7 +938,6 @@ mod tests {
         expect_single_lig(&mut testdata, b"===", 3);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_monaspace_ligs() {
         let mut testdata = test_shaper_with_font(TestFont::MonaspaceNeon);
@@ -957,7 +949,6 @@ mod tests {
     // that cells are in strict LTR order. This means that we need to
     // force RTL text to be LTR for rendering. This test ensures that
     // we are correctly forcing RTL text to be LTR.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_arabic_forced_ltr() {
         let mut testdata = test_shaper_with_font(TestFont::Arabic);
@@ -965,7 +956,7 @@ mod tests {
         let cells = terminal_row(120, 30, &[include_bytes!("testdata/arabic.txt")], 0);
 
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -983,7 +974,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_emoji_width() {
         let mut testdata = test_shaper();
@@ -992,7 +982,7 @@ mod tests {
             let cells = terminal_row(5, 3, &["👍".as_bytes()], 0);
 
             let grid: &SharedGrid = &testdata.grid;
-            let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+            let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
             let mut count = 0;
             while let Some(run) = it.next().unwrap() {
                 count += 1;
@@ -1006,7 +996,6 @@ mod tests {
         }
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_emoji_width_long() {
         let mut testdata = test_shaper();
@@ -1015,10 +1004,11 @@ mod tests {
         let mut t = new_terminal(30, 3);
 
         {
-            let page = t.screens.active_mut().pages.pages.first_mut().unwrap().page_mut();
-            let row = page.get_row(1);
-            // SAFETY: row 1 of the first page is live.
-            let cell = unsafe { &mut row.cells_mut(page)[0] };
+            // SAFETY: the first node is live while `t` is.
+            let page = unsafe { t.screens.active.pages.pages.first.unwrap().as_mut().page() };
+            // SAFETY: row 1 and its first cell are live page memory.
+            let row = unsafe { &mut *page.get_row(1) };
+            let cell = unsafe { &mut (*page.get_cells(row))[0] };
             *cell = page::Cell::init(0x1F9D4); // Person with beard
             let graphemes: [u32; 4] = [
                 0x1F3FB, // Light skin tone (Fitz 1-2)
@@ -1030,12 +1020,12 @@ mod tests {
         }
 
         let mut state = crate::terminal::RenderState::empty();
-        state.update(&mut t).unwrap();
+        state.update(&mut t);
         let cells = row_cells(&state, 1);
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1048,7 +1038,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shaper_selects_font_for_entire_grapheme() {
         let mut testdata = test_shaper();
@@ -1065,13 +1054,12 @@ mod tests {
         assert!(testdata.grid.has_codepoint(additional, 0x20E3, None));
 
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let run = it.next().unwrap().unwrap();
         assert_eq!(additional, run.font_index);
     }
 
     /// Shared body of the variation selector tests.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     fn expect_variation_selector(selector: u32) {
         let mut testdata = test_shaper();
 
@@ -1084,7 +1072,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1096,19 +1084,16 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_variation_selector_vs15() {
         expect_variation_selector(0xFE0E);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_variation_selector_vs16() {
         expect_variation_selector(0xFE0F);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_with_empty_cells_in_between() {
         let mut testdata = test_shaper();
@@ -1118,7 +1103,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1129,7 +1114,6 @@ mod tests {
         }
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_combining_characters() {
         let mut testdata = test_shaper();
@@ -1145,7 +1129,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1162,8 +1146,7 @@ mod tests {
 
     /// Zig: a terminal with grapheme clustering set to `grapheme_cluster`
     /// fed with `input`, returning row 0.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
-    fn terminal_row_grapheme(grapheme_cluster: bool, input: &str) -> Vec<RenderCell> {
+    fn terminal_row_grapheme(grapheme_cluster: bool, input: &str) -> Cells {
         let mut t = new_terminal(30, 3);
 
         t.modes.set(crate::terminal::modes::Mode::GraphemeCluster, grapheme_cluster);
@@ -1174,14 +1157,13 @@ mod tests {
         }
 
         let mut state = crate::terminal::RenderState::empty();
-        state.update(&mut t).unwrap();
+        state.update(&mut t);
         row_cells(&state, 0)
     }
 
     // This test exists because the string it uses causes HarfBuzz to output a
     // non-monotonic run with our cluster level set to `characters`, which we need
     // to handle by tracking the max cluster for the run.
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_devanagari_string() {
         // We need a font that supports devanagari for this to work, if we can't
@@ -1196,7 +1178,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
 
         let run = it.next().unwrap();
         assert!(run.is_some());
@@ -1224,7 +1206,6 @@ mod tests {
         // return error.SkipZigTest; (the Zig body is commented out)
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_tibetan_characters() {
         // We need a font that has multiple glyphs for this codepoint to reproduce
@@ -1239,7 +1220,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1269,7 +1250,6 @@ mod tests {
         // return error.SkipZigTest; (the Zig body is commented out)
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_chakma_vowel_sign_with_ligature_vowel_sign_renders_first() {
         // We need a font that supports Chakma for this to work, if we can't find
@@ -1294,7 +1274,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1316,7 +1296,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_bengali_ligatures_with_out_of_order_vowels() {
         // Whereas this test in CoreText had everything shaping into one giant
@@ -1349,7 +1328,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1374,7 +1353,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_box_glyphs() {
         let mut testdata = test_shaper();
@@ -1388,7 +1366,7 @@ mod tests {
 
         // Get our run iterator
         let grid: &SharedGrid = &testdata.grid;
-        let mut it = testdata.shaper.run_iterator(RunOptions { cells: &cells, ..RunOptions::new(grid) });
+        let mut it = testdata.shaper.run_iterator(RunOptions { cells: cells.slice(), ..RunOptions::new(grid) });
         let mut count = 0;
         while let Some(run) = it.next().unwrap() {
             count += 1;
@@ -1403,7 +1381,6 @@ mod tests {
         assert_eq!(1, count);
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_selection_boundary() {
         let mut testdata = test_shaper();
@@ -1427,7 +1404,6 @@ mod tests {
         assert_eq!(3, count_runs(&mut testdata, |o| RunOptions { selection: Some([1, 1]), ..o }, &cells));
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_cursor_boundary() {
         let mut testdata = test_shaper();
@@ -1459,7 +1435,6 @@ mod tests {
         }
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_cursor_boundary_and_colored_emoji() {
         let mut testdata = test_shaper();
@@ -1477,7 +1452,6 @@ mod tests {
         assert_eq!(1, count_runs(&mut testdata, |o| o, &cells));
     }
 
-    #[cfg(any())] // TODO(port-terminal): enable when terminal::Terminal is ported
     #[test]
     fn shape_cell_attribute_change() {
         let mut testdata = test_shaper();

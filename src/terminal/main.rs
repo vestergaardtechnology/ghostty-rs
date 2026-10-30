@@ -1,6 +1,6 @@
 //! Port of `src/terminal/main.zig`.
 //!
-//! STATUS: partial — re-exports of unported modules (render, SelectionGesture) pending.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "ansi.rs"]
@@ -133,6 +133,7 @@ pub use self::page::Page;
 pub use self::page_list::PageList;
 pub use self::page_list::Pin;
 pub use self::page_list::Scrollbar;
+pub use self::render::RenderState;
 pub use self::parser::Csi as CSI;
 pub use self::parser::Dcs as DCS;
 pub use self::parser::Parser;
@@ -176,9 +177,7 @@ pub use self::build_options::Options;
 /// (Zig: `options`, the `terminal_options` build module.)
 pub use self::build_options as options;
 
-// TODO(port-dedupe): the following re-exports are pending the ports of
-// their modules: `RenderState` (render.zig), `SelectionGesture`
-// (SelectionGesture.zig). `c_api` is the `c` module.
+// (Zig: `c_api` is the `c` module.)
 
 /// Whether this target supports terminal page compression.
 pub const COMPRESSION_ENABLED: bool = self::mem::can_reclaim(self::mem::DecommitMode::Strict);

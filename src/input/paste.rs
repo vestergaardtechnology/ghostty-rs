@@ -2,22 +2,21 @@
 //!
 //! STATUS: ported
 //!
-//! Port notes / deviations:
-//! - Zig's `encode` takes either a `[]u8` (mutable, never fails) or a
-//!   `[]const u8` (may return `error.MutableRequired`) via `anytype`. Rust
-//!   splits this into [`encode`] (`&mut [u8]`) and [`encode_const`]
-//!   (`&[u8]`).
-//! - [`encode_writer`] takes any `std::io::Write`. Zig copies the data
-//!   directly into the writer's buffer (`writableSliceGreedy`) and encodes
-//!   it in place; Rust has no generic access to a writer's buffer, so the
-//!   data is copied and encoded chunk by chunk through a stack buffer and
-//!   then written. The bytes written are identical.
+//! Deviations:
+//! - Zig's `encode(data: anytype, ...)` switches on the data type: a
+//!   `[]u8` returns the frame directly while a `[]const u8` returns
+//!   `Error![3][]const u8`. In Rust this is the [`EncodeData`] trait,
+//!   implemented for `&mut [u8]` and `&[u8]` with the same return types.
+//! - `*std.Io.Writer` is any `std::io::Write`. `encodeWriter` copies the
+//!   data into the writer's own buffer (`writableSliceGreedy`) in Zig;
+//!   `std::io::Write` exposes no such buffer, so the data is copied chunk
+//!   by chunk into a fixed stack buffer, encoded there, and written out.
 
 use std::fmt;
-use std::io::Write;
+use std::io::{self, Write};
 
 use crate::terminal::modes::Mode;
-use crate::terminal::Terminal;
+use crate::terminal::terminal::Terminal;
 
 /// The bracketed paste (mode 2004) frame written around the data.
 pub const BRACKETED_PREFIX: &[u8] = b"\x1b[200~";
@@ -42,10 +41,10 @@ impl Options {
     }
 }
 
-/// These are the set of byte values that are always replaced by
-/// a space (per xterm's behavior) for any text insertion method e.g.
-/// a paste, drag and drop, etc. These are copied directly from xterm's
-/// source.
+// These are the set of byte values that are always replaced by
+// a space (per xterm's behavior) for any text insertion method e.g.
+// a paste, drag and drop, etc. These are copied directly from xterm's
+// source.
 const STRIP: &[u8] = &[
     0x00, // NUL
     0x08, // BS
@@ -70,68 +69,106 @@ const STRIP: &[u8] = &[
     0x0F, // VDISCARD (Ctrl+O)
 ];
 
-#[inline]
-fn is_strip(b: u8) -> bool {
-    STRIP.contains(&b)
+/// Returns true if `data` contains any byte of `set`
+/// (Zig: `std.mem.indexOfAny(...) != null`).
+fn contains_any(data: &[u8], set: &[u8]) -> bool {
+    data.iter().any(|b| set.contains(b))
+}
+
+/// Returns true if `needle` occurs in `haystack` (Zig: `std.mem.indexOf`).
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The data types accepted by [`encode`] (Zig: the `anytype` switch on
+/// `[]u8` vs `[]const u8`).
+pub trait EncodeData<'a> {
+    /// `[3][]const u8` for mutable data, `Error![3][]const u8` for
+    /// const data.
+    type Output;
+
+    fn encode(self, opts: Options) -> Self::Output;
+}
+
+impl<'a> EncodeData<'a> for &'a mut [u8] {
+    type Output = [&'a [u8]; 3];
+
+    fn encode(self, opts: Options) -> Self::Output {
+        let data = self;
+
+        // If we have any of the strip values, then we need to replace them
+        // with spaces. This is what xterm does and it does it regardless
+        // of bracketed paste mode. This is a security measure to prevent pastes
+        // from containing bytes that could be used to inject commands.
+        for b in data.iter_mut() {
+            if STRIP.contains(b) {
+                *b = b' ';
+            }
+        }
+
+        // Bracketed paste mode (mode 2004) wraps pasted data in
+        // fenceposts so that the terminal can ignore things like newlines.
+        if opts.bracketed {
+            return [BRACKETED_PREFIX, data, BRACKETED_SUFFIX];
+        }
+
+        // Non-bracketed. We have to replace newline with `\r`. This matches
+        // the behavior of xterm and other terminals. For `\r\n` this will
+        // result in `\r\r` which does match xterm.
+        for b in data.iter_mut() {
+            if *b == b'\n' {
+                *b = b'\r';
+            }
+        }
+
+        [b"", data, b""]
+    }
+}
+
+impl<'a> EncodeData<'a> for &'a [u8] {
+    type Output = Result<[&'a [u8]; 3], Error>;
+
+    fn encode(self, opts: Options) -> Self::Output {
+        let data = self;
+
+        // See the mutable implementation: any strip value requires
+        // modifying the data, which const data can't do.
+        if contains_any(data, STRIP) {
+            return Err(Error::MutableRequired);
+        }
+
+        if opts.bracketed {
+            return Ok([BRACKETED_PREFIX, data, BRACKETED_SUFFIX]);
+        }
+
+        if data.contains(&b'\n') {
+            return Err(Error::MutableRequired);
+        }
+
+        Ok([b"", data, b""])
+    }
 }
 
 /// Encode the given data for pasting. The resulting value can be written
 /// to the pty to perform a paste of the input data.
 ///
-/// This is the mutable form of Zig's `encode`: the data is modified in
-/// place and this can't fail. See [`encode_const`] for the const form.
+/// The data can be either a `&mut [u8]` or a `&[u8]`. If the data
+/// type is const then `Error` may be returned. If the data type
+/// is mutable then this function can't return an error.
+///
+/// This slightly complex calling style allows for initially const
+/// data to be passed in without an allocation, since it is rare in normal
+/// use cases that the data will need to be modified. In the unlikely case
+/// data does need to be modified, the caller can make a mutable copy
+/// after seeing the error.
 ///
 /// The data is returned as a set of slices to limit allocations. The caller
 /// can combine the slices into a single buffer if desired.
 ///
 /// WARNING: The input data is not checked for safety. See the `is_safe`
 /// function to check if the data is safe to paste.
-pub fn encode(data: &mut [u8], opts: Options) -> [&[u8]; 3] {
-    // If we have any of the strip values, then we need to replace them
-    // with spaces. This is what xterm does and it does it regardless
-    // of bracketed paste mode. This is a security measure to prevent pastes
-    // from containing bytes that could be used to inject commands.
-    for b in data.iter_mut() {
-        if is_strip(*b) {
-            *b = b' ';
-        }
-    }
-
-    // Bracketed paste mode (mode 2004) wraps pasted data in
-    // fenceposts so that the terminal can ignore things like newlines.
-    if opts.bracketed {
-        return [BRACKETED_PREFIX, data, BRACKETED_SUFFIX];
-    }
-
-    // Non-bracketed. We have to replace newline with `\r`. This matches
-    // the behavior of xterm and other terminals. For `\r\n` this will
-    // result in `\r\r` which does match xterm.
-    for b in data.iter_mut() {
-        if *b == b'\n' {
-            *b = b'\r';
-        }
-    }
-
-    [b"", data, b""]
-}
-
-/// The const form of Zig's `encode`: returns `Error::MutableRequired` if
-/// encoding requires a mutable copy of the data. The caller can make a
-/// mutable copy after seeing the error and use [`encode`].
-pub fn encode_const(data: &[u8], opts: Options) -> Result<[&[u8]; 3], Error> {
-    if data.iter().any(|&b| is_strip(b)) {
-        return Err(Error::MutableRequired);
-    }
-
-    if opts.bracketed {
-        return Ok([BRACKETED_PREFIX, data, BRACKETED_SUFFIX]);
-    }
-
-    if memchr::memchr(b'\n', data).is_some() {
-        return Err(Error::MutableRequired);
-    }
-
-    Ok([b"", data, b""])
+pub fn encode<'a, D: EncodeData<'a>>(data: D, opts: Options) -> D::Output {
+    data.encode(opts)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +180,9 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("MutableRequired")
+        match self {
+            Error::MutableRequired => f.write_str("MutableRequired"),
+        }
     }
 }
 
@@ -151,17 +190,22 @@ impl std::error::Error for Error {}
 
 /// Encode the given data for pasting directly into a writer. This is
 /// the same transformation as `encode` (unsafe bytes replaced, bracketed
-/// frame or newline conversion per `opts`) but the data is never
-/// modified and no allocation is made. This is the form to use when the
-/// data is const and the result is being assembled into a single buffer
-/// anyway.
+/// frame or newline conversion per `opts`) but the data is never copied
+/// into a separate allocation: it is copied chunk by chunk into a small
+/// staging buffer, where it is modified in place, and written out.
+/// This is the form to use when the data is const and the result is
+/// being assembled into a single buffer anyway.
 ///
-/// The data is copied and encoded in chunks, so any writer works; a
-/// writer with less total capacity than needed reports an error as usual.
+/// Any writer works; a writer with less total capacity than the encoded
+/// data reports its write error as usual.
 ///
 /// WARNING: The input data is not checked for safety. See `is_safe`
 /// and `is_safe_with` to check if the data is safe to paste.
-pub fn encode_writer<W: Write + ?Sized>(writer: &mut W, data: &[u8], opts: Options) -> std::io::Result<()> {
+pub fn encode_writer<W: Write + ?Sized>(
+    writer: &mut W,
+    data: &[u8],
+    opts: Options,
+) -> io::Result<()> {
     if opts.bracketed {
         writer.write_all(BRACKETED_PREFIX)?;
     }
@@ -169,17 +213,21 @@ pub fn encode_writer<W: Write + ?Sized>(writer: &mut W, data: &[u8], opts: Optio
     // The byte transformations are position-independent, so the data
     // can be copied and encoded chunk by chunk. The frame returned by
     // encode is ignored since it's written around the whole data here.
-    let mut buf = [0u8; 4096];
-    for chunk in data.chunks(buf.len()) {
-        let dest = &mut buf[..chunk.len()];
-        dest.copy_from_slice(chunk);
-        let _ = encode(dest, opts);
+    let mut staging = [0u8; 1024];
+    let mut remaining = data;
+    while !remaining.is_empty() {
+        let n = staging.len().min(remaining.len());
+        let dest = &mut staging[..n];
+        dest.copy_from_slice(&remaining[..n]);
+        let _ = encode(&mut *dest, opts);
         writer.write_all(dest)?;
+        remaining = &remaining[n..];
     }
 
     if opts.bracketed {
         writer.write_all(BRACKETED_SUFFIX)?;
     }
+
     Ok(())
 }
 
@@ -201,7 +249,7 @@ pub fn encode_writer<W: Write + ?Sized>(writer: &mut W, data: &[u8], opts: Optio
 /// should raise suspicion that the producer of the paste data is
 /// acting strangely.
 pub fn is_safe(data: &[u8]) -> bool {
-    memchr::memchr2(b'\r', b'\n', data).is_none() && memchr::memmem::find(data, b"\x1b[201~").is_none()
+    !contains_any(data, b"\r\n") && !contains_slice(data, b"\x1b[201~")
 }
 
 /// Returns true if the data looks safe to paste given how it will be
@@ -217,7 +265,7 @@ pub fn is_safe(data: &[u8]) -> bool {
 /// should use `is_safe` instead.
 pub fn is_safe_with(data: &[u8], opts: Options) -> bool {
     if opts.bracketed {
-        return memchr::memmem::find(data, BRACKETED_SUFFIX).is_none();
+        return !contains_slice(data, BRACKETED_SUFFIX);
     }
     is_safe(data)
 }
@@ -263,126 +311,144 @@ mod tests {
         assert!(!is_safe_with(b"he\x1b[201~llo", UNBRACKETED));
     }
 
-    fn fixed_writer(buf: &mut [u8], f: impl FnOnce(&mut &mut [u8]) -> std::io::Result<()>) -> std::io::Result<usize> {
-        let total = buf.len();
-        let mut writer: &mut [u8] = buf;
-        f(&mut writer)?;
-        Ok(total - writer.len())
+    /// Zig `std.Io.Writer.fixed`: a writer over a fixed buffer.
+    fn fixed(buf: &mut [u8]) -> io::Cursor<&mut [u8]> {
+        io::Cursor::new(buf)
+    }
+
+    fn buffered<'a>(w: &'a io::Cursor<&mut [u8]>) -> &'a [u8] {
+        &w.get_ref()[..w.position() as usize]
     }
 
     #[test]
     fn encode_writer_bracketed() {
         let mut buf = [0u8; 64];
-        let n = fixed_writer(&mut buf, |w| encode_writer(w, b"hel\x1blo\nworld", BRACKETED)).unwrap();
-        assert_eq!(b"\x1b[200~hel lo\nworld\x1b[201~", &buf[..n]);
+        let mut writer = fixed(&mut buf);
+        encode_writer(&mut writer, b"hel\x1blo\nworld", BRACKETED).unwrap();
+        assert_eq!(buffered(&writer), b"\x1b[200~hel lo\nworld\x1b[201~");
     }
 
     #[test]
     fn encode_writer_unbracketed() {
         let mut buf = [0u8; 64];
-        let n = fixed_writer(&mut buf, |w| encode_writer(w, b"hel\x00lo\r\nworld", UNBRACKETED)).unwrap();
-        assert_eq!(b"hel lo\r\rworld", &buf[..n]);
+        let mut writer = fixed(&mut buf);
+        encode_writer(&mut writer, b"hel\x00lo\r\nworld", UNBRACKETED).unwrap();
+        assert_eq!(buffered(&writer), b"hel lo\r\rworld");
     }
 
     #[test]
     fn encode_writer_empty() {
         let mut buf = [0u8; 64];
-        let n = fixed_writer(&mut buf, |w| encode_writer(w, b"", BRACKETED)).unwrap();
-        assert_eq!(b"\x1b[200~\x1b[201~", &buf[..n]);
-        let n = fixed_writer(&mut buf, |w| encode_writer(w, b"", UNBRACKETED)).unwrap();
-        assert_eq!(b"", &buf[..n]);
+        {
+            let mut writer = fixed(&mut buf);
+            encode_writer(&mut writer, b"", BRACKETED).unwrap();
+            assert_eq!(buffered(&writer), b"\x1b[200~\x1b[201~");
+        }
+        let mut writer = fixed(&mut buf);
+        encode_writer(&mut writer, b"", UNBRACKETED).unwrap();
+        assert_eq!(buffered(&writer), b"");
     }
 
     #[test]
     fn encode_writer_chunks_through_a_small_writer_buffer() {
         // A writer with a 4-byte staging buffer that drains into a list,
         // so the data is copied and encoded in several chunks.
-        let mut sink = std::io::BufWriter::with_capacity(4, Vec::new());
+        let mut sink = io::BufWriter::with_capacity(4, Vec::<u8>::new());
+
         let data = b"line one\nline\x1btwo\nline three\n";
         encode_writer(&mut sink, data, BRACKETED).unwrap();
         sink.flush().unwrap();
-        let list = sink.into_inner().unwrap();
-        assert_eq!(&b"\x1b[200~line one\nline two\nline three\n\x1b[201~"[..], &list[..]);
+        assert_eq!(
+            &sink.get_ref()[..],
+            b"\x1b[200~line one\nline two\nline three\n\x1b[201~"
+        );
     }
 
     #[test]
     fn encode_writer_too_small() {
         let mut buf = [0u8; 4];
-        assert!(fixed_writer(&mut buf, |w| encode_writer(w, b"hello", BRACKETED)).is_err());
+        let mut writer = fixed(&mut buf);
+        assert!(encode_writer(&mut writer, b"hello", BRACKETED).is_err());
     }
 
     #[test]
     fn max_frame_size() {
-        let result = encode_const(b"", BRACKETED).unwrap();
+        let result = encode(&b""[..], BRACKETED).unwrap();
         assert_eq!(MAX_FRAME_SIZE, result[0].len() + result[2].len());
     }
 
     #[test]
     fn encode_bracketed() {
-        let result = encode_const(b"hello", BRACKETED).unwrap();
-        assert_eq!(b"\x1b[200~", result[0]);
-        assert_eq!(b"hello", result[1]);
-        assert_eq!(b"\x1b[201~", result[2]);
+        let result = encode(&b"hello"[..], BRACKETED).unwrap();
+        assert_eq!(result[0], b"\x1b[200~");
+        assert_eq!(result[1], b"hello");
+        assert_eq!(result[2], b"\x1b[201~");
     }
 
     #[test]
     fn encode_unbracketed_no_newlines() {
-        let result = encode_const(b"hello", UNBRACKETED).unwrap();
-        assert_eq!(b"", result[0]);
-        assert_eq!(b"hello", result[1]);
-        assert_eq!(b"", result[2]);
+        let result = encode(&b"hello"[..], UNBRACKETED).unwrap();
+        assert_eq!(result[0], b"");
+        assert_eq!(result[1], b"hello");
+        assert_eq!(result[2], b"");
     }
 
     #[test]
     fn encode_unbracketed_newlines_const() {
-        assert_eq!(Err(Error::MutableRequired), encode_const(b"hello\nworld", UNBRACKETED));
+        assert_eq!(
+            encode(&b"hello\nworld"[..], UNBRACKETED),
+            Err(Error::MutableRequired)
+        );
     }
 
     #[test]
     fn encode_unbracketed_newlines() {
         let mut data = b"hello\nworld".to_vec();
-        let result = encode(&mut data, UNBRACKETED);
-        assert_eq!(b"", result[0]);
-        assert_eq!(b"hello\rworld", result[1]);
-        assert_eq!(b"", result[2]);
+        let result = encode(data.as_mut_slice(), UNBRACKETED);
+        assert_eq!(result[0], b"");
+        assert_eq!(result[1], b"hello\rworld");
+        assert_eq!(result[2], b"");
     }
 
     #[test]
     fn encode_unbracketed_windows_stye_newline() {
         let mut data = b"hello\r\nworld".to_vec();
-        let result = encode(&mut data, UNBRACKETED);
-        assert_eq!(b"", result[0]);
-        assert_eq!(b"hello\r\rworld", result[1]);
-        assert_eq!(b"", result[2]);
+        let result = encode(data.as_mut_slice(), UNBRACKETED);
+        assert_eq!(result[0], b"");
+        assert_eq!(result[1], b"hello\r\rworld");
+        assert_eq!(result[2], b"");
     }
 
     #[test]
     fn encode_strip_unsafe_bytes_const() {
-        assert_eq!(Err(Error::MutableRequired), encode_const(b"hello\x00world", BRACKETED));
+        assert_eq!(
+            encode(&b"hello\x00world"[..], BRACKETED),
+            Err(Error::MutableRequired)
+        );
     }
 
     #[test]
     fn encode_strip_unsafe_bytes_mutable_bracketed() {
         let mut data = b"hel\x1blo\x00world".to_vec();
-        let result = encode(&mut data, BRACKETED);
-        assert_eq!(b"\x1b[200~", result[0]);
-        assert_eq!(b"hel lo world", result[1]);
-        assert_eq!(b"\x1b[201~", result[2]);
+        let result = encode(data.as_mut_slice(), BRACKETED);
+        assert_eq!(result[0], b"\x1b[200~");
+        assert_eq!(result[1], b"hel lo world");
+        assert_eq!(result[2], b"\x1b[201~");
     }
 
     #[test]
     fn encode_strip_unsafe_bytes_mutable_unbracketed() {
         let mut data = b"hel\x03lo".to_vec();
-        let result = encode(&mut data, UNBRACKETED);
-        assert_eq!(b"", result[0]);
-        assert_eq!(b"hel lo", result[1]);
-        assert_eq!(b"", result[2]);
+        let result = encode(data.as_mut_slice(), UNBRACKETED);
+        assert_eq!(result[0], b"");
+        assert_eq!(result[1], b"hel lo");
+        assert_eq!(result[2], b"");
     }
 
     #[test]
     fn encode_strip_multiple_unsafe_bytes() {
         let mut data = b"\x00\x08\x7f".to_vec();
-        let result = encode(&mut data, BRACKETED);
-        assert_eq!(b"   ", result[1]);
+        let result = encode(data.as_mut_slice(), BRACKETED);
+        assert_eq!(result[1], b"   ");
     }
 }

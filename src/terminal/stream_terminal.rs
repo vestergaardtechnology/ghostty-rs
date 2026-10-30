@@ -2715,7 +2715,6 @@ mod tests {
         assert_eq!(vec![true, false], events());
     }
 
-    #[cfg(any())] // TODO(port-render): enable once render.rs (RenderState) is ported
     #[test]
     fn render_hold_effect_can_snapshot_the_frame_when_the_hold_begins() {
         use crate::terminal::render::RenderState;
@@ -2731,7 +2730,7 @@ mod tests {
             if !held {
                 return;
             }
-            STATE.with(|s| s.borrow_mut().update(h.terminal).unwrap());
+            STATE.with(|s| s.borrow_mut().update(h.terminal));
             SNAPSHOTS.with(|c| c.set(c.get() + 1));
         }
         fn char_at(y: usize, x: usize) -> u32 {
