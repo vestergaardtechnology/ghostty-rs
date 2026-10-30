@@ -6,33 +6,11 @@
 //! for clipboard operations. When copying text to clipboard, matching
 //! codepoints will be replaced with their mapped values.
 
-/// To ease our usage later, we map it directly to formatter entries
-/// (Zig: `terminal/formatter.zig` `CodepointMap`).
-///
-/// TODO(port-dedupe): replace with crate::terminal::formatter::CodepointMap
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    /// Unicode codepoint range to replace.
-    /// Asserts: range[0] <= range[1]
-    pub range: [u32; 2],
+/// To ease our usage later, we map it directly to formatter entries.
+pub use crate::terminal::formatter::CodepointMap as Entry;
 
-    /// Replacement value for this range.
-    pub replacement: Replacement,
-}
-
-/// Zig `CodepointMap.Replacement`.
-///
-/// TODO(port-dedupe): replace with
-/// crate::terminal::formatter::CodepointMapReplacement
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Replacement {
-    /// A single replacement codepoint.
-    Codepoint(u32),
-
-    /// A UTF-8 encoded string to replace with. Asserts the
-    /// UTF-8 encoding (must be valid).
-    String(String),
-}
+/// (Zig: `Entry.Replacement`.)
+pub use crate::terminal::formatter::Replacement;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClipboardCodepointMap {
@@ -52,6 +30,7 @@ impl ClipboardCodepointMap {
     /// be an arena allocator of some sort since the struct itself
     /// doesn't support fine-grained deallocation of fields.
     pub fn clone_map(&self) -> ClipboardCodepointMap {
+        // Strings are owned, so a derived clone is a deep copy.
         self.clone()
     }
 

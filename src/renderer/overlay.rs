@@ -1,7 +1,7 @@
 //! Port of `src/renderer/Overlay.zig`.
 //!
-//! STATUS: ported (against stand-ins for `terminal.RenderState` and
-//! `renderer.image.Image.Pending`, see [`standin`]; TODO(port-dedupe)).
+//! STATUS: ported (against a stand-in for `renderer.image.Image.Pending`,
+//! see [`standin`]; TODO(port-dedupe)).
 //!
 //! The debug overlay that can be drawn on top of the terminal
 //! during the rendering process.
@@ -34,38 +34,14 @@ use crate::font::sprite::canvas::{Color as AlphaColor, DrawError};
 use crate::renderer::size::{CellSize, Size};
 use crate::terminal::page::{SemanticContent, SemanticPrompt};
 
-use self::standin::{Pending, PixelFormat, RenderState};
+use crate::terminal::render::RenderState;
+
+use self::standin::{Pending, PixelFormat};
 
 const LOG: &str = "renderer_overlay";
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
-    use crate::terminal::page;
-
-    /// TODO(port-dedupe): replace with `crate::terminal::render::RenderState`.
-    /// Only the fields the overlay reads are modelled; Zig's
-    /// `std.MultiArrayList`s are `Vec`s.
-    #[derive(Debug, Clone, Default)]
-    pub struct RenderState {
-        pub row_data: Vec<RenderStateRow>,
-    }
-
-    /// TODO(port-dedupe): replace with `crate::terminal::render::RenderState::Row`.
-    #[derive(Debug, Clone, Default)]
-    pub struct RenderStateRow {
-        /// Raw row data.
-        pub raw: page::Row,
-        /// The cells in this row. Guaranteed to be `cols` length.
-        pub cells: Vec<RenderStateCell>,
-    }
-
-    /// TODO(port-dedupe): replace with `crate::terminal::render::RenderState::Cell`.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct RenderStateCell {
-        /// Always set, this is the raw copied cell data from page.Cell.
-        pub raw: page::Cell,
-    }
-
     /// TODO(port-dedupe): replace with `crate::renderer::image::Image::Pending`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Pending {
@@ -425,17 +401,19 @@ impl Overlay {
         let border_color = Color::Hyperlink.rect_border();
         let fill_color = Color::Hyperlink.rect_fill();
 
-        for (y, row) in state.row_data.iter().enumerate() {
-            if !row.raw.hyperlink() {
+        let row_raw = &state.row_data.raw;
+        let row_cells = &state.row_data.cells;
+        for (y, (row, cells)) in row_raw.iter().zip(row_cells.iter()).enumerate() {
+            if !row.hyperlink() {
                 continue;
             }
 
-            let raw_cells = &row.cells;
+            let raw_cells = &cells.raw;
 
             let mut x: usize = 0;
             while x < raw_cells.len() {
                 // Skip cells without hyperlinks
-                if !raw_cells[x].raw.hyperlink() {
+                if !raw_cells[x].hyperlink() {
                     x += 1;
                     continue;
                 }
@@ -444,7 +422,7 @@ impl Overlay {
                 let start_x = x;
 
                 // Find end of contiguous hyperlink cells
-                while x < raw_cells.len() && raw_cells[x].raw.hyperlink() {
+                while x < raw_cells.len() && raw_cells[x].hyperlink() {
                     x += 1;
                 }
                 let end_x = x;
@@ -459,7 +437,8 @@ impl Overlay {
     }
 
     fn highlight_semantic_prompts(&mut self, state: &RenderState) {
-        let rows = &state.row_data;
+        let row_raw = &state.row_data.raw;
+        let row_cells = &state.row_data.cells;
 
         // Highlight the row-level semantic prompt bars. The prompts are easy
         // because they're part of the row metadata.
@@ -468,9 +447,9 @@ impl Overlay {
             let prompt_fill = Color::SemanticPrompt.rect_fill();
 
             let mut y: usize = 0;
-            while y < rows.len() {
+            while y < row_raw.len() {
                 // If its not a semantic prompt row, skip it.
-                if rows[y].raw.semantic_prompt() == SemanticPrompt::None {
+                if row_raw[y].semantic_prompt() == SemanticPrompt::None {
                     y += 1;
                     continue;
                 }
@@ -479,8 +458,7 @@ impl Overlay {
                 // all continuations.
                 let start_y = y;
                 y += 1;
-                while y < rows.len()
-                    && rows[y].raw.semantic_prompt() == SemanticPrompt::PromptContinuation
+                while y < row_raw.len() && row_raw[y].semantic_prompt() == SemanticPrompt::PromptContinuation
                 {
                     y += 1;
                 }
@@ -501,12 +479,12 @@ impl Overlay {
         }
 
         // Highlight contiguous semantic cells within rows.
-        for (y, row) in rows.iter().enumerate() {
-            let raw_cells = &row.cells;
+        for (y, cells) in row_cells.iter().enumerate() {
+            let raw_cells = &cells.raw;
 
             let mut x: usize = 0;
             while x < raw_cells.len() {
-                let cell = raw_cells[x].raw;
+                let cell = raw_cells[x];
                 let content = cell.semantic_content();
                 let start_x = x;
 
@@ -520,7 +498,7 @@ impl Overlay {
                 // Find the end of this content.
                 x += 1;
                 while x < raw_cells.len() {
-                    let next = raw_cells[x].raw;
+                    let next = raw_cells[x];
                     if next.semantic_content() != content {
                         break;
                     }
@@ -662,10 +640,23 @@ impl Overlay {
 
 #[cfg(test)]
 mod tests {
-    use super::standin::{RenderStateCell, RenderStateRow};
     use super::*;
     use crate::renderer::size::{GridSize, Padding, ScreenSize};
-    use crate::terminal::page;
+    use crate::terminal::render::test_vt::VtStreamExt;
+    use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
+
+    /// A render state of a 10x2 terminal (the grid of [`size`]) after
+    /// writing `input`.
+    fn render_state(input: &[u8]) -> RenderState {
+        let mut t = Terminal::init(TerminalOptions::new(10, 2)).unwrap();
+        {
+            let mut s = t.vt_stream();
+            s.next_slice(input);
+        }
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        state
+    }
 
     // Not Zig tests: Overlay.zig has none. These check the drawing basics.
 
@@ -714,18 +705,9 @@ mod tests {
     #[test]
     fn highlight_hyperlinks_draws_in_rect() {
         let mut o = Overlay::init(size()).unwrap();
-        let mut raw_row = page::Row::default();
-        raw_row.set_hyperlink(true);
-        let mut cells = vec![RenderStateCell::default(); 10];
-        for c in &mut cells[2..4] {
-            c.raw.set_hyperlink(true);
-        }
-        let state = RenderState {
-            row_data: vec![RenderStateRow {
-                raw: raw_row,
-                cells,
-            }],
-        };
+        // A hyperlink over cells 2..4 of row 0.
+        let state = render_state(b"\x1b[1;3H\x1b]8;;http://example.com\x1b\\AB\x1b]8;;\x1b\\");
+        assert!(state.row_data.raw[0].hyperlink());
         o.apply_features(&state, &[Feature::HighlightHyperlinks]);
 
         let px = |x: i32, y: i32| o.surface.buf[(y * 100 + x) as usize];
@@ -740,20 +722,8 @@ mod tests {
     #[test]
     fn semantic_prompt_bar() {
         let mut o = Overlay::init(size()).unwrap();
-        let mut prompt = page::Row::default();
-        prompt.set_semantic_prompt(SemanticPrompt::Prompt);
-        let state = RenderState {
-            row_data: vec![
-                RenderStateRow {
-                    raw: prompt,
-                    cells: vec![RenderStateCell::default(); 10],
-                },
-                RenderStateRow {
-                    raw: page::Row::default(),
-                    cells: vec![RenderStateCell::default(); 10],
-                },
-            ],
-        };
+        let mut state = render_state(b"");
+        state.row_data.raw[0].set_semantic_prompt(SemanticPrompt::Prompt);
         o.apply_features(&state, &[Feature::SemanticPrompts]);
         let px = |x: i32, y: i32| o.surface.buf[(y * 100 + x) as usize];
         assert_ne!(0, px(2, 10).a);
