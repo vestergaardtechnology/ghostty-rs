@@ -1,16 +1,14 @@
 //! Port of `src/terminal/kitty/graphics_exec.zig`.
 //!
-//! STATUS: partial — everything is ported, but `Terminal.zig` is not yet
-//! on main, so `execute` runs against a minimal stand-in [`Terminal`]
-//! (see `stand_in`; TODO(port-terminal)) and the one test that needs a
-//! real terminal operation ("placements created after a full reset are
-//! retained") is gated.
+//! STATUS: ported
 //!
 //! Notes on the port:
 //! - `std.Io`/allocator parameters are dropped.
 //! - The storage lives in the active screen, so the functions below borrow
 //!   the screen's `kitty_images` and `pages` separately and pass the
 //!   terminal values the storage reads as a [`TerminalInfo`].
+//! - `Terminal.kittyGraphics` (a wrapper of `execute`) is defined here, as
+//!   the `Terminal` port expects.
 
 use crate::terminal::kitty::graphics_animation as animation;
 use crate::terminal::kitty::graphics_command::{self as command, Command, Control, Response};
@@ -22,22 +20,21 @@ use crate::terminal::kitty::graphics_storage::{
 };
 use crate::terminal::screen::Screen;
 use crate::terminal::size::AllocError;
-
-pub use self::stand_in::Terminal;
+use crate::terminal::terminal::Terminal;
 
 const LOG_TARGET: &str = "kitty_gfx";
 
 /// The [`TerminalInfo`] of a terminal (its geometry, scrolling region and
 /// the active screen's cursor).
 pub fn terminal_info(t: &Terminal) -> TerminalInfo {
-    TerminalInfo {
-        cols: t.cols,
-        rows: t.rows,
-        width_px: t.width_px,
-        height_px: t.height_px,
-        scrolling_region: t.scrolling_region,
-        cursor_x: t.screens.active.cursor.x,
-        cursor_y: t.screens.active.cursor.y,
+    TerminalInfo::from_terminal(t)
+}
+
+impl Terminal {
+    /// Execute a kitty graphics command against this terminal (Zig:
+    /// `Terminal.kittyGraphics`).
+    pub fn kitty_graphics(&mut self, cmd: &Command) -> Option<Response> {
+        execute(self, cmd)
     }
 }
 
@@ -1131,130 +1128,10 @@ fn encode_error(r: &mut Response, err: image::Error) {
     };
 }
 
-pub mod stand_in {
-    //! TODO(port-terminal): replace with `crate::terminal::Terminal` once
-    //! `Terminal.zig` is ported.
-    //!
-    //! A minimal stand-in for the parts of `Terminal` that `execute` and
-    //! its tests use: the active screen, the grid and pixel size, the
-    //! scrolling region and `index` (moving the cursor down, scrolling at
-    //! the bottom of the scrolling region).
-
-    use crate::terminal::kitty::graphics_image::Limits as LoadingImageLimits;
-    use crate::terminal::kitty::graphics_storage::{ScrollingRegion, TerminalInfo};
-    use crate::terminal::screen::{self, Screen};
-    use crate::terminal::size::{AllocError, CellCountInt};
-
-    /// `Terminal.screens` (only the active screen).
-    pub struct ScreenSet {
-        pub active: Box<Screen>,
-    }
-
-    pub struct Terminal {
-        pub screens: ScreenSet,
-        pub rows: CellCountInt,
-        pub cols: CellCountInt,
-        pub width_px: u32,
-        pub height_px: u32,
-        pub scrolling_region: ScrollingRegion,
-    }
-
-    /// `Terminal.Options` (the fields the stand-in uses).
-    #[derive(Debug, Clone)]
-    pub struct Options {
-        pub cols: CellCountInt,
-        pub rows: CellCountInt,
-        pub max_scrollback_bytes: Option<usize>,
-        pub kitty_image_storage_limit: usize,
-        pub kitty_image_loading_limits: LoadingImageLimits,
-    }
-
-    impl Options {
-        pub fn new(cols: CellCountInt, rows: CellCountInt) -> Options {
-            Options {
-                cols,
-                rows,
-                max_scrollback_bytes: Some(10_000),
-                kitty_image_storage_limit: 320 * 1000 * 1000,
-                kitty_image_loading_limits: LoadingImageLimits::DIRECT,
-            }
-        }
-    }
-
-    impl Terminal {
-        pub fn init(opts: Options) -> Result<Terminal, AllocError> {
-            let active = Screen::init(screen::Options {
-                cols: opts.cols,
-                rows: opts.rows,
-                max_scrollback_bytes: opts.max_scrollback_bytes,
-                max_scrollback_lines: None,
-                kitty_image_storage_limit: opts.kitty_image_storage_limit,
-                kitty_image_loading_limits: opts.kitty_image_loading_limits,
-            })?;
-            Ok(Terminal {
-                screens: ScreenSet {
-                    active: Box::new(active),
-                },
-                rows: opts.rows,
-                cols: opts.cols,
-                width_px: 0,
-                height_px: 0,
-                scrolling_region: TerminalInfo::new(opts.cols, opts.rows).scrolling_region,
-            })
-        }
-
-        /// Move the cursor to the next line in the scrolling region,
-        /// possibly scrolling (simplified `Terminal.index`: no semantic
-        /// prompt handling and no kitty scroll-margin adjustment).
-        pub fn index(&mut self) -> Result<(), AllocError> {
-            let region = self.scrolling_region;
-            let rows = self.rows;
-            let cols = self.cols;
-            let screen: &mut Screen = &mut self.screens.active;
-
-            // Unset pending wrap state
-            screen.cursor.pending_wrap = false;
-
-            // Outside of the scroll region we move the cursor one line down.
-            if screen.cursor.y < region.top || screen.cursor.y > region.bottom {
-                // We only move down if we're not already at the bottom of
-                // the screen.
-                if screen.cursor.y < rows - 1 {
-                    screen.cursor_down(1);
-                }
-                return Ok(());
-            }
-
-            // If the cursor is inside the scrolling region and on the bottom-most
-            // line, then we scroll up. If our scrolling region is the full screen
-            // we create scrollback.
-            if screen.cursor.y == region.bottom
-                && screen.cursor.x >= region.left
-                && screen.cursor.x <= region.right
-            {
-                if region.top == 0
-                    && region.left == 0
-                    && region.right == cols - 1
-                    && (!screen.no_scrollback || region.bottom == 0)
-                {
-                    return screen.cursor_scroll_above();
-                }
-                return screen.cursor_scroll_region_up((region.bottom - region.top) as usize);
-            }
-
-            // Increase cursor by 1, maximum to bottom of scroll region
-            if screen.cursor.y < region.bottom {
-                screen.cursor_down(1);
-            }
-            Ok(())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::stand_in::Options;
     use super::*;
+    use crate::terminal::terminal::Options;
     use crate::terminal::kitty::graphics_command::{Parser, Quiet, Transmission};
     use crate::terminal::kitty::graphics_image::test_util::TmpDir;
     use crate::terminal::kitty::graphics_storage::ImageStorage;
@@ -2151,8 +2028,6 @@ mod tests {
     // but PageList.reset marked it garbage. Placements copy the cursor
     // pin, so every placement created after a reset was born garbage
     // and silently swept by the next placement command.
-    // TODO(port-terminal): needs `Terminal::full_reset`.
-    #[cfg(any())]
     #[test]
     fn kittygfx_placements_created_after_a_full_reset_are_retained() {
         let mut t = init(80, 24);

@@ -33,6 +33,7 @@ use crate::terminal::kitty::graphics_pixel as pixel;
 use crate::terminal::page_list::{PageList, Pin, PinOverflow, PinPtr};
 use crate::terminal::point;
 use crate::terminal::size::{AllocError, CellCountInt};
+use crate::terminal::terminal::Terminal;
 
 const LOG_TARGET: &str = "kitty_gfx";
 
@@ -56,22 +57,7 @@ pub fn next_generation() -> u64 {
     GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// `Terminal.ScrollingRegion`.
-///
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::ScrollingRegion`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ScrollingRegion {
-    // Top and bottom of the scroll region (0-indexed)
-    // Precondition: top < bottom
-    pub top: CellCountInt,
-    pub bottom: CellCountInt,
-
-    // Left/right scroll regions.
-    // Precondition: right > left
-    // Precondition: right <= cols - 1
-    pub left: CellCountInt,
-    pub right: CellCountInt,
-}
+pub use crate::terminal::terminal::ScrollingRegion;
 
 /// The terminal values the storage reads (Zig: the `*Terminal` parameter;
 /// the active screen's page list is passed separately because the storage
@@ -95,6 +81,19 @@ pub struct TerminalInfo {
 }
 
 impl TerminalInfo {
+    /// The values of the given terminal (and its active screen's cursor).
+    pub fn from_terminal(t: &Terminal) -> TerminalInfo {
+        TerminalInfo {
+            cols: t.cols,
+            rows: t.rows,
+            width_px: t.width_px,
+            height_px: t.height_px,
+            scrolling_region: t.scrolling_region,
+            cursor_x: t.screens.active.cursor.x,
+            cursor_y: t.screens.active.cursor.y,
+        }
+    }
+
     /// A terminal of the given size with a full-screen scrolling region,
     /// no pixel geometry and the cursor at the top-left.
     pub fn new(cols: CellCountInt, rows: CellCountInt) -> TerminalInfo {
@@ -2629,31 +2628,16 @@ fn div_ceil(numerator: u32, denominator: u32) -> u32 {
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    //! A minimal stand-in for `Terminal` in the storage tests: the same
-    //! field paths (`t.screens.active.pages`, `t.width_px`, ...) the Zig
-    //! tests use, backed by a single screen.
-    //!
-    //! TODO(port-terminal): replace with `crate::terminal::Terminal`.
+    //! Helpers mirroring the Zig tests' `Terminal.init` and `trackPin`.
 
     use super::*;
-    use crate::terminal::screen::{self, Screen};
+    use crate::terminal::terminal::Options;
 
-    pub struct TestScreens {
-        pub active: Screen,
-    }
-
-    pub struct TestTerminal {
-        pub screens: TestScreens,
-        pub cols: CellCountInt,
-        pub rows: CellCountInt,
-        pub width_px: u32,
-        pub height_px: u32,
-        pub scrolling_region: ScrollingRegion,
-    }
+    pub type TestTerminal = Terminal;
 
     /// `Terminal.init(io, alloc, .{ .cols = cols, .rows = rows })`
-    pub fn init(cols: CellCountInt, rows: CellCountInt) -> TestTerminal {
-        init_scrollback(cols, rows, Some(10_000))
+    pub fn init(cols: CellCountInt, rows: CellCountInt) -> Terminal {
+        Terminal::init(Options::new(cols, rows)).unwrap()
     }
 
     /// `Terminal.init` with `.max_scrollback_bytes`.
@@ -2661,41 +2645,21 @@ pub(crate) mod test_util {
         cols: CellCountInt,
         rows: CellCountInt,
         max_scrollback_bytes: Option<usize>,
-    ) -> TestTerminal {
-        let active = Screen::init(screen::Options {
-            cols,
-            rows,
+    ) -> Terminal {
+        Terminal::init(Options {
             max_scrollback_bytes,
-            max_scrollback_lines: None,
-            kitty_image_storage_limit: 320 * 1000 * 1000,
-            kitty_image_loading_limits: LoadingImageLimits::DIRECT,
+            ..Options::new(cols, rows)
         })
-        .unwrap();
-        TestTerminal {
-            screens: TestScreens { active },
-            cols,
-            rows,
-            width_px: 0,
-            height_px: 0,
-            scrolling_region: TerminalInfo::new(cols, rows).scrolling_region,
-        }
+        .unwrap()
     }
 
     /// The [`TerminalInfo`] of the terminal.
-    pub fn info(t: &TestTerminal) -> TerminalInfo {
-        TerminalInfo {
-            cols: t.cols,
-            rows: t.rows,
-            width_px: t.width_px,
-            height_px: t.height_px,
-            scrolling_region: t.scrolling_region,
-            cursor_x: t.screens.active.cursor.x,
-            cursor_y: t.screens.active.cursor.y,
-        }
+    pub fn info(t: &Terminal) -> TerminalInfo {
+        TerminalInfo::from_terminal(t)
     }
 
     /// Our pin for the placement (Zig: `trackPin`).
-    pub fn track_pin(t: &mut TestTerminal, x: CellCountInt, y: u32) -> PinPtr {
+    pub fn track_pin(t: &mut Terminal, x: CellCountInt, y: u32) -> PinPtr {
         let pages = &mut t.screens.active.pages;
         let p = pages
             .pin(point::Point::Active(point::Coordinate { x, y }))
