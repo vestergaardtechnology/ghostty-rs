@@ -1,8 +1,6 @@
 //! Port of `src/terminal/page.zig`.
 //!
-//! STATUS: partial — `Cell.CLayout` (C ABI layout metadata built with
-//! `lib.Packed`/`lib.PackedTaggedUnion`) is pending the `src/lib` port;
-//! everything else, including all tests, is ported.
+//! STATUS: ported
 //!
 //! Notes on the port:
 //! - `Row` and `Cell` are `packed struct(u64)` in Zig. They are `u64`
@@ -2852,8 +2850,126 @@ pub type CellBacking = u64;
 /// C ABI type of [`Cell`] (Zig: `Cell.C`).
 pub type CellC = u64;
 
-// TODO(port-dedupe): `Cell.CLayout` (C ABI field metadata built with
-// crate::lib::packed::Packed) is pending the `src/lib` port.
+/// Bit layout metadata for the C representation of [`Cell`]
+/// (Zig: `Cell.CLayout`). All physical bit offsets and widths mirror
+/// [`cell_fields`]; Zig reflects them from the packed struct, the port
+/// declares them once with [`crate::lib::packed::packed_fields`].
+pub mod cell_c_layout {
+    use crate::lib::packed::{
+        packed_fields, Arm, Encoding, FieldSpec, PackedField, PackedLayout, PackedTaggedUnion,
+    };
+
+    // `content.codepoint`: packed struct(u24) { data: u21, _pad: u3 }
+    static CODEPOINT_FIELDS: [PackedField; 2] = packed_fields([
+        FieldSpec::scalar("data", "u21", 21).name("codepoint"),
+        FieldSpec::scalar("_pad", "u3", 3).omit(),
+    ]);
+    /// Layout of the `codepoint` arm of `Cell.content`.
+    pub static CODEPOINT: PackedLayout = PackedLayout::new("Codepoint", 24, &CODEPOINT_FIELDS);
+
+    // `content.color_palette`: packed struct(u24) { data: u8, _pad: u16 }
+    static COLOR_PALETTE_FIELDS: [PackedField; 2] = packed_fields([
+        FieldSpec::scalar("data", "u8", 8)
+            .name("index")
+            .type_name("GhosttyColorPaletteIndex"),
+        FieldSpec::scalar("_pad", "u16", 16).omit(),
+    ]);
+    /// Layout of the `color_palette` arm of `Cell.content`.
+    pub static COLOR_PALETTE: PackedLayout =
+        PackedLayout::new("ColorPalette", 24, &COLOR_PALETTE_FIELDS);
+
+    // `content.color_rgb`: Cell.RGB = packed struct { r: u8, g: u8, b: u8 }
+    static COLOR_RGB_FIELDS: [PackedField; 3] = packed_fields([
+        FieldSpec::scalar("r", "u8", 8),
+        FieldSpec::scalar("g", "u8", 8),
+        FieldSpec::scalar("b", "u8", 8),
+    ]);
+    /// Layout of the `color_rgb` arm of `Cell.content`.
+    pub static COLOR_RGB: PackedLayout = PackedLayout::new("RGB", 24, &COLOR_RGB_FIELDS);
+
+    /// The `content` packed union, selected by `content_tag`.
+    pub static CONTENT: PackedTaggedUnion = PackedTaggedUnion::new(
+        "Cell",
+        "Content",
+        24,
+        "content",
+        "content_tag",
+        &[
+            (
+                "codepoint",
+                Some(Arm {
+                    source: "codepoint",
+                    source_ty: "Codepoint",
+                    layout: &CODEPOINT,
+                }),
+            ),
+            (
+                "codepoint_grapheme",
+                Some(Arm {
+                    source: "codepoint",
+                    source_ty: "Codepoint",
+                    layout: &CODEPOINT,
+                }),
+            ),
+            (
+                "bg_color_palette",
+                Some(Arm {
+                    source: "color_palette",
+                    source_ty: "ColorPalette",
+                    layout: &COLOR_PALETTE,
+                }),
+            ),
+            (
+                "bg_color_rgb",
+                Some(Arm {
+                    source: "color_rgb",
+                    source_ty: "RGB",
+                    layout: &COLOR_RGB,
+                }),
+            ),
+        ],
+    );
+
+    static FIELDS: [PackedField; 8] = packed_fields([
+        FieldSpec::scalar("content_tag", "ContentTag", 2).type_name("GhosttyCellContentTag"),
+        FieldSpec::compound("content", "Content", 24).encoding(Encoding::TaggedUnion(&CONTENT)),
+        FieldSpec::scalar("style_id", "u16", 16).type_name("GhosttyStyleId"),
+        FieldSpec::scalar("wide", "Wide", 2).type_name("GhosttyCellWide"),
+        FieldSpec::scalar("protected", "bool", 1),
+        FieldSpec::scalar("hyperlink", "bool", 1),
+        FieldSpec::scalar("semantic_content", "SemanticContent", 2)
+            .type_name("GhosttyCellSemanticContent"),
+        FieldSpec::scalar("_padding", "u16", 16).omit(),
+    ]);
+
+    /// Metadata for the C representation (Zig: `Cell.CLayout`).
+    pub static LAYOUT: PackedLayout = PackedLayout::new("Cell", 64, &FIELDS);
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::terminal::page::cell_fields;
+
+        #[test]
+        fn c_layout_matches_cell_fields() {
+            let check = |name: &str, f: crate::terminal::page::BitField| {
+                assert_eq!(f.offset as usize, LAYOUT.bit_offset(name), "{name}");
+                assert_eq!(f.bits as usize, LAYOUT.bit_width(name), "{name}");
+            };
+            check("content_tag", cell_fields::CONTENT_TAG);
+            check("content", cell_fields::CONTENT);
+            check("style_id", cell_fields::STYLE_ID);
+            check("wide", cell_fields::WIDE);
+            check("protected", cell_fields::PROTECTED);
+            check("hyperlink", cell_fields::HYPERLINK);
+            check("semantic_content", cell_fields::SEMANTIC_CONTENT);
+            check("_padding", cell_fields::PADDING);
+            assert!(LAYOUT.field_name("_padding").is_none());
+            assert_eq!(Some("codepoint"), CODEPOINT.field_name("data"));
+            assert_eq!(Some("index"), COLOR_PALETTE.field_name("data"));
+        }
+    }
+}
 
 impl Cell {
     #[inline(always)]
