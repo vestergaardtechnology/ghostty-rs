@@ -6885,6 +6885,9 @@ mod integration_tests {
             )),
             shell_integration: crate::config::config::ShellIntegration::None,
             term: "xterm-256color".into(),
+            // The config is not finalized (gtk-single-instance stays
+            // `detect`), so keep the GTK runtime's cgroup hooks out of it.
+            linux_cgroup: crate::config::config::LinuxCgroup::Never,
             ..Config::default()
         };
 

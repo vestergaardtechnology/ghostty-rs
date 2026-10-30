@@ -2844,7 +2844,7 @@ pub(crate) mod test_support {
             let app = Application::new_with_config(core, CoreConfig::default(), None);
             let rt = Box::leak(Box::new(apprt::App::default()));
             app.set_rt(rt);
-            gio::Application::set_default(Some(&app));
+            app.set_default();
             a.replace(Some(app.clone()));
             app
         })

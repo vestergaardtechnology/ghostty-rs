@@ -240,7 +240,7 @@ mod tests {
             core.scrollbar = Scrollbar::Never;
             let config = Config::new(&core);
 
-            let surface = Surface::default();
+            let surface = Surface::new(&crate::apprt::gtk::class::overrides::Overrides::NONE);
             surface.set_property("config", &config);
             surface.set_split_min_size(Size { width: 30, height: 40 });
 
