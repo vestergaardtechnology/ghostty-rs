@@ -17,9 +17,9 @@
 //! module) is [`rt`] because `runtime` is the module port of
 //! `apprt/runtime.zig` (whose `Runtime` enum is re-exported here).
 //!
-//! [`App`]/[`Surface`] are the GTK runtime's types when built with the
-//! `gtk` Cargo feature. Builds without it (and all test builds) use the
-//! recording [`standin`] types; in test builds with `gtk` the stand-ins
+//! [`App`]/[`Surface`] are the embedded runtime's types on macOS and the
+//! GTK runtime's types when built with the `gtk` Cargo feature elsewhere.
+//! Other builds (and all test builds) use the recording [`standin`] types; in test builds with `gtk` the stand-ins
 //! wrap an optional real GTK app/surface and forward to it, so the core
 //! test suite can observe what it asked of the runtime while GTK smoke
 //! tests run the real apprt.
@@ -66,9 +66,12 @@ pub use self::gtk as rt;
 pub use self::embedded as rt;
 
 /// The runtime app and surface (Zig: `apprt.runtime.App`/`Surface`).
-#[cfg(all(feature = "gtk", not(test)))]
+/// On macOS this is the embedded runtime (libghostty).
+#[cfg(all(target_os = "macos", not(test)))]
+pub use self::embedded::{App, Surface};
+#[cfg(all(feature = "gtk", not(target_os = "macos"), not(test)))]
 pub use self::gtk::{App, Surface};
-#[cfg(any(test, not(feature = "gtk")))]
+#[cfg(any(test, all(not(feature = "gtk"), not(target_os = "macos"))))]
 pub use self::standin::{App, Surface};
 
 /// An error from the runtime (Zig: the runtimes' inferred error sets).
