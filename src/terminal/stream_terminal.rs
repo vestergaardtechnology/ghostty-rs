@@ -1798,7 +1798,8 @@ impl<'a> Handler<'a> {
                 None => b"",
             };
             let version: &[u8] = if !version.is_empty() { version } else { b"libghostty" };
-            let Ok(n) = write_fixed(&mut buf, |w| {
+            // The final byte is reserved for the callback's sentinel, as in Zig.
+            let Ok(n) = write_fixed(&mut buf[..287], |w| {
                 w.write_all(b"\x1BP>|")?;
                 w.write_all(version)?;
                 w.write_all(b"\x1B\\")
