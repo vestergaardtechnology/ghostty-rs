@@ -208,7 +208,7 @@ pub struct Windows {
 #[derive(Debug)]
 pub struct CoreText {
     /// The initialized font
-    pub font: crate::pkg::macos::text::Font,
+    pub font: &'static crate::pkg::macos::text::Font,
 
     /// Variations to apply to this font. We apply the variations to the
     /// search descriptor but sometimes when the font collection is
@@ -258,11 +258,11 @@ impl DeferredFace {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         if let Some(ct) = &self.ct {
             use crate::pkg::macos;
-            let Some(family_name) = ct.font.copy_attribute_family_name() else {
+            let Some(family_name) = ct.font.copy_attribute(macos::text::attr::FamilyName) else {
                 return Ok(b"unknown");
             };
             if let Some(s) = family_name.cstring_ptr(macos::foundation::StringEncoding::Utf8) {
-                return Ok(s);
+                return Ok(s.to_bytes());
             }
             return family_name
                 .cstring(buf, macos::foundation::StringEncoding::Utf8)
@@ -304,7 +304,7 @@ impl DeferredFace {
                 return self.family_name(buf);
             };
             if let Some(s) = display_name.cstring_ptr(macos::foundation::StringEncoding::Utf8) {
-                return Ok(s);
+                return Ok(s.to_bytes());
             }
             // "NULL if the internal storage of theString does not allow
             // this to be returned efficiently." In this case, we need
@@ -385,7 +385,7 @@ impl DeferredFace {
     fn load_core_text(&mut self, lib: Library, opts: face::Options) -> Result<Face, Error> {
         let _ = lib;
         let ct = self.ct.as_ref().unwrap();
-        let mut face = Face::init_font_copy(&ct.font, opts)?;
+        let mut face = Face::init_font_copy(ct.font, opts)?;
         face.set_variations(&ct.variations, opts)?;
         Ok(face)
     }
@@ -404,7 +404,7 @@ impl DeferredFace {
         let ct = self.ct.as_ref().unwrap();
 
         // Get the URL for the font so we can get the filepath
-        let url = ct.font.copy_attribute_url().ok_or(Error::FontHasNoFile)?;
+        let url = ct.font.copy_attribute(macos::text::attr::Url).ok_or(Error::FontHasNoFile)?;
 
         // Get the path from the URL
         let path = url.copy_path();
@@ -419,7 +419,7 @@ impl DeferredFace {
         )
         .map_err(|_| Error::OutOfMemory)?;
         let decoded =
-            macos::foundation::Url::create_string_by_replacing_percent_escapes(&path, &blank);
+            macos::foundation::URL::create_string_by_replacing_percent_escapes(path, blank);
         blank.release();
         path.release();
         let decoded = decoded.map_err(|_| Error::OutOfMemory)?;

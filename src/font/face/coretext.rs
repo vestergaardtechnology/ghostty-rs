@@ -1,8 +1,7 @@
 //! Port of `src/font/face/coretext.zig`.
 //!
-//! STATUS: ported (macOS-only; not compiled on Linux. Written against the
-//! snake_case transliteration of the `pkg/macos` Zig API, which is not yet
-//! ported to Rust, so this has never been compiled.)
+//! STATUS: ported (macOS-only; type-checked with
+//! `cargo check --target x86_64-apple-darwin`, tests not run on Linux)
 
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
@@ -29,7 +28,7 @@ pub enum Error {
     InvalidAtlasFormat,
     InvalidSVGTable,
     /// A CoreFoundation/CoreText/CoreGraphics call failed.
-    Macos(macos::foundation::Error),
+    Macos(macos::Error),
     /// A HarfBuzz call failed.
     Harfbuzz(harfbuzz::Error),
 }
@@ -42,8 +41,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<macos::foundation::Error> for Error {
-    fn from(e: macos::foundation::Error) -> Error {
+impl From<macos::Error> for Error {
+    fn from(e: macos::Error) -> Error {
         Error::Macos(e)
     }
 }
@@ -80,7 +79,7 @@ pub const ITALIC_SKEW: macos::graphics::AffineTransform = macos::graphics::Affin
 #[derive(Debug)]
 pub struct Face {
     /// Our font face
-    pub font: macos::text::Font,
+    pub font: &'static macos::text::Font,
 
     /// Harfbuzz font corresponding to this face. We only use this
     /// if we're using Harfbuzz.
@@ -109,15 +108,15 @@ impl Face {
         let _ = lib;
 
         let data = macos::foundation::Data::create_with_bytes_no_copy(source)?;
-        let desc = macos::text::create_font_descriptor_from_data(&data);
+        let desc = macos::text::create_font_descriptor_from_data(data);
         data.release();
         let desc = desc.ok_or(Error::FontInitFailure)?;
 
-        let ct_font = macos::text::Font::create_with_font_descriptor(&desc, 12.0);
+        let ct_font = macos::text::Font::create_with_font_descriptor(desc, 12.0);
         desc.release();
         let ct_font = ct_font?;
 
-        let result = Self::init_font_copy(&ct_font, opts);
+        let result = Self::init_font_copy(ct_font, opts);
         ct_font.release();
         result
     }
@@ -130,17 +129,17 @@ impl Face {
         // Create a copy. The copyWithAttributes docs say the size is in points,
         // but we need to scale the points by the DPI and to do that we use our
         // function called "pixels".
-        let ct_font = base.copy_with_attributes(opts.size.pixels() as f64, None, None)?;
+        let ct_font = base.copy_with_attributes(opts.size.pixels(), None, None)?;
         Self::init_font(ct_font, opts)
     }
 
     /// Initialize a face with a CTFont. This will take ownership over
     /// the CTFont. This does NOT copy or retain the CTFont.
-    pub fn init_font(ct_font: macos::text::Font, opts: Options) -> Result<Face, Error> {
+    pub fn init_font(ct_font: &'static macos::text::Font, opts: Options) -> Result<Face, Error> {
         let traits = ct_font.get_symbolic_traits();
 
         let hb_font = if HARFBUZZ_SHAPER {
-            let mut hb_font = match harfbuzz::coretext::create_font(&ct_font) {
+            let mut hb_font = match harfbuzz::coretext::create_font(ct_font) {
                 Ok(v) => v,
                 Err(err) => {
                     ct_font.release();
@@ -155,7 +154,7 @@ impl Face {
         };
 
         let color = if traits.color_glyphs {
-            match ColorState::init(&ct_font) {
+            match ColorState::init(ct_font) {
                 Ok(v) => Some(v),
                 Err(err) => {
                     if let Some(mut hb) = hb_font {
@@ -184,38 +183,47 @@ impl Face {
         // In debug mode, we output information about available variation axes,
         // if they exist.
         if cfg!(debug_assertions) {
-            if let Some(axes) = result.font.copy_attribute_variation_axes() {
+            if let Some(axes) = ct_font.copy_attribute(macos::text::attr::VariationAxes) {
                 let mut buf = [0u8; 1024];
                 let name = String::from_utf8_lossy(result.name(&mut buf).unwrap_or(b"")).into_owned();
                 log::debug!(target: LOG, "variation axes font={}", name);
 
                 let len = axes.get_count();
                 for i in 0..len {
-                    let dict: macos::foundation::Dictionary = axes.get_value_at_index(i);
+                    use macos::foundation::{Dictionary, Number, NumberType};
                     use macos::text::FontVariationAxisKey as Key;
-                    let cf_name = dict.get_value_string(Key::Name.key()).unwrap();
-                    let cf_id = dict.get_value_number(Key::Identifier.key()).unwrap();
-                    let cf_min = dict.get_value_number(Key::MinimumValue.key()).unwrap();
-                    let cf_max = dict.get_value_number(Key::MaximumValue.key()).unwrap();
-                    let cf_def = dict.get_value_number(Key::DefaultValue.key()).unwrap();
+                    // SAFETY: the variation axes attribute is an array of
+                    // dictionaries keyed by `FontVariationAxisKey`, with
+                    // string names and numeric values.
+                    let (cf_name, cf_id, cf_min, cf_max, cf_def) = unsafe {
+                        let dict: &Dictionary = axes.get_value_at_index(i);
+                        (
+                            dict.get_value::<macos::foundation::String>(Key::Name.key().as_ptr())
+                                .unwrap(),
+                            dict.get_value::<Number>(Key::Identifier.key().as_ptr()).unwrap(),
+                            dict.get_value::<Number>(Key::MinimumValue.key().as_ptr()).unwrap(),
+                            dict.get_value::<Number>(Key::MaximumValue.key().as_ptr()).unwrap(),
+                            dict.get_value::<Number>(Key::DefaultValue.key().as_ptr()).unwrap(),
+                        )
+                    };
 
                     let namestr = cf_name
                         .cstring(&mut buf, macos::foundation::StringEncoding::Utf8)
                         .map(|s| String::from_utf8_lossy(s).into_owned())
                         .unwrap_or_default();
 
-                    let mut id_raw: i32 = 0;
-                    let _ = cf_id.get_value_i32(&mut id_raw);
+                    let mut id_raw: std::ffi::c_int = 0;
+                    let _ = cf_id.get_value(NumberType::Int, &mut id_raw);
                     let id = VariationId::from_bits(id_raw as u32);
 
                     let mut min: f64 = 0.0;
-                    let _ = cf_min.get_value_f64(&mut min);
+                    let _ = cf_min.get_value(NumberType::Double, &mut min);
 
                     let mut max: f64 = 0.0;
-                    let _ = cf_max.get_value_f64(&mut max);
+                    let _ = cf_max.get_value(NumberType::Double, &mut max);
 
                     let mut def: f64 = 0.0;
-                    let _ = cf_def.get_value_f64(&mut def);
+                    let _ = cf_def.get_value(NumberType::Double, &mut def);
 
                     log::debug!(
                         target: LOG,
@@ -267,7 +275,7 @@ impl Face {
     pub fn name<'a>(&'a self, buf: &'a mut [u8]) -> Result<&'a [u8], NameError> {
         let family_name = self.font.copy_family_name();
         if let Some(s) = family_name.cstring_ptr(macos::foundation::StringEncoding::Utf8) {
-            return Ok(s);
+            return Ok(s.to_bytes());
         }
 
         // "NULL if the internal storage of theString does not allow
@@ -282,7 +290,7 @@ impl Face {
     /// for clearing any glyph caches, font atlas data, etc.
     pub fn set_size(&mut self, opts: Options) -> Result<(), Error> {
         // We just create a copy and replace ourself
-        let face = Self::init_font_copy(&self.font, opts)?;
+        let face = Self::init_font_copy(self.font, opts)?;
         *self = face;
         Ok(())
     }
@@ -299,11 +307,8 @@ impl Face {
         let mut desc = self.font.copy_descriptor();
         for v in vs {
             let id_bits = v.id.to_bits();
-            let id = macos::foundation::Number::create(
-                macos::foundation::NumberType::Int,
-                &id_bits as *const u32 as *const std::ffi::c_void,
-            )?;
-            let next = desc.create_copy_with_variation(&id, v.value);
+            let id = macos::foundation::Number::create(macos::foundation::NumberType::Int, &id_bits)?;
+            let next = macos::text::FontDescriptor::create_copy_with_variation(desc, id, v.value);
             id.release();
             desc.release();
             desc = next?;
@@ -314,7 +319,7 @@ impl Face {
         new_opts.size = self.size;
 
         // Initialize a font based on these attributes.
-        let ct_font = self.font.copy_with_attributes(0.0, None, Some(&desc));
+        let ct_font = self.font.copy_with_attributes(0.0, None, Some(desc));
         desc.release();
         let face = Self::init_font(ct_font?, new_opts)?;
         *self = face;
@@ -498,7 +503,7 @@ impl Face {
         struct ColorSettings {
             color: bool,
             depth: u32,
-            space: macos::graphics::ColorSpace,
+            space: &'static macos::graphics::ColorSpace,
             context_opts: u32,
         }
         let color = if !is_color {
@@ -506,7 +511,7 @@ impl Face {
                 color: false,
                 depth: 1,
                 space: macos::graphics::ColorSpace::create_named(
-                    macos::graphics::ColorSpaceName::LinearGray,
+                    macos::graphics::color_space::Name::LinearGray,
                 )?,
                 context_opts: macos::graphics::ImageAlphaInfo::Only as u32,
             }
@@ -515,13 +520,13 @@ impl Face {
                 color: true,
                 depth: 4,
                 space: macos::graphics::ColorSpace::create_named(
-                    macos::graphics::ColorSpaceName::DisplayP3,
+                    macos::graphics::color_space::Name::DisplayP3,
                 )?,
-                context_opts: macos::graphics::BitmapInfo::BYTE_ORDER_32_LITTLE
+                context_opts: macos::graphics::BitmapInfo::BYTE_ORDER_32_LITTLE.0
                     | macos::graphics::ImageAlphaInfo::PremultipliedFirst as u32,
             }
         };
-        let _space_release = Release(&color.space);
+        let _space_release = Release(color.space);
 
         // This is just a safety check.
         if atlas.format.depth() as u32 != color.depth {
@@ -541,26 +546,26 @@ impl Face {
         let mut buf = vec![0u8; (px_width * px_height * color.depth) as usize];
 
         let ctx = macos::graphics::BitmapContext::create(
-            &mut buf,
+            Some(&mut buf),
             px_width as usize,
             px_height as usize,
             8,
             (px_width * color.depth) as usize,
-            &color.space,
+            color.space,
             color.context_opts,
         )?;
         {
-            use macos::graphics::context as context;
+            use macos::graphics::Context;
 
             // Perform an initial fill. This ensures that we don't have any
             // uninitialized pixels in the bitmap.
             if color.color {
-                context::set_rgb_fill_color(&ctx, 0.0, 0.0, 0.0, 0.0);
+                Context::set_rgb_fill_color(ctx, 0.0, 0.0, 0.0, 0.0);
             } else {
-                context::set_gray_fill_color(&ctx, 0.0, 0.0);
+                Context::set_gray_fill_color(ctx, 0.0, 0.0);
             }
-            context::fill_rect(
-                &ctx,
+            Context::fill_rect(
+                ctx,
                 macos::graphics::Rect {
                     origin: macos::graphics::Point { x: 0.0, y: 0.0 },
                     size: macos::graphics::Size {
@@ -574,39 +579,39 @@ impl Face {
             // to compensate for optical thinning of fonts, but at this point
             // it's just something that makes the text look closer to system
             // applications if users want that.
-            context::set_allows_font_smoothing(&ctx, true);
-            context::set_should_smooth_fonts(&ctx, opts.thicken);
+            Context::set_allows_font_smoothing(ctx, true);
+            Context::set_should_smooth_fonts(ctx, opts.thicken);
 
             // Subpixel positioning allows glyphs to be placed at non-integer
             // coordinates. We need this for our alignment.
-            context::set_allows_font_subpixel_positioning(&ctx, true);
-            context::set_should_subpixel_position_fonts(&ctx, true);
+            Context::set_allows_font_subpixel_positioning(ctx, true);
+            Context::set_should_subpixel_position_fonts(ctx, true);
 
             // We don't want subpixel quantization, since we very carefully
             // manage the position of our glyphs ourselves, and dont want to
             // mess that up.
-            context::set_allows_font_subpixel_quantization(&ctx, false);
-            context::set_should_subpixel_quantize_fonts(&ctx, false);
+            Context::set_allows_font_subpixel_quantization(ctx, false);
+            Context::set_should_subpixel_quantize_fonts(ctx, false);
 
             // Anti-aliasing is self explanatory.
-            context::set_allows_antialiasing(&ctx, true);
-            context::set_should_antialias(&ctx, true);
+            Context::set_allows_antialiasing(ctx, true);
+            Context::set_should_antialias(ctx, true);
 
             // Set our color for drawing
             if color.color {
-                context::set_rgb_fill_color(&ctx, 1.0, 1.0, 1.0, 1.0);
-                context::set_rgb_stroke_color(&ctx, 1.0, 1.0, 1.0, 1.0);
+                Context::set_rgb_fill_color(ctx, 1.0, 1.0, 1.0, 1.0);
+                Context::set_rgb_stroke_color(ctx, 1.0, 1.0, 1.0, 1.0);
             } else {
                 let strength = opts.thicken_strength as f64;
-                context::set_gray_fill_color(&ctx, strength / 255.0, 1.0);
-                context::set_gray_stroke_color(&ctx, strength / 255.0, 1.0);
+                Context::set_gray_fill_color(ctx, strength / 255.0, 1.0);
+                Context::set_gray_stroke_color(ctx, strength / 255.0, 1.0);
             }
 
             // If we are drawing with synthetic bold then use a fill stroke
             // which strokes the outlines of the glyph making a more bold look.
             if let Some(line_width) = self.synthetic_bold {
-                context::set_text_drawing_mode(&ctx, macos::graphics::TextDrawingMode::FillStroke);
-                context::set_line_width(&ctx, line_width);
+                Context::set_text_drawing_mode(ctx, macos::graphics::TextDrawingMode::FillStroke);
+                Context::set_line_width(ctx, line_width);
             }
 
             // Translate our drawing context so that when we draw our
@@ -614,15 +619,15 @@ impl Face {
             // position. The bottom/left edges are guaranteed to be at
             // exactly [0, 0] relative to this because when we call to
             // `drawGlyphs`, we pass the negated bearings.
-            context::translate_ctm(
-                &ctx,
+            Context::translate_ctm(
+                ctx,
                 frac_x + canvas_padding as f64,
                 frac_y + canvas_padding as f64,
             );
 
             // Scale the drawing context so that when we draw
             // our glyph it's stretched to the constrained size.
-            context::scale_ctm(&ctx, width / rect.size.width, height / rect.size.height);
+            Context::scale_ctm(ctx, width / rect.size.width, height / rect.size.height);
 
             // Draw our glyph.
             //
@@ -636,10 +641,10 @@ impl Face {
                     x: -rect.origin.x,
                     y: -rect.origin.y,
                 }],
-                &ctx,
+                ctx,
             );
 
-            context::release(&ctx);
+            Context::release(ctx);
         }
 
         // Write our rasterized glyph to the atlas.
@@ -1004,7 +1009,7 @@ pub struct ColorState {
     /// The parsed table borrows `svg_data`, which is retained until
     /// `deinit` (hence `'static`).
     pub svg: Option<opentype::Svg<'static>>,
-    pub svg_data: Option<macos::foundation::Data>,
+    pub svg_data: Option<&'static macos::foundation::Data>,
 }
 
 impl ColorState {
@@ -1082,15 +1087,15 @@ mod tests {
     use crate::font::embedded;
     use crate::font::metrics::Metrics;
 
-    fn ct_font_named(name: &str) -> macos::text::Font {
+    fn ct_font_named(name: &str) -> &'static macos::text::Font {
         let name = macos::foundation::String::create_with_bytes(
             name.as_bytes(),
             macos::foundation::StringEncoding::Utf8,
             false,
         )
         .unwrap();
-        let desc = macos::text::FontDescriptor::create_with_name_and_size(&name, 12.0).unwrap();
-        let ct_font = macos::text::Font::create_with_font_descriptor(&desc, 12.0).unwrap();
+        let desc = macos::text::FontDescriptor::create_with_name_and_size(name, 12.0).unwrap();
+        let ct_font = macos::text::Font::create_with_font_descriptor(desc, 12.0).unwrap();
         desc.release();
         name.release();
         ct_font
@@ -1115,7 +1120,7 @@ mod tests {
         let mut atlas = Atlas::init(512, atlas::Format::Grayscale).unwrap();
 
         let ct_font = ct_font_named("Monaco");
-        let face = Face::init_font_copy(&ct_font, Options::new(DesiredSize::new(12.0))).unwrap();
+        let face = Face::init_font_copy(ct_font, Options::new(DesiredSize::new(12.0))).unwrap();
         ct_font.release();
 
         render_all_ascii(&face, &mut atlas);
@@ -1124,7 +1129,7 @@ mod tests {
     #[test]
     fn name() {
         let ct_font = ct_font_named("Menlo");
-        let face = Face::init_font_copy(&ct_font, Options::new(DesiredSize::new(12.0))).unwrap();
+        let face = Face::init_font_copy(ct_font, Options::new(DesiredSize::new(12.0))).unwrap();
         ct_font.release();
 
         let mut buf = [0u8; 1024];
@@ -1135,7 +1140,7 @@ mod tests {
     #[test]
     fn emoji() {
         let ct_font = ct_font_named("Apple Color Emoji");
-        let face = Face::init_font_copy(&ct_font, Options::new(DesiredSize::new(18.0))).unwrap();
+        let face = Face::init_font_copy(ct_font, Options::new(DesiredSize::new(18.0))).unwrap();
         ct_font.release();
 
         // Glyph index check

@@ -17,6 +17,10 @@
 //! wuffs (same output: 8-bit non-premultiplied RGBA). Zig's `std.Io`
 //! parameter of `randomSecure` is a function that fills a buffer
 //! ([`IoRandomSecureFn`]); [`os_random_secure`] is the OS-backed default.
+//! Zig passes the decoder an allocator, which callers wrap in a
+//! `LimitedAllocator`; Rust decoders take no allocator, so a caller sets
+//! the per-allocation limit for the current thread with [`DecodeLimit`]
+//! and decoders allocate their output with [`decode_alloc`].
 
 use std::fmt;
 use std::sync::RwLock;
@@ -72,6 +76,63 @@ pub struct Image {
     pub data: Vec<u8>,
 }
 
+thread_local! {
+    static DECODE_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static DECODE_LIMIT_EXCEEDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Limits every allocation made through [`decode_alloc`] on this thread to
+/// `limit` bytes while it is alive (Zig: passing a `LimitedAllocator` to the
+/// decode function). Dropping it restores the previous limit.
+pub struct DecodeLimit {
+    prev_limit: Option<usize>,
+    prev_exceeded: bool,
+}
+
+impl DecodeLimit {
+    pub fn init(limit: usize) -> DecodeLimit {
+        DecodeLimit {
+            prev_limit: DECODE_LIMIT.with(|l| l.replace(Some(limit))),
+            prev_exceeded: DECODE_LIMIT_EXCEEDED.with(|e| e.replace(false)),
+        }
+    }
+
+    /// Set after an allocation is rejected for exceeding the limit
+    /// (`LimitedAllocator.limit_exceeded`).
+    pub fn limit_exceeded(&self) -> bool {
+        DECODE_LIMIT_EXCEEDED.with(|e| e.get())
+    }
+}
+
+impl Drop for DecodeLimit {
+    fn drop(&mut self) {
+        DECODE_LIMIT.with(|l| l.set(self.prev_limit));
+        DECODE_LIMIT_EXCEEDED.with(|e| e.set(self.prev_exceeded));
+    }
+}
+
+/// Allocate a zeroed buffer of `len` bytes for decoded data, honoring the
+/// current thread's [`DecodeLimit`] (Zig: `alloc.alloc` with the allocator
+/// handed to the decoder).
+pub fn decode_alloc(len: usize) -> Result<Vec<u8>, DecodeError> {
+    if let Some(limit) = DECODE_LIMIT.with(|l| l.get()) {
+        if len > limit {
+            DECODE_LIMIT_EXCEEDED.with(|e| e.set(true));
+            return Err(DecodeError::OutOfMemory);
+        }
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| DecodeError::OutOfMemory)?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
+/// Serializes tests that replace [`DECODE_PNG`] (write lock) against tests
+/// that decode PNGs (read lock), since Rust runs tests in parallel.
+#[cfg(test)]
+pub(crate) static DECODE_PNG_TEST_LOCK: RwLock<()> = RwLock::new(());
+
 /// The default PNG decoder (`decodePngWuffs` in Zig). Produces 8-bit
 /// non-premultiplied RGBA.
 fn decode_png_default(data: &[u8]) -> Result<Image, DecodeError> {
@@ -85,10 +146,7 @@ fn decode_png_default(data: &[u8]) -> Result<Image, DecodeError> {
     decoder.set_transformations(Transformations::normalize_to_color8() | Transformations::ALPHA);
     let mut reader = decoder.read_info().map_err(map_png_error)?;
     let size = reader.output_buffer_size().ok_or(DecodeError::InvalidData)?;
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(size)
-        .map_err(|_| DecodeError::OutOfMemory)?;
-    buf.resize(size, 0);
+    let mut buf = decode_alloc(size)?;
     let info = reader.next_frame(&mut buf).map_err(map_png_error)?;
     buf.truncate(info.buffer_size());
 
@@ -100,9 +158,8 @@ fn decode_png_default(data: &[u8]) -> Result<Image, DecodeError> {
     let rgba = match info.color_type {
         ColorType::Rgba => buf,
         other => {
-            let mut out = Vec::new();
-            out.try_reserve_exact(rgba_len)
-                .map_err(|_| DecodeError::OutOfMemory)?;
+            let mut out = decode_alloc(rgba_len)?;
+            out.clear();
             match other {
                 ColorType::Rgb => {
                     for px in buf.chunks_exact(3) {

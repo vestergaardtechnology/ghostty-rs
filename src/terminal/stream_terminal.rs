@@ -1,10 +1,6 @@
 //! Port of `src/terminal/stream_terminal.zig`.
 //!
-//! STATUS: partial — everything (including all tests) is ported, except
-//! that executing Kitty graphics APC commands (`Terminal.kittyGraphics`)
-//! waits on the `kitty/graphics_exec` port; until then a Kitty graphics
-//! command is parsed and dropped without a response, and the three Kitty
-//! graphics tests are gated with `TODO(port-kitty-graphics)`.
+//! STATUS: ported
 //!
 //! Port notes / deviations:
 //! - `Handler` holds `&'a mut Terminal` (Zig: `*Terminal`). Tests that
@@ -2275,9 +2271,9 @@ impl<'a> Handler<'a> {
                 }));
             }
 
-            apc::Command::Kitty(mut kitty_cmd) => {
+            apc::Command::Kitty(kitty_cmd) => {
                 if build_options::KITTY_GRAPHICS {
-                    self.apc_kitty_graphics(&mut kitty_cmd);
+                    self.apc_kitty_graphics(&kitty_cmd);
                 }
             }
 
@@ -2307,8 +2303,7 @@ impl<'a> Handler<'a> {
     }
 
     /// Execute a Kitty graphics command and write its response.
-    #[cfg(any())] // TODO(port-kitty-graphics): enable once kitty/graphics_exec.rs provides Terminal::kitty_graphics
-    fn apc_kitty_graphics(&mut self, kitty_cmd: &mut crate::terminal::kitty::graphics::Command) {
+    fn apc_kitty_graphics(&mut self, kitty_cmd: &crate::terminal::kitty::graphics::Command) {
         let Some(resp) = self.terminal.kitty_graphics(kitty_cmd) else {
             return;
         };
@@ -2328,16 +2323,6 @@ impl<'a> Handler<'a> {
         if n > 2 {
             self.write_pty(&buf[..n]);
         }
-    }
-
-    /// Execute a Kitty graphics command and write its response.
-    ///
-    /// TODO(port-kitty-graphics): `Terminal::kitty_graphics` (a wrapper of
-    /// `kitty.graphics.execute`) is pending the kitty/graphics_exec port;
-    /// until then the parsed command is dropped without a response.
-    #[cfg(not(any()))]
-    fn apc_kitty_graphics(&mut self, _kitty_cmd: &mut crate::terminal::kitty::graphics::Command) {
-        log::debug!(target: LOG_TARGET, "kitty graphics execution is not available yet, dropping command");
     }
 }
 
