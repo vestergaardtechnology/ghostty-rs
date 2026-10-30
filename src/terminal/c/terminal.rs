@@ -4011,5 +4011,1137 @@ pub(crate) mod tests {
         unsafe { free(t) };
     }
 
-    // CHUNK2
+    const GROUND: u32 = Boundary::Ground as u32;
+    const APC_START: u32 = Boundary::ApcStart as u32;
+    const APC_END: u32 = Boundary::ApcEnd as u32;
+    const DCS_START: u32 = Boundary::DcsStart as u32;
+    const DCS_END: u32 = Boundary::DcsEnd as u32;
+    const OSC_START: u32 = Boundary::OscStart as u32;
+    const OSC_END: u32 = Boundary::OscEnd as u32;
+
+    fn wu(t: Terminal, input: &[u8], boundaries: u32, stop: &mut WriteStop) -> Result {
+        unsafe { vt_write_until(t, input.as_ptr(), input.len(), boundaries, stop) }
+    }
+
+    fn ws(f: impl FnOnce(&mut WriteStop)) -> WriteStop {
+        let mut s = WriteStop::default();
+        f(&mut s);
+        s
+    }
+
+    fn ground(t: Terminal) -> bool {
+        wr(t).stream.ground()
+    }
+
+    #[test]
+    fn vt_write_until_ground_stops_at_the_first_ground_byte() {
+        let t = new_t(80, 24);
+
+        // Input remains untouched when the stream is already at ground.
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, b"unprocessed", GROUND, &mut stop));
+        assert_eq!(0, stop.consumed);
+
+        // Complete a split CSI and stop before inspecting the printable suffix.
+        vw(t, b"\x1b[31");
+        let input = b"mABC\x1b[";
+        assert_eq!(Result::Success, wu(t, input, GROUND, &mut stop));
+        assert_eq!(1, stop.consumed);
+        assert!(ground(t));
+
+        assert_eq!("", plain(t));
+
+        // The untouched suffix can be processed after work at the boundary.
+        vw(t, &input[stop.consumed..]);
+        assert_eq!("ABC", plain(t));
+        assert!(!ground(t));
+
+        // Exhausting input while unfinished is distinct from reaching ground on
+        // the final byte, even though both consume the entire input.
+        assert_eq!(Result::NoValue, wu(t, b"123", GROUND, &mut stop));
+        assert_eq!(3, stop.consumed);
+        assert!(!ground(t));
+
+        assert_eq!(Result::Success, wu(t, b"m", GROUND, &mut stop));
+        assert_eq!(1, stop.consumed);
+        assert!(ground(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_ground_handles_utf8_and_abort_boundaries() {
+        let t = new_t(80, 24);
+
+        let mut at_ground = false;
+        assert_eq!(Result::Success, gdat(t, TerminalData::VtGround, o(&mut at_ground)));
+        assert!(at_ground);
+
+        vw(t, &[0xF0]);
+        assert_eq!(Result::Success, gdat(t, TerminalData::VtGround, o(&mut at_ground)));
+        assert!(!at_ground);
+
+        let utf8_suffix = [0x9Fu8, 0x98, 0x84];
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, &utf8_suffix, GROUND, &mut stop));
+        assert_eq!(utf8_suffix.len(), stop.consumed);
+        assert!(ground(t));
+
+        // A malformed continuation resets the decoder and reaches ground after
+        // processing the retry byte.
+        vw(t, &[0xE0, 0xA0]);
+        assert_eq!(Result::Success, wu(t, b"A", GROUND, &mut stop));
+        assert_eq!(1, stop.consumed);
+        assert!(ground(t));
+
+        vw(t, b"\x1b[123");
+        assert_eq!(Result::Success, wu(t, &[0x18], GROUND, &mut stop));
+        assert_eq!(1, stop.consumed);
+        assert!(ground(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_invokes_effects_only_for_consumed_input() {
+        thread_local!(static BELL_COUNT: Cell<usize> = const { Cell::new(0) });
+        unsafe extern "C" fn bell(_: Terminal, _: *mut c_void) {
+            BELL_COUNT.set(BELL_COUNT.get() + 1);
+        }
+
+        let t = new_t(80, 24);
+        assert_eq!(Result::Success, sopt(t, Option::Bell, bell as BellFn as *const c_void));
+
+        vw(t, b"\x1b[31");
+        let input = b"m\x07";
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, input, GROUND, &mut stop));
+        assert_eq!(1, stop.consumed);
+        assert_eq!(0, BELL_COUNT.get());
+
+        vw(t, &input[stop.consumed..]);
+        assert_eq!(1, BELL_COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_result_contract() {
+        let t = new_t(80, 24);
+
+        // Fill every field so each invalid call below must reset them.
+        let stale = ws(|s| {
+            s.consumed = 99;
+            s.reached = 99;
+            s.kind = StringKind::Osc;
+            s.introducer = StringIntroducer::C1;
+            s.end = StringEnd::Aborted;
+            s.byte = 99;
+        });
+
+        let mut stop = stale;
+        assert_eq!(Result::InvalidValue, wu(std::ptr::null_mut(), b"x", GROUND, &mut stop));
+        assert_eq!(WriteStop::default(), stop);
+
+        stop = stale;
+        assert_eq!(Result::InvalidValue, unsafe {
+            vt_write_until(t, std::ptr::null(), 1, GROUND, &mut stop)
+        });
+        assert_eq!(WriteStop::default(), stop);
+
+        for bits in [0u32, 1 << 7, 1 << 31, GROUND | 1 << 7] {
+            stop = stale;
+            assert_eq!(Result::InvalidValue, wu(t, b"x", bits, &mut stop));
+            assert_eq!(WriteStop::default(), stop);
+        }
+
+        assert_eq!(Result::InvalidValue, unsafe {
+            vt_write_until(t, b"x".as_ptr(), 1, GROUND, std::ptr::null_mut())
+        });
+
+        // A struct one byte short is rejected and left untouched.
+        stop = stale;
+        stop.size = std::mem::size_of::<WriteStop>() - 1;
+        assert_eq!(Result::InvalidValue, wu(t, b"x", GROUND, &mut stop));
+        assert_eq!(99, stop.consumed);
+
+        // Already at ground with ground requested consumes nothing.
+        stop = stale;
+        assert_eq!(Result::Success, wu(t, b"x", GROUND | APC_END, &mut stop));
+        assert_eq!(ws(|s| s.reached = GROUND), stop);
+
+        // No boundary in the whole slice fills consumed and zeroes reached.
+        stop = stale;
+        let text = b"hello";
+        assert_eq!(Result::NoValue, wu(t, text, APC_START | APC_END, &mut stop));
+        assert_eq!(ws(|s| s.consumed = text.len()), stop);
+
+        // NULL with len 0 is an empty slice.
+        assert_eq!(Result::NoValue, unsafe {
+            vt_write_until(t, std::ptr::null(), 0, APC_START, &mut stop)
+        });
+        assert_eq!(WriteStop::default(), stop);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_kitty_apc_start_and_end() {
+        let input = b"\x1b_Gf=100,s=1,v=1;AAAA\x1b\\";
+        let content = b"Gf=100,s=1,v=1;AAAA";
+
+        for with_ground in [false, true] {
+            let t = new_t(80, 24);
+
+            // The start stop covers ESC and '_'.
+            let mut stop = WriteStop::default();
+            assert_eq!(Result::Success, wu(t, input, APC_START | APC_END, &mut stop));
+            assert_eq!(
+                ws(|s| {
+                    s.consumed = 2;
+                    s.reached = APC_START;
+                    s.kind = StringKind::Apc;
+                    s.introducer = StringIntroducer::Esc;
+                    s.byte = b'_';
+                }),
+                stop
+            );
+            let mut off = stop.consumed;
+            assert_eq!(b'G', input[off]);
+
+            // The end stop consumes the ESC of ESC \ but not the backslash.
+            assert_eq!(Result::Success, wu(t, &input[off..], APC_START | APC_END, &mut stop));
+            assert_eq!(
+                ws(|s| {
+                    s.consumed = content.len() + 1;
+                    s.reached = APC_END;
+                    s.kind = StringKind::Apc;
+                    s.end = StringEnd::StEsc;
+                    s.byte = 0x1B;
+                }),
+                stop
+            );
+            assert_eq!(&content[..], &input[off..off + content.len()]);
+            off += stop.consumed;
+            assert_eq!(input.len() - 1, off);
+
+            // The backslash completes the escape, reaching ground only.
+            if with_ground {
+                assert_eq!(Result::Success, wu(t, b"\\", GROUND | APC_START | APC_END, &mut stop));
+                assert_eq!(
+                    ws(|s| {
+                        s.consumed = 1;
+                        s.reached = GROUND;
+                    }),
+                    stop
+                );
+            } else {
+                assert_eq!(Result::NoValue, wu(t, b"\\", APC_START | APC_END, &mut stop));
+                assert_eq!(ws(|s| s.consumed = 1), stop);
+            }
+            assert!(ground(t));
+            unsafe { free(t) };
+        }
+    }
+
+    #[test]
+    fn vt_write_until_split_introducer() {
+        let t = new_t(80, 24);
+
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::NoValue, wu(t, b"\x1b", APC_START, &mut stop));
+        assert_eq!(ws(|s| s.consumed = 1), stop);
+
+        assert_eq!(Result::Success, wu(t, b"_G", APC_START, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 1;
+                s.reached = APC_START;
+                s.kind = StringKind::Apc;
+                s.introducer = StringIntroducer::Esc;
+                s.byte = b'_';
+            }),
+            stop
+        );
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_c1_introducer() {
+        let t = new_t(80, 24);
+
+        // At ground a raw C1 byte goes through the UTF-8 decoder, so the
+        // introducer is only recognized from inside another sequence.
+        vw(t, b"\x1b[1");
+
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, &[0x9F, b'G'], APC_START, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 1;
+                s.reached = APC_START;
+                s.kind = StringKind::Apc;
+                s.introducer = StringIntroducer::C1;
+                s.byte = 0x9F;
+            }),
+            stop
+        );
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_string_end_that_reaches_ground() {
+        for (byte, end) in [(0x18u8, StringEnd::Cancelled), (0x9C, StringEnd::StC1)] {
+            let t = new_t(80, 24);
+
+            vw(t, b"\x1b_Gab");
+            let input = [byte, b'x'];
+            let mut stop = WriteStop::default();
+            assert_eq!(Result::Success, wu(t, &input, GROUND | APC_END, &mut stop));
+            assert_eq!(
+                ws(|s| {
+                    s.consumed = 1;
+                    s.reached = GROUND | APC_END;
+                    s.kind = StringKind::Apc;
+                    s.end = end;
+                    s.byte = byte;
+                }),
+                stop
+            );
+            unsafe { free(t) };
+        }
+    }
+
+    #[test]
+    fn vt_write_until_sos_and_pm_report_as_apc() {
+        for final_ in *b"X^" {
+            let t = new_t(80, 24);
+
+            let input = [0x1B, final_, b'a'];
+            let mut stop = WriteStop::default();
+            assert_eq!(Result::Success, wu(t, &input, APC_START, &mut stop));
+            assert_eq!(
+                ws(|s| {
+                    s.consumed = 2;
+                    s.reached = APC_START;
+                    s.kind = StringKind::Apc;
+                    s.introducer = StringIntroducer::Esc;
+                    s.byte = final_;
+                }),
+                stop
+            );
+            unsafe { free(t) };
+        }
+    }
+
+    #[test]
+    fn vt_write_until_osc_start_and_bel_end() {
+        let t = new_t(80, 24);
+
+        // The start stop covers ESC and ']'.
+        let input = b"\x1b]2;title\x07x";
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, input, OSC_START | OSC_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 2;
+                s.reached = OSC_START;
+                s.kind = StringKind::Osc;
+                s.introducer = StringIntroducer::Esc;
+                s.byte = b']';
+            }),
+            stop
+        );
+        let mut off = stop.consumed;
+
+        // BEL ends the string and reaches ground on the same byte.
+        assert_eq!(Result::Success, wu(t, &input[off..], GROUND | OSC_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = b"2;title".len() + 1;
+                s.reached = GROUND | OSC_END;
+                s.kind = StringKind::Osc;
+                s.end = StringEnd::Bel;
+                s.byte = 0x07;
+            }),
+            stop
+        );
+        off += stop.consumed;
+        assert_eq!(input.len() - 1, off);
+        assert!(ground(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_dcs_start_and_end() {
+        let t = new_t(80, 24);
+
+        // The start stop covers ESC and 'P', before the header.
+        let input = b"\x1bP1;2|data\x1b\\";
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, input, DCS_START | DCS_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 2;
+                s.reached = DCS_START;
+                s.kind = StringKind::Dcs;
+                s.introducer = StringIntroducer::Esc;
+                s.byte = b'P';
+            }),
+            stop
+        );
+        let mut off = stop.consumed;
+        assert_eq!(b'1', input[off]);
+
+        // The end stop consumes the ESC of ESC \ but not the backslash.
+        assert_eq!(Result::Success, wu(t, &input[off..], DCS_START | DCS_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = b"1;2|data".len() + 1;
+                s.reached = DCS_END;
+                s.kind = StringKind::Dcs;
+                s.end = StringEnd::StEsc;
+                s.byte = 0x1B;
+            }),
+            stop
+        );
+        off += stop.consumed;
+        assert_eq!(input.len() - 1, off);
+
+        assert_eq!(Result::NoValue, wu(t, b"\\", DCS_START | DCS_END, &mut stop));
+        assert!(ground(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_until_string_end_that_is_also_a_string_start() {
+        let t = new_t(80, 24);
+
+        // 0x9D inside an APC ends it and starts an OSC on the same byte.
+        // The end's kind is reported; the OSC_START flag names the start.
+        vw(t, b"\x1b_a");
+        let input = b"\x9d0;x\x07";
+        let mut stop = WriteStop::default();
+        assert_eq!(Result::Success, wu(t, input, APC_END | OSC_START | OSC_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 1;
+                s.reached = APC_END | OSC_START;
+                s.kind = StringKind::Apc;
+                s.introducer = StringIntroducer::C1;
+                s.end = StringEnd::Aborted;
+                s.byte = 0x9D;
+            }),
+            stop
+        );
+
+        assert_eq!(Result::Success, wu(t, &input[1..], APC_END | OSC_START | OSC_END, &mut stop));
+        assert_eq!(
+            ws(|s| {
+                s.consumed = 4;
+                s.reached = OSC_END;
+                s.kind = StringKind::Osc;
+                s.end = StringEnd::Bel;
+                s.byte = 0x07;
+            }),
+            stop
+        );
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_split_escape_sequence() {
+        let t = new_t(80, 24);
+
+        // Write "Hello" in bold by splitting the CSI bold sequence across two writes.
+        // ESC [ 1 m  = bold on, ESC [ 0 m = reset
+        // Split ESC from the rest of the CSI sequence.
+        vw(t, b"Hello \x1b");
+        vw(t, b"[1mBold\x1b[0m");
+
+        // If the escape sequence leaked, we'd see "[1mBold" as literal text.
+        assert_eq!("Hello Bold", plain(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_split_combining_mark_after_base_at_right_edge() {
+        let t = new_t(2, 2);
+
+        // Put "å" in the final column, then send its combining low line in a
+        // separate write so the mark arrives while the cursor has a pending wrap.
+        vw(t, "xå".as_bytes());
+        vw(t, b"\xcc\xb2");
+
+        assert_eq!("xå̲", plain(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_cols_and_rows() {
+        let t = new_t(80, 24);
+        let mut cols: CellCountInt = 0;
+        let mut rows: CellCountInt = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::Cols, o(&mut cols)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::Rows, o(&mut rows)));
+        assert_eq!(80, cols);
+        assert_eq!(24, rows);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_cursor_position() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+        let mut x: CellCountInt = 0;
+        let mut y: CellCountInt = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorX, o(&mut x)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorY, o(&mut y)));
+        assert_eq!(5, x);
+        assert_eq!(0, y);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_vt_processing_error() {
+        use crate::terminal::stream_terminal::{FailPoint, OutOfMemory as VtOom, VT_TW};
+
+        let t = new_t(80, 24);
+
+        let mut processing_error = true;
+        assert_eq!(
+            Result::Success,
+            gdat(t, TerminalData::VtProcessingError, o(&mut processing_error))
+        );
+        assert!(!processing_error);
+
+        // Force a non-graceful terminal-owned update failure through the public
+        // VT write path. (Rust port: the title allocation tripwire stands in
+        // for Zig's failing screen allocator.)
+        VT_TW.error_always(FailPoint::WindowTitle, VtOom);
+        vw(t, b"\x1B]2;unavailable\x1B\\");
+        VT_TW.end(crate::tripwire::ResetMode::Reset).unwrap();
+
+        assert_eq!(
+            Result::Success,
+            gdat(t, TerminalData::VtProcessingError, o(&mut processing_error))
+        );
+        assert!(processing_error);
+
+        unsafe { reset(t) };
+        assert_eq!(
+            Result::Success,
+            gdat(t, TerminalData::VtProcessingError, o(&mut processing_error))
+        );
+        assert!(processing_error);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_null() {
+        let mut cols: CellCountInt = 0;
+        assert_eq!(
+            Result::InvalidValue,
+            gdat(std::ptr::null_mut(), TerminalData::Cols, o(&mut cols))
+        );
+    }
+
+    #[test]
+    fn get_cursor_visible() {
+        let t = new_t(80, 24);
+
+        let mut visible = false;
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorVisible, o(&mut visible)));
+        assert!(visible);
+
+        // DEC mode 25 controls cursor visibility
+        let config = ModeConfig {
+            mode: mode_tag(25, false),
+            value: false,
+        };
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorVisible, o(&mut visible)));
+        assert!(!visible);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_cursor_at_prompt() {
+        let t = new_t(80, 24);
+
+        let mut at_prompt = true;
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorAtPrompt, o(&mut at_prompt)));
+        assert!(!at_prompt);
+
+        vw(t, b"\x1b]133;A\x07");
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorAtPrompt, o(&mut at_prompt)));
+        assert!(at_prompt);
+
+        vw(t, b"\x1b[?1049h");
+        assert_eq!(Result::Success, gdat(t, TerminalData::CursorAtPrompt, o(&mut at_prompt)));
+        assert!(!at_prompt);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_active_screen() {
+        let t = new_t(80, 24);
+        let mut screen = TerminalScreen::Alternate;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ActiveScreen, o(&mut screen)));
+        assert_eq!(TerminalScreen::Primary, screen);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_kitty_keyboard_flags() {
+        let t = new_t(80, 24);
+
+        let mut flags: u8 = 0xFF;
+        assert_eq!(Result::Success, gdat(t, TerminalData::KittyKeyboardFlags, o(&mut flags)));
+        assert_eq!(0, flags);
+
+        // Push kitty flags via VT sequence: CSI > 3 u (push disambiguate | report_events)
+        vw(t, b"\x1b[>3u");
+
+        assert_eq!(Result::Success, gdat(t, TerminalData::KittyKeyboardFlags, o(&mut flags)));
+        assert_eq!(3, flags);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_mouse_tracking() {
+        let t = new_t(80, 24);
+
+        let mut tracking = true;
+        assert_eq!(Result::Success, gdat(t, TerminalData::MouseTracking, o(&mut tracking)));
+        assert!(!tracking);
+
+        // Each of X10 (9), normal (1000), button (1002) and any (1003)
+        // mouse modes enables tracking on its own.
+        let mut config = ModeConfig {
+            mode: mode_tag(9, false),
+            value: true,
+        };
+        for mode in [9u16, 1000, 1002, 1003] {
+            // Disable the previous mode, enable the next one.
+            config.value = false;
+            assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+            config = ModeConfig {
+                mode: mode_tag(mode, false),
+                value: true,
+            };
+            assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+            assert_eq!(Result::Success, gdat(t, TerminalData::MouseTracking, o(&mut tracking)));
+            assert!(tracking);
+        }
+
+        // Disable all - should be false again
+        config.value = false;
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::MouseTracking, o(&mut tracking)));
+        assert!(!tracking);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_total_rows() {
+        let t = new_t(80, 24);
+        let mut total: usize = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::TotalRows, o(&mut total)));
+        assert!(total >= 24);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_scrollback_rows() {
+        let t = new_t(80, 3);
+
+        let mut scrollback: usize = 99;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackRows, o(&mut scrollback)));
+        assert_eq!(0, scrollback);
+
+        // Write enough lines to push content into scrollback
+        // (Zig passes len 34, dropping the final newline.)
+        vw(t, &b"line1\r\nline2\r\nline3\r\nline4\r\nline5\r\n"[..34]);
+
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackRows, o(&mut scrollback)));
+        assert_eq!(2, scrollback);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_configured_scrollback_limits() {
+        let t = new_t(80, 3);
+
+        let mut value: usize = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackMaxBytes, o(&mut value)));
+        assert_eq!(10_000, value);
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ScrollbackMaxLines, o(&mut value)));
+
+        let max_bytes: usize = 0;
+        let max_lines: usize = 12;
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxBytes, p(&max_bytes)));
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxLines, p(&max_lines)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackMaxBytes, o(&mut value)));
+        assert_eq!(max_bytes, value);
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackMaxLines, o(&mut value)));
+        assert_eq!(max_lines, value);
+
+        // The configured limits belong to the primary screen and remain
+        // readable while an alternate screen is active.
+        vw(t, b"\x1b[?1049h");
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackMaxBytes, o(&mut value)));
+        assert_eq!(max_bytes, value);
+        assert_eq!(Result::Success, gdat(t, TerminalData::ScrollbackMaxLines, o(&mut value)));
+        assert_eq!(max_lines, value);
+
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxBytes, std::ptr::null()));
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxLines, std::ptr::null()));
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ScrollbackMaxBytes, o(&mut value)));
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ScrollbackMaxLines, o(&mut value)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_invalid() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::InvalidValue, gdat(t, TerminalData::Invalid, std::ptr::null_mut()));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_default_cursor_style_and_blink() {
+        let t = new_t(80, 24);
+        let cursor_style = |t: Terminal| zt(t).screens.active.cursor.cursor_style;
+
+        let mut default_style = TerminalCursorStyle::Bar;
+        let default_blink = true;
+        assert_eq!(Result::Success, sopt(t, Option::DefaultCursorStyle, p(&default_style)));
+        assert_eq!(Result::Success, sopt(t, Option::DefaultCursorBlink, p(&default_blink)));
+
+        // Setting defaults applies them immediately while the cursor is still default.
+        assert_eq!(CursorStyle::Bar, cursor_style(t));
+        assert!(zt(t).modes.get(Mode::CursorBlinking));
+
+        // An explicit DECSCUSR style overrides the configured defaults.
+        vw(t, b"\x1b[2 q");
+        assert_eq!(CursorStyle::Block, cursor_style(t));
+        assert!(!zt(t).modes.get(Mode::CursorBlinking));
+
+        // Changing defaults does not override an explicit cursor style.
+        default_style = TerminalCursorStyle::Underline;
+        assert_eq!(Result::Success, sopt(t, Option::DefaultCursorStyle, p(&default_style)));
+        assert_eq!(CursorStyle::Block, cursor_style(t));
+        assert!(!zt(t).modes.get(Mode::CursorBlinking));
+
+        // DECSCUSR reset restores the configured default style and blink.
+        vw(t, b"\x1b[0 q");
+        assert_eq!(CursorStyle::Underline, cursor_style(t));
+        assert!(zt(t).modes.get(Mode::CursorBlinking));
+
+        // RIS also restores cursor defaults from Terminal-owned state.
+        vw(t, b"\x1b[2 q");
+        unsafe { reset(t) };
+        assert_eq!(CursorStyle::Underline, cursor_style(t));
+        assert!(zt(t).modes.get(Mode::CursorBlinking));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_resize_pull_scrollback() {
+        let t = new_t(80, 24);
+        assert!(zt(t).flags.resize_pull_scrollback);
+
+        let disabled = false;
+        assert_eq!(Result::Success, sopt(t, Option::ResizePullScrollback, p(&disabled)));
+        assert!(!zt(t).flags.resize_pull_scrollback);
+
+        // NULL restores the default.
+        assert_eq!(Result::Success, sopt(t, Option::ResizePullScrollback, std::ptr::null()));
+        assert!(zt(t).flags.resize_pull_scrollback);
+        unsafe { free(t) };
+    }
+
+    fn gref(t: Terminal, pt: point::Point) -> grid_ref_c::CGridRef {
+        let mut r = grid_ref_c::CGridRef::default();
+        assert_eq!(Result::Success, unsafe { grid_ref(t, pt.cval(), &mut r) });
+        r
+    }
+
+    fn active(x: u16, y: u32) -> point::Point {
+        point::Point::Active(point::Coordinate { x, y })
+    }
+
+    fn pin_of(r: &grid_ref_c::CGridRef) -> crate::terminal::page_list::Pin {
+        r.to_pin().unwrap()
+    }
+
+    fn empty_sel() -> selection_c::CSelection {
+        selection_c::CSelection::new(grid_ref_c::CGridRef::default(), grid_ref_c::CGridRef::default())
+    }
+
+    #[test]
+    fn set_and_get_selection() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+
+        let start_ref = gref(t, active(0, 0));
+        let end_ref = gref(t, active(4, 0));
+
+        let mut out = empty_sel();
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::Selection, o(&mut out)));
+
+        let sel = selection_c::CSelection {
+            rectangle: true,
+            ..selection_c::CSelection::new(start_ref, end_ref)
+        };
+        assert_eq!(Result::Success, sopt(t, Option::Selection, p(&sel)));
+        assert!(zt(t).screens.active.selection.unwrap().tracked());
+
+        assert_eq!(Result::Success, gdat(t, TerminalData::Selection, o(&mut out)));
+        assert!(pin_of(&out.start).eql(pin_of(&start_ref)));
+        assert!(pin_of(&out.end).eql(pin_of(&end_ref)));
+        assert!(out.rectangle);
+
+        assert_eq!(Result::Success, sopt(t, Option::Selection, std::ptr::null()));
+        assert!(zt(t).screens.active.selection.is_none());
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::Selection, o(&mut out)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn selection_derivation_helpers() {
+        let t = new_t(80, 24);
+        vw(t, b"  Hello  \r\nWorld");
+
+        let mut out = empty_sel();
+
+        let word_ref = gref(t, active(3, 0));
+        let empty_ref = gref(t, active(20, 0));
+        let line_ref = gref(t, active(0, 0));
+
+        unsafe {
+            let mut word_opts = selection_c::SelectWordOptions::new(word_ref);
+            assert_eq!(Result::Success, selection_c::word(t, &word_opts, &mut out));
+            assert_eq!(2, pin_of(&out.start).x);
+            assert_eq!(6, pin_of(&out.end).x);
+
+            word_opts.r#ref = empty_ref;
+            assert_eq!(Result::NoValue, selection_c::word(t, &word_opts, &mut out));
+
+            let between_start_ref = gref(t, active(20, 1));
+            let between_end_ref = gref(t, active(0, 1));
+
+            let word_between_opts = selection_c::SelectWordBetweenOptions::new(between_start_ref, between_end_ref);
+            assert_eq!(Result::Success, selection_c::word_between(t, &word_between_opts, &mut out));
+            assert_eq!(0, pin_of(&out.start).x);
+            assert_eq!(1, pin_of(&out.start).y);
+            assert_eq!(4, pin_of(&out.end).x);
+            assert_eq!(1, pin_of(&out.end).y);
+
+            let mut line_opts = selection_c::SelectLineOptions::new(line_ref);
+            assert_eq!(Result::Success, selection_c::line(t, &line_opts, &mut out));
+            assert_eq!(2, pin_of(&out.start).x);
+            assert_eq!(6, pin_of(&out.end).x);
+
+            assert_eq!(Result::Success, selection_c::all(t, &mut out));
+            assert_eq!(2, pin_of(&out.start).x);
+            assert_eq!(0, pin_of(&out.start).y);
+            assert_eq!(4, pin_of(&out.end).x);
+            assert_eq!(1, pin_of(&out.end).y);
+
+            assert_eq!(Result::NoValue, selection_c::output(t, line_ref, &mut out));
+
+            line_opts.size = std::mem::size_of::<usize>() - 1;
+            assert_eq!(Result::InvalidValue, selection_c::line(t, &line_opts, &mut out));
+            assert_eq!(Result::InvalidValue, selection_c::word(t, std::ptr::null(), &mut out));
+            assert_eq!(Result::InvalidValue, selection_c::word(t, &word_opts, std::ptr::null_mut()));
+            assert_eq!(Result::InvalidValue, selection_c::word_between(t, std::ptr::null(), &mut out));
+            assert_eq!(
+                Result::InvalidValue,
+                selection_c::word_between(t, &word_between_opts, std::ptr::null_mut())
+            );
+            free(t);
+        }
+    }
+
+    #[test]
+    fn selection_adjust_mutates_snapshot_end() {
+        use crate::terminal::selection::Adjustment;
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+
+        let start_ref = gref(t, active(0, 0));
+        let end_ref = gref(t, active(1, 0));
+
+        unsafe {
+            let mut sel = selection_c::CSelection::new(start_ref, end_ref);
+            assert_eq!(Result::Success, selection_c::adjust(t, &mut sel, Adjustment::Right as c_int));
+            assert_eq!(0, pin_of(&sel.start).x);
+            assert_eq!(2, pin_of(&sel.end).x);
+
+            assert_eq!(Result::Success, selection_c::adjust(t, &mut sel, Adjustment::Left as c_int));
+            assert_eq!(0, pin_of(&sel.start).x);
+            assert_eq!(1, pin_of(&sel.end).x);
+
+            sel = selection_c::CSelection::new(end_ref, start_ref);
+            assert_eq!(Result::Success, selection_c::adjust(t, &mut sel, Adjustment::Right as c_int));
+            assert_eq!(1, pin_of(&sel.start).x);
+            assert_eq!(1, pin_of(&sel.end).x);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn selection_order_and_selection_ordered() {
+        use crate::terminal::selection::Order;
+        let t = new_t(80, 24);
+        vw(t, b"Hello\r\nWorld");
+
+        let start_ref = gref(t, active(3, 0));
+        let end_ref = gref(t, active(1, 1));
+
+        let sel = selection_c::CSelection {
+            rectangle: true,
+            ..selection_c::CSelection::new(start_ref, end_ref)
+        };
+
+        unsafe {
+            let mut order: c_int = -1;
+            assert_eq!(Result::Success, selection_c::order(t, &sel, &mut order));
+            assert_eq!(Order::MirroredForward as c_int, order);
+
+            let mut out = empty_sel();
+            assert_eq!(Result::Success, selection_c::ordered(t, &sel, Order::Forward as c_int, &mut out));
+            assert_eq!(1, pin_of(&out.start).x);
+            assert_eq!(0, pin_of(&out.start).y);
+            assert_eq!(3, pin_of(&out.end).x);
+            assert_eq!(1, pin_of(&out.end).y);
+            assert!(out.rectangle);
+
+            assert_eq!(Result::Success, selection_c::ordered(t, &sel, Order::Reverse as c_int, &mut out));
+            assert_eq!(3, pin_of(&out.start).x);
+            assert_eq!(1, pin_of(&out.start).y);
+            assert_eq!(1, pin_of(&out.end).x);
+            assert_eq!(0, pin_of(&out.end).y);
+            assert!(out.rectangle);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn selection_contains() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello\r\nWorld");
+
+        let start_ref = gref(t, active(3, 0));
+        let end_ref = gref(t, active(1, 1));
+
+        let linear = selection_c::CSelection::new(start_ref, end_ref);
+
+        unsafe {
+            let mut contains = false;
+            assert_eq!(
+                Result::Success,
+                selection_c::contains(t, &linear, active(4, 0).cval(), &mut contains)
+            );
+            assert!(contains);
+
+            assert_eq!(
+                Result::Success,
+                selection_c::contains(t, &linear, active(2, 0).cval(), &mut contains)
+            );
+            assert!(!contains);
+
+            let rectangle = selection_c::CSelection {
+                rectangle: true,
+                ..linear
+            };
+
+            assert_eq!(
+                Result::Success,
+                selection_c::contains(t, &rectangle, active(2, 0).cval(), &mut contains)
+            );
+            assert!(contains);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn selection_equal() {
+        let t = new_t(80, 24);
+        let other_t = new_t(80, 24);
+
+        vw(t, b"Hello");
+        vw(other_t, b"Hello");
+
+        let start_ref = gref(t, active(0, 0));
+        let end_ref = gref(t, active(1, 0));
+        let other_end_ref = gref(t, active(2, 0));
+        let cross_terminal_ref = gref(other_t, active(1, 0));
+
+        let sel = selection_c::CSelection::new(start_ref, end_ref);
+        let equal_sel = selection_c::CSelection::new(start_ref, end_ref);
+        let different_endpoint = selection_c::CSelection::new(start_ref, other_end_ref);
+        let different_rectangle = selection_c::CSelection {
+            rectangle: true,
+            ..selection_c::CSelection::new(start_ref, end_ref)
+        };
+        let cross_terminal = selection_c::CSelection::new(start_ref, cross_terminal_ref);
+
+        unsafe {
+            let mut equal = false;
+            assert_eq!(Result::Success, selection_c::equal(t, &sel, &equal_sel, &mut equal));
+            assert!(equal);
+
+            assert_eq!(Result::Success, selection_c::equal(t, &sel, &different_endpoint, &mut equal));
+            assert!(!equal);
+
+            assert_eq!(Result::Success, selection_c::equal(t, &sel, &different_rectangle, &mut equal));
+            assert!(!equal);
+
+            assert_eq!(Result::Success, selection_c::equal(t, &sel, &cross_terminal, &mut equal));
+            assert!(!equal);
+            assert_eq!(
+                Result::InvalidValue,
+                selection_c::equal(t, &sel, &equal_sel, std::ptr::null_mut())
+            );
+            free(other_t);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn selection_order_invalid_values() {
+        let t = new_t(80, 24);
+        unsafe {
+            let mut order: c_int = 0;
+            assert_eq!(
+                Result::InvalidValue,
+                selection_c::order(std::ptr::null_mut(), std::ptr::null(), &mut order)
+            );
+            assert_eq!(Result::InvalidValue, selection_c::order(t, std::ptr::null(), &mut order));
+            free(t);
+        }
+    }
+
+    #[test]
+    fn grid_ref_test() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+
+        let out_ref = gref(t, active(0, 0));
+
+        unsafe {
+            // Extract cell from grid ref and verify it contains 'H'
+            let mut out_cell: super::super::cell::CCell = 0;
+            assert_eq!(Result::Success, grid_ref_c::grid_ref_cell(&out_ref, &mut out_cell));
+
+            let mut cp: u32 = 0;
+            assert_eq!(
+                Result::Success,
+                super::super::cell::get(out_cell, super::super::cell::CellData::Codepoint as c_int, o(&mut cp))
+            );
+            assert_eq!('H' as u32, cp);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn grid_ref_null_terminal() {
+        let mut out_ref = grid_ref_c::CGridRef::default();
+        assert_eq!(Result::InvalidValue, unsafe {
+            grid_ref(std::ptr::null_mut(), active(0, 0).cval(), &mut out_ref)
+        });
+    }
+
+    #[test]
+    fn point_from_grid_ref_roundtrip_active() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+
+        // Get a grid ref at (2, 0) in active coords
+        let r = gref(t, active(2, 0));
+
+        // Convert back to active coords
+        let mut coord = point::Coordinate::default();
+        assert_eq!(Result::Success, unsafe {
+            point_from_grid_ref(t, &r, point::Tag::Active as c_int, &mut coord)
+        });
+        assert_eq!(2, coord.x);
+        assert_eq!(0, coord.y);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn point_from_grid_ref_roundtrip_viewport() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+
+        let r = gref(t, point::Point::Viewport(point::Coordinate { x: 0, y: 0 }));
+
+        let mut coord = point::Coordinate { x: 9, y: 9 };
+        assert_eq!(Result::Success, unsafe {
+            point_from_grid_ref(t, &r, point::Tag::Viewport as c_int, &mut coord)
+        });
+        assert_eq!(0, coord.x);
+        assert_eq!(0, coord.y);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn point_from_grid_ref_history_ref_to_active_returns_no_value() {
+        let t = new_t(80, 4);
+
+        // Write enough lines to push content into scrollback
+        for _ in 0..10 {
+            vw(t, b"line\n");
+        }
+
+        // Get a ref to the first line (now in scrollback)
+        let r = gref(t, point::Point::Screen(point::Coordinate { x: 0, y: 0 }));
+
+        unsafe {
+            // Should succeed for screen coords
+            let mut coord = point::Coordinate { x: 9, y: 9 };
+            assert_eq!(
+                Result::Success,
+                point_from_grid_ref(t, &r, point::Tag::Screen as c_int, &mut coord)
+            );
+            assert_eq!(0, coord.y);
+
+            // Should fail for active coords (it's in scrollback)
+            assert_eq!(
+                Result::NoValue,
+                point_from_grid_ref(t, &r, point::Tag::Active as c_int, &mut coord)
+            );
+            free(t);
+        }
+    }
+
+    #[test]
+    fn point_from_grid_ref_null_terminal() {
+        let r = grid_ref_c::CGridRef::default();
+        assert_eq!(Result::InvalidValue, unsafe {
+            point_from_grid_ref(std::ptr::null_mut(), &r, point::Tag::Active as c_int, std::ptr::null_mut())
+        });
+    }
+
+    #[test]
+    fn point_from_grid_ref_null_node() {
+        let t = new_t(80, 24);
+        let r = grid_ref_c::CGridRef::default();
+        assert_eq!(Result::InvalidValue, unsafe {
+            point_from_grid_ref(t, &r, point::Tag::Active as c_int, std::ptr::null_mut())
+        });
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn grid_ref_out_of_bounds() {
+        let t = new_t(80, 24);
+        let mut out_ref = grid_ref_c::CGridRef::default();
+        assert_eq!(Result::InvalidValue, unsafe {
+            grid_ref(t, active(100, 0).cval(), &mut out_ref)
+        });
+        unsafe { free(t) };
+    }
+
+    // CHUNK3
 }
