@@ -2,9 +2,7 @@
 //!
 //! STATUS: partial — everything (including all tests) is ported except
 //! `vtStream`/`vtHandler` (pending the stream_terminal port, which defines
-//! the Stream/Handler types they return) and `kittyGraphics` (pending the
-//! kitty graphics_exec port). Kitty placement scroll-margin adjustment uses
-//! stand-ins until graphics_storage stores placements.
+//! the Stream/Handler types they return).
 //!
 //! The primary terminal emulation structure. This represents a single
 //! "terminal" containing a grid of characters and exposes various operations
@@ -17,12 +15,9 @@
 //!   `screen_set.rs`.
 //! - `vtStream`/`vtHandler` are provided by the `stream_terminal` port (they
 //!   construct its `Stream`/`Handler` types); `kittyGraphics` is provided by
-//!   the `kitty/graphics_exec` port (it wraps `kitty.graphics.execute`).
+//!   the `kitty/graphics_exec` port (`Terminal::kitty_graphics`).
 //! - The batched print fast path (`printSlice`) uses scalar loops where the
 //!   Zig version hand-vectorizes with `@Vector` (identical results).
-//! - Kitty image placements: the `graphics_storage` port does not store
-//!   placements yet, so the scroll-margin adjustment paths use local
-//!   stand-ins (see `KittyScrollMargins`) and never run.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -37,7 +32,7 @@ use crate::terminal::csi;
 use crate::terminal::cursor::Style as CursorStyle;
 use crate::terminal::kitty;
 use crate::terminal::kitty::graphics_image::Limits as LoadingImageLimits;
-use crate::terminal::kitty::graphics_storage::ImageStorage;
+use crate::terminal::kitty::graphics_storage::{ImageStorage, TerminalInfo};
 use crate::terminal::modes::{Mode, ModePacked, ModeState};
 use crate::terminal::mouse;
 use crate::terminal::osc;
@@ -133,33 +128,18 @@ fn clear_cursor_row_unprotected_cells(mut s: ScreenPtr, cells: &mut [Cell]) {
     s.clear_unprotected_cells(page, row, cells);
 }
 
-// TODO(port-dedupe): replace with
-// crate::terminal::kitty::graphics_storage::ImageStorage::placements.count()
-// once placements are ported. The storage never holds placements yet.
+/// `screen.kitty_images.placements.count()`
 #[inline(always)]
-fn kitty_placement_count(_storage: &ImageStorage) -> usize {
-    0
+fn kitty_placement_count(storage: &ImageStorage) -> usize {
+    storage.placements.len()
 }
 
-// TODO(port-dedupe): replace with
-// crate::terminal::kitty::graphics_storage::ScrollOp once ported.
 /// (Zig: `kitty.graphics.ImageStorage.ScrollOp`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KittyScrollOp {
-    WindowShift,
-    InPlace,
-}
+use crate::terminal::kitty::graphics_storage::ScrollOp as KittyScrollOp;
 
-// TODO(port-dedupe): replace with
-// crate::terminal::kitty::graphics_storage::ScrollMargins once ported.
-/// Handle when Kitty graphics is disabled (or placements are not yet
-/// ported): a scroll-margins state whose `end` does nothing.
-struct KittyScrollMargins;
-
-impl KittyScrollMargins {
-    #[inline]
-    fn end(&mut self) {}
-}
+/// (Zig: `kitty.graphics.ImageStorage.ScrollMargins`.) `end` takes the
+/// active screen's page list.
+use crate::terminal::kitty::graphics_storage::ScrollMargins as KittyScrollMargins;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2976,7 +2956,7 @@ impl Terminal {
     /// hot path.
     #[cold]
     fn index_scroll_with_images(&mut self, op: KittyScrollOp) -> Result<(), AllocError> {
-        let mut kitty_scroll = self.kitty_scroll_margins_begin(-1, op);
+        let kitty_scroll = self.kitty_scroll_margins_begin(-1, op);
         let r = match op {
             KittyScrollOp::WindowShift => self.screens.active.cursor_scroll_above(),
             KittyScrollOp::InPlace => {
@@ -2984,8 +2964,8 @@ impl Terminal {
                 self.screens.active.cursor_scroll_region_up(n)
             }
         };
-        if let Some(state) = kitty_scroll.as_mut() {
-            state.end();
+        if let Some(state) = kitty_scroll {
+            state.end(&self.screens.active.pages);
         }
         r
     }
@@ -3014,11 +2994,9 @@ impl Terminal {
             return None;
         }
 
-        // TODO(port-dedupe): screen.kitty_images.scrollMarginsBegin(self,
-        // delta, op) is pending the graphics_storage port. Without stored
-        // placements there is nothing to adjust.
-        let _ = (delta, op);
-        None
+        let info = TerminalInfo::from_terminal(self);
+        let screen: &mut Screen = &mut self.screens.active;
+        Some(screen.kitty_images.scroll_margins_begin(&mut screen.pages, &info, delta, op))
     }
 
     /// Move the cursor to the previous line in the scrolling region, possibly
@@ -3214,8 +3192,8 @@ impl Terminal {
         self.screens.active.cursor_absolute(left, top);
         self.insert_lines(count);
 
-        if let Some(state) = kitty_scroll.as_mut() {
-            state.end();
+        if let Some(state) = kitty_scroll {
+            state.end(&self.screens.active.pages);
         }
         self.screens.active.cursor_absolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
@@ -3258,8 +3236,8 @@ impl Terminal {
 
         let r = self.scroll_up_(count);
 
-        if let Some(state) = kitty_scroll.as_mut() {
-            state.end();
+        if let Some(state) = kitty_scroll {
+            state.end(&self.screens.active.pages);
         }
         self.screens.active.cursor_absolute(old_x, old_y);
         self.screens.active.cursor.pending_wrap = old_wrap;
@@ -4194,8 +4172,9 @@ impl Terminal {
                 if build_options::KITTY_GRAPHICS {
                     // Clear only placements still visible after moving the active
                     // area into scrollback.
-                    // TODO(port-dedupe): kitty_images.clearScreen is pending the
-                    // graphics_storage port; without stored placements it is a no-op.
+                    let info = TerminalInfo::from_terminal(self);
+                    let screen: &mut Screen = &mut s;
+                    screen.kitty_images.clear_screen(&mut screen.pages, &info);
                 }
             }
 
@@ -4258,8 +4237,9 @@ impl Terminal {
                 if build_options::KITTY_GRAPHICS {
                     // ED2 clears visible placements but preserves graphics that
                     // are wholly in scrollback.
-                    // TODO(port-dedupe): kitty_images.clearScreen is pending the
-                    // graphics_storage port; without stored placements it is a no-op.
+                    let info = TerminalInfo::from_terminal(self);
+                    let screen: &mut Screen = &mut s;
+                    screen.kitty_images.clear_screen(&mut screen.pages, &info);
                 }
 
                 // Cleared screen dirty bit
@@ -4377,9 +4357,8 @@ impl Terminal {
         Ok(())
     }
 
-    // TODO(port-dedupe): `kittyGraphics(io, alloc, cmd)` wraps
-    // `kitty.graphics.execute(io, alloc, self, cmd)`, which is pending the
-    // `kitty/graphics_exec` port; that port provides it on `Terminal`.
+    // `kittyGraphics(io, alloc, cmd)` is `Terminal::kitty_graphics`, defined
+    // by the `kitty/graphics_exec` port.
 
     /// Execute a Glyph Protocol APC command against this terminal's per-session
     /// glossary. The returned response, if any, should be sent back to the pty as

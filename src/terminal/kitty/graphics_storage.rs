@@ -4635,4 +4635,447 @@ mod tests {
         assert_eq!(Some(5u64), anim_of(&mut s).frame_shown_at_ms);
         s.deinit(&mut t.screens.active.pages);
     }
+
+    // ---------------------------------------------------------------
+    // Tests that drive Terminal operations.
+    // ---------------------------------------------------------------
+
+    use super::test_util::init_scrollback;
+    use crate::terminal::csi;
+    use crate::terminal::modes::Mode;
+    use crate::terminal::screen::Screen;
+
+    /// `t.screens.active.kitty_images`
+    fn ks(t: &TestTerminal) -> &ImageStorage {
+        &t.screens.active.kitty_images
+    }
+
+    /// `t.screens.active.kitty_images.addImage(...)`
+    fn sadd(t: &mut TestTerminal, image: Image) {
+        let scr: &mut Screen = &mut t.screens.active;
+        scr.kitty_images.add_image(&mut scr.pages, image).unwrap();
+    }
+
+    /// `t.screens.active.kitty_images.addPlacement(...)`
+    fn splace(t: &mut TestTerminal, image_id: u32, placement_id: u32, p: Placement) {
+        let scr: &mut Screen = &mut t.screens.active;
+        scr.kitty_images
+            .add_placement(&mut scr.pages, image_id, placement_id, p)
+            .unwrap();
+    }
+
+    /// The active coordinate of a placement's pin.
+    fn active_coord(t: &TestTerminal, key: PlacementKey) -> point::Coordinate {
+        let p = ks(t).placements[&key];
+        t.screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Active, deref(pin_of(&p)))
+            .unwrap()
+            .coord()
+    }
+
+    fn deref(pin: PinPtr) -> Pin {
+        // SAFETY: tests only read pins that are still tracked.
+        unsafe { *pin.as_ptr() }
+    }
+
+    #[test]
+    fn storage_delete_all_visible_placements_preserves_scrollback() {
+        let mut t = init_scrollback(2, 2, Some(4096));
+        t.width_px = 2;
+        t.height_px = 2;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        t.scroll_up(1).unwrap();
+
+        let history_key = external(1, 1);
+        assert!(t
+            .screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Active, deref(pin_of(&s.placements[&history_key])))
+            .is_none());
+
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 2, p);
+
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&history_key));
+        assert_eq!(1, s.images.len());
+        assert!(s.images.contains_key(&1));
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_delete_all_includes_placements_spanning_into_active_area() {
+        let mut t = init_scrollback(2, 2, Some(4096));
+        t.width_px = 2;
+        t.height_px = 2;
+
+        let mut s = ImageStorage::default();
+        add(&mut s, &mut t, img_wh(1, 1, 2));
+        let p = pin_placement(&mut t, 0, 0);
+        place(&mut s, &mut t, 1, 1, p);
+        t.scroll_up(1).unwrap();
+
+        let placement = s.placements[&external(1, 1)];
+        assert!(t
+            .screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Active, deref(pin_of(&placement)))
+            .is_none());
+        let rect = placement
+            .rect(s.image_by_id(1).unwrap(), &info(&t))
+            .unwrap();
+        assert!(t
+            .screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Active, rect.bottom_right)
+            .is_some());
+
+        delete(&mut s, &mut t, DeleteAction::All(true));
+        assert_eq!(0, s.placements.len());
+        assert_eq!(0, s.images.len());
+        s.deinit(&mut t.screens.active.pages);
+    }
+
+    #[test]
+    fn storage_erase_display_preserves_scrollback_and_reclaims_unplaced_images() {
+        let mut t = init_scrollback(2, 2, Some(4096));
+        t.width_px = 2;
+        t.height_px = 2;
+
+        sadd(&mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 1, 1, p);
+        t.scroll_up(1).unwrap();
+
+        let history_key = external(1, 1);
+        assert!(t
+            .screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Active, deref(pin_of(&ks(&t).placements[&history_key])))
+            .is_none());
+
+        sadd(&mut t, img_wh(2, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 2, 1, p);
+        sadd(&mut t, img_wh(3, 1, 1));
+
+        t.erase_display(csi::EraseDisplay::Complete, false);
+        let s = ks(&t);
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&history_key));
+        assert_eq!(1, s.images.len());
+        assert!(s.images.contains_key(&1));
+        assert!(!s.images.contains_key(&2));
+        assert!(!s.images.contains_key(&3));
+    }
+
+    #[test]
+    fn storage_erase_scrollback_removes_placements_in_history() {
+        let mut t = init_scrollback(2, 2, Some(4096));
+        t.width_px = 2;
+        t.height_px = 2;
+
+        sadd(&mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 1, 1, p);
+        t.scroll_up(1).unwrap();
+        sadd(&mut t, img_wh(2, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 2, 1, p);
+
+        // Erasing history must not move the history placement onto the
+        // top of the active area, where it would be visible again.
+        t.erase_display(csi::EraseDisplay::Scrollback, false);
+        let s = ks(&t);
+        assert_eq!(1, s.placements.len());
+        assert!(s.placements.contains_key(&external(2, 1)));
+    }
+
+    #[test]
+    fn storage_partial_history_erase_keeps_later_history_placements() {
+        let mut t = init_scrollback(2, 2, Some(4096));
+        t.width_px = 2;
+        t.height_px = 2;
+
+        sadd(&mut t, img_wh(1, 1, 1));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 1, 1, p);
+        sadd(&mut t, img_wh(2, 1, 1));
+        let p = pin_placement(&mut t, 0, 1);
+        splace(&mut t, 2, 1, p);
+        t.scroll_up(2).unwrap();
+
+        t.screens
+            .active
+            .erase_history(Some(point::Point::History(point::Coordinate { x: 0, y: 0 })));
+        assert_eq!(1, ks(&t).placements.len());
+        let key = external(2, 1);
+        assert_eq!(
+            point::Point::History(point::Coordinate { x: 0, y: 0 }),
+            t.screens
+                .active
+                .pages
+                .point_from_pin(point::Tag::History, deref(pin_of(&ks(&t).placements[&key])))
+                .unwrap()
+        );
+    }
+
+    /// A 10x6 terminal with 10x10px cells.
+    fn margins_terminal() -> TestTerminal {
+        let mut t = init(10, 6);
+        t.width_px = 100;
+        t.height_px = 60;
+        t
+    }
+
+    #[test]
+    fn storage_scroll_margins_placement_inside_region_scrolls_and_clips_at_top() {
+        let mut t = margins_terminal();
+
+        // 2-row image (10x10px cells) inside the region (rows 1-4).
+        sadd(&mut t, img_wh(1, 10, 20));
+        let p = pin_placement(&mut t, 0, 2);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(5, 1);
+
+        // Entirely inside: moves up with the content.
+        t.index().unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 1 }, active_coord(&t, external(1, 1)));
+
+        // Would extend above the top margin: anchored at the top margin
+        // with the top cell row clipped off the source.
+        t.index().unwrap();
+        {
+            assert_eq!(point::Coordinate { x: 0, y: 1 }, active_coord(&t, external(1, 1)));
+            let p = ks(&t).placements[&external(1, 1)];
+            assert_eq!(10u32, p.source_y);
+            assert_eq!(10u32, p.source_height);
+        }
+
+        // Fully clipped: deleted.
+        t.index().unwrap();
+        assert_eq!(0, ks(&t).placements.len());
+        // The image itself is retained.
+        assert_eq!(1, ks(&t).images.len());
+    }
+
+    #[test]
+    fn storage_scroll_margins_placement_straddling_region_does_not_move() {
+        let mut t = margins_terminal();
+
+        // 3-row image anchored at the top of a 2-row region: not entirely
+        // within the region, so region scrolls must not move it. This
+        // exercises the scrollback-creating path (region top at row 0).
+        sadd(&mut t, img_wh(1, 10, 30));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(1, 2);
+        t.set_cursor_pos(2, 1);
+
+        t.index().unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 0 }, active_coord(&t, external(1, 1)));
+        let p = ks(&t).placements[&external(1, 1)];
+        assert_eq!(0u32, p.source_y);
+        assert_eq!(0u32, p.source_height);
+    }
+
+    #[test]
+    fn storage_scroll_margins_placement_below_region_does_not_move() {
+        let mut t = margins_terminal();
+
+        // A "status bar" image below the bottom margin must stay put while
+        // the region above it scrolls (scrollback-creating path).
+        sadd(&mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 5);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(1, 4);
+        t.set_cursor_pos(4, 1);
+
+        t.index().unwrap();
+        t.index().unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 5 }, active_coord(&t, external(1, 1)));
+    }
+
+    #[test]
+    fn storage_scroll_margins_reverse_index_clips_at_bottom() {
+        let mut t = margins_terminal();
+
+        // 2-row image at the bottom of the region (rows 1-4).
+        sadd(&mut t, img_wh(1, 10, 20));
+        let p = pin_placement(&mut t, 0, 3);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(2, 1);
+
+        // Moves down, with the bottom cell row clipped off the source.
+        t.reverse_index();
+        {
+            assert_eq!(point::Coordinate { x: 0, y: 4 }, active_coord(&t, external(1, 1)));
+            let p = ks(&t).placements[&external(1, 1)];
+            assert_eq!(0u32, p.source_y);
+            assert_eq!(10u32, p.source_height);
+        }
+
+        // Fully clipped: deleted.
+        t.reverse_index();
+        assert_eq!(0, ks(&t).placements.len());
+    }
+
+    #[test]
+    fn storage_scroll_margins_scaled_placement_clips_proportionally() {
+        let mut t = margins_terminal();
+
+        // A 40px-tall image scaled into 2 rows, inside a 2-row region.
+        sadd(&mut t, img_wh(1, 10, 40));
+        let pin = track_pin(&mut t, 0, 1);
+        splace(
+            &mut t,
+            1,
+            1,
+            Placement {
+                columns: 1,
+                rows: 2,
+                ..Placement::new(Location::Pin(pin))
+            },
+        );
+        t.set_top_and_bottom_margin(2, 3);
+        t.set_cursor_pos(3, 1);
+
+        t.index().unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 1 }, active_coord(&t, external(1, 1)));
+        let p = ks(&t).placements[&external(1, 1)];
+        assert_eq!(20u32, p.source_y);
+        assert_eq!(20u32, p.source_height);
+        assert_eq!(1u32, p.rows);
+        assert_eq!(1u32, p.columns);
+    }
+
+    #[test]
+    fn storage_scroll_margins_left_right_margins_respect_columns() {
+        let mut t = margins_terminal();
+
+        // One placement outside the left/right margin columns, one inside.
+        sadd(&mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 2);
+        splace(&mut t, 1, 1, p);
+        let p = pin_placement(&mut t, 2, 2);
+        splace(&mut t, 1, 2, p);
+
+        t.modes.set(Mode::EnableLeftAndRightMargin, true);
+        t.set_left_and_right_margin(2, 8);
+
+        t.scroll_up(1).unwrap();
+
+        // Outside the margin columns: stays.
+        assert_eq!(point::Coordinate { x: 0, y: 2 }, active_coord(&t, external(1, 1)));
+
+        // Inside: moves up.
+        assert_eq!(point::Coordinate { x: 2, y: 1 }, active_coord(&t, external(1, 2)));
+    }
+
+    #[test]
+    fn storage_scroll_margins_insert_delete_lines_do_not_move_placements() {
+        let mut t = margins_terminal();
+
+        // Kitty does not scroll images for IL/DL, only for IND/RI/SU/SD.
+        sadd(&mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 2);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(2, 1);
+
+        t.delete_lines(1);
+        assert_eq!(point::Coordinate { x: 0, y: 2 }, active_coord(&t, external(1, 1)));
+
+        t.insert_lines(1);
+        assert_eq!(point::Coordinate { x: 0, y: 2 }, active_coord(&t, external(1, 1)));
+    }
+
+    #[test]
+    fn storage_scroll_without_margins_moves_placement_into_scrollback() {
+        let mut t = margins_terminal();
+
+        // No margins: the placement follows its anchored row into the
+        // scrollback via pin tracking (kitty's marginless behavior).
+        sadd(&mut t, img_wh(1, 10, 20));
+        let p = pin_placement(&mut t, 0, 0);
+        splace(&mut t, 1, 1, p);
+        t.set_cursor_pos(6, 1);
+
+        t.index().unwrap();
+        let p = ks(&t).placements[&external(1, 1)];
+        let pages = &t.screens.active.pages;
+        assert!(pages
+            .point_from_pin(point::Tag::Active, deref(pin_of(&p)))
+            .is_none());
+        let pt = pages
+            .point_from_pin(point::Tag::Screen, deref(pin_of(&p)))
+            .unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 0 }, pt.coord());
+    }
+
+    #[test]
+    fn storage_scroll_margins_large_scroll_deletes_inside_placement() {
+        let mut t = margins_terminal();
+
+        sadd(&mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 2);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(2, 5);
+
+        t.scroll_up(10).unwrap();
+        assert_eq!(0, ks(&t).placements.len());
+    }
+
+    #[test]
+    fn storage_scroll_margins_straddling_placement_pin_inside_region_restored() {
+        let mut t = margins_terminal();
+
+        // 2-row image anchored on the bottom margin row, extending below
+        // the region: not entirely inside, so it must not move even though
+        // the region scroll moves every tracked pin within the region rows.
+        sadd(&mut t, img_wh(1, 10, 20));
+        let p = pin_placement(&mut t, 0, 4);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(5, 1);
+
+        t.index().unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 4 }, active_coord(&t, external(1, 1)));
+        let p = ks(&t).placements[&external(1, 1)];
+        assert_eq!(0u32, p.source_y);
+        assert_eq!(0u32, p.source_height);
+    }
+
+    #[test]
+    fn storage_scroll_margins_multi_line_scroll_up_with_scrollback() {
+        let mut t = margins_terminal();
+
+        // 1-row image inside a region whose top is the screen top, so the
+        // scroll pushes text into the scrollback (window shift) while the
+        // image moves within the region.
+        sadd(&mut t, img_wh(1, 10, 10));
+        let p = pin_placement(&mut t, 0, 2);
+        splace(&mut t, 1, 1, p);
+        t.set_top_and_bottom_margin(1, 4);
+
+        t.scroll_up(2).unwrap();
+        assert_eq!(point::Coordinate { x: 0, y: 0 }, active_coord(&t, external(1, 1)));
+
+        // Another two rows scrolls it out of the region: deleted.
+        t.scroll_up(2).unwrap();
+        assert_eq!(0, ks(&t).placements.len());
+    }
 }
