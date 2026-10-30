@@ -133,6 +133,7 @@ pub use self::page::Page;
 pub use self::page_list::PageList;
 pub use self::page_list::Pin;
 pub use self::page_list::Scrollbar;
+pub use self::render::RenderState;
 pub use self::parser::Csi as CSI;
 pub use self::parser::Dcs as DCS;
 pub use self::parser::Parser;
@@ -170,7 +171,7 @@ pub use self::build_options::Options;
 pub use self::build_options as options;
 
 // TODO(port-dedupe): the following re-exports are pending the ports of
-// their modules: `RenderState` (render.zig), `SelectionGesture`
+// their modules: `SelectionGesture`
 // (SelectionGesture.zig), `TerminalStream`, `SemanticPrompt`,
 // `UnknownSequence`, `PasteError` (stream_terminal.zig), `Paste`,
 // `PasteContents`, `PasteSource` (paste.zig). `c_api` is the `c` module.
