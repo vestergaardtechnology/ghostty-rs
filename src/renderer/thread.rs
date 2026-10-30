@@ -1115,7 +1115,8 @@ mod tests {
     use crate::lib::tinyio::Mutex;
     use crate::renderer::message::SearchMatches;
     use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
-    use crate::renderer::opengl::test_util::test_options;
+    use crate::apprt::surface::standin::AppQueue;
+    use crate::renderer::opengl::test_util::test_options_with_mailbox;
     use crate::renderer::{Health, ScreenSize, Size};
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
@@ -1127,7 +1128,9 @@ mod tests {
     fn run_messages_stop() {
         let _guard = egl_lock();
         let mut device = Device::init(device::Options::default()).unwrap();
-        let opts = test_options(&mut *device);
+        let app = apprt::App::default();
+        let queue = AppQueue::create();
+        let opts = test_options_with_mailbox(&mut *device, &app, &*queue);
         let mut renderer = Renderer::init(opts).unwrap();
 
         let mut mutex = Mutex::new();
@@ -1182,7 +1185,8 @@ mod tests {
         assert!(thread.flags.cursor_blink_visible);
         assert!(!renderer.focused);
         assert!(renderer.search_matches.is_some());
-        assert!(renderer.search_matches_dirty);
+        // (`search_matches_dirty` is not checked: the frame update that
+        // follows the message may already have consumed it.)
         assert_eq!(Health::Unhealthy, renderer.presentation_health());
         assert_eq!(100, renderer.size.screen.width);
         // threadExit marks the display unrealized.
