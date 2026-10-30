@@ -1,6 +1,6 @@
 //! Port of `src/renderer/opengl/Frame.zig`.
 //!
-//! STATUS: ported (against the stand-in generic renderer; TODO(port-dedupe))
+//! STATUS: ported
 //!
 //! Wrapper for handling render passes.
 //!
@@ -113,8 +113,7 @@ mod tests {
         let app = apprt::App::default();
         let queue = AppQueue::create();
         let opts = test_options_with_mailbox(&mut *device, &app, &*queue);
-        let api = OpenGL::init(&*device, &opts).unwrap();
-        let mut renderer = Renderer::init_with_api(api, opts);
+        let mut renderer = Renderer::init(opts).unwrap();
         renderer.thread_enter(std::ptr::null_mut()).unwrap();
 
         let mut target = renderer.api.init_target(8, 4).unwrap();

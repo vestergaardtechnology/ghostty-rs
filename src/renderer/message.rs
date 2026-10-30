@@ -7,30 +7,13 @@
 //! drop; `deinit` consumes the message. The font grid pointers stay raw
 //! pointers like in Zig (they are reference counted by the grid set).
 //!
-//! Stand-in for `terminal.highlight.Flattened` lives in [`standin`]
-//! (TODO(port-dedupe)).
 
 use crate::config::Config;
-use crate::renderer::standin::{
-    InitError, RendererDerivedConfig, SharedGrid, SharedGridSet, SharedGridSetKey,
-    ThreadDerivedConfig,
-};
+use crate::renderer::generic::{DerivedConfig as RendererDerivedConfig, InitError};
+use crate::renderer::standin::{SharedGrid, SharedGridSet, SharedGridSetKey, ThreadDerivedConfig};
 use crate::renderer::{Health, Size};
 
-use self::standin::Flattened;
-
-/// Stand-ins for types whose Zig files are not ported yet.
-pub mod standin {
-    use crate::terminal::size::CellCountInt;
-
-    /// TODO(port-dedupe): replace with `crate::terminal::highlight::Flattened`.
-    #[derive(Debug, Clone, Default, PartialEq, Eq)]
-    pub struct Flattened {
-        /// The x bounds of the highlight.
-        pub top_x: CellCountInt,
-        pub bot_x: CellCountInt,
-    }
-}
+pub use crate::terminal::highlight::Flattened;
 
 /// The messages that can be sent to a renderer thread.
 #[derive(Debug)]

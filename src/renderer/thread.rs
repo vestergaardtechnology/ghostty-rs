@@ -1,7 +1,6 @@
 //! Port of `src/renderer/Thread.zig`.
 //!
-//! STATUS: ported (against the stand-in generic renderer and terminal;
-//! TODO(port-dedupe))
+//! STATUS: ported
 //!
 //! Represents the renderer thread logic. The renderer thread is able to
 //! be woken up to render.
@@ -18,9 +17,6 @@
 //!   thread pointer (never a `&mut Thread` that would alias the loop).
 //! * Valgrind is detected through its `LD_PRELOAD` preload libraries
 //!   (Zig: `std.valgrind.runningOnValgrind()` client request).
-//! * The terminal compression API (`Terminal.compressionActivity` /
-//!   `Terminal.compress`) is reached through the [`TerminalCompression`]
-//!   stand-in trait until `Terminal` is ported (TODO(port-dedupe)).
 
 use std::fmt;
 
@@ -30,7 +26,8 @@ use crate::datastruct::BlockingQueue;
 use crate::global::xev;
 use crate::lib::tinyio::TinyIo;
 use crate::renderer::message::Message;
-use crate::renderer::standin::{crash_surface, AnimationWakeKind};
+use crate::renderer::generic::AnimationWakeKind;
+use crate::renderer::standin::crash_surface;
 use crate::renderer::{Renderer, State};
 use crate::terminal::mem::{can_reclaim, DecommitMode};
 use crate::apprt;
@@ -165,41 +162,9 @@ impl fmt::Debug for Thread {
 }
 
 /// Errors from [`Thread`] (Zig: inferred error sets).
-pub type Error = crate::renderer::standin::Error;
+pub type Error = crate::renderer::generic::Error;
 
-/// Stand-in for the terminal's compression API.
-///
-/// TODO(port-dedupe): remove once `Terminal.compressionActivity` and
-/// `Terminal.compress` are ported (the inherent methods take over).
-pub trait TerminalCompression {
-    fn compression_activity(&self) -> u64;
-    fn compress(&mut self, mode: CompressionMode) -> CompressionResult;
-}
-
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::CompressionMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionMode {
-    Incremental,
-    Full,
-}
-
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::CompressionResult`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionResult {
-    Unsupported,
-    Pending,
-    Complete,
-}
-
-impl TerminalCompression for crate::renderer::state::standin::Terminal {
-    fn compression_activity(&self) -> u64 {
-        0
-    }
-
-    fn compress(&mut self, _mode: CompressionMode) -> CompressionResult {
-        CompressionResult::Unsupported
-    }
-}
+pub use crate::terminal::terminal::{CompressionMode, CompressionResult};
 
 impl Thread {
     /// Initialize the thread. This does not START the thread. This only sets
@@ -1151,8 +1116,8 @@ mod tests {
     use crate::renderer::message::SearchMatches;
     use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
     use crate::renderer::opengl::test_util::test_options;
-    use crate::renderer::state::standin::Terminal;
-    use crate::renderer::{Health, OpenGL, ScreenSize, Size};
+    use crate::renderer::{Health, ScreenSize, Size};
+    use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
     struct SendPtr(*mut Thread);
     // SAFETY: the test only reads thread-safe parts until it joins.
@@ -1163,11 +1128,10 @@ mod tests {
         let _guard = egl_lock();
         let mut device = Device::init(device::Options::default()).unwrap();
         let opts = test_options(&mut *device);
-        let api = OpenGL::init(&*device, &opts).unwrap();
-        let mut renderer = Renderer::init_with_api(api, opts);
+        let mut renderer = Renderer::init(opts).unwrap();
 
         let mut mutex = Mutex::new();
-        let mut terminal = Terminal::default();
+        let mut terminal = Terminal::init(TerminalOptions::new(80, 24)).unwrap();
         let mut state = State::new(NonNull::from(&mut mutex), NonNull::from(&mut terminal));
         let mut surface = apprt::Surface::default();
 
