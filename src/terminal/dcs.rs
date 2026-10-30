@@ -3,11 +3,8 @@
 //! STATUS: ported
 //!
 //! Port notes / deviations:
-//! - `terminal.Terminal` is not ported yet, so [`Decrqss::encode`] takes any
-//!   [`DecrqssTerminal`] (the handful of terminal queries it needs) instead
-//!   of `*Terminal`. The DECRQSS encoding tests use a minimal test terminal
-//!   that ports `Terminal.printAttributes`/`setAttribute`/`setCursorStyle`
-//!   for the attributes they exercise.
+//! - [`Decrqss::encode`] takes `&Terminal` (Zig: `*Terminal`) since it only
+//!   reads terminal state.
 //! - `std.Io.Writer.Allocating` buffers are `Vec<u8>`; `deinit` is `Drop`.
 //! - `build_options.tmux_control_mode` is checked at runtime via the
 //!   `TMUX_CONTROL_MODE` const; the tmux types always exist in Rust.
@@ -17,50 +14,14 @@ use std::io::Write;
 
 use crate::terminal::build_options::TMUX_CONTROL_MODE;
 use crate::terminal::cursor::Style as CursorStyle;
-use crate::terminal::modes::{Mode, ModeState};
-use crate::terminal::size::CellCountInt;
+use crate::terminal::modes::Mode;
+use crate::terminal::Terminal;
 use crate::terminal::tmux::{ControlNotification, ControlParser};
 
 const LOG_TARGET: &str = "terminal_dcs";
 
 /// `Parser.Action.DCS`.
 pub use crate::terminal::parser::Dcs;
-
-/// `Terminal.ScrollingRegion`.
-///
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::ScrollingRegion`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ScrollingRegion {
-    // Top and bottom of the scroll region (0-indexed)
-    // Precondition: top < bottom
-    pub top: CellCountInt,
-    pub bottom: CellCountInt,
-
-    // Left/right scroll regions.
-    // Precondition: right > left
-    // Precondition: right <= cols - 1
-    pub left: CellCountInt,
-    pub right: CellCountInt,
-}
-
-/// The parts of `terminal.Terminal` that DECRQSS encoding reads.
-///
-/// TODO(port-dedupe): replace with `crate::terminal::Terminal` once
-/// `Terminal.zig` is ported (`encode` then takes `&mut Terminal`).
-pub trait DecrqssTerminal {
-    /// `Terminal.printAttributes`: write the SGR attributes of the cursor
-    /// pen into `buf`, returning the number of bytes written.
-    fn print_attributes(&mut self, buf: &mut [u8]) -> Result<usize, NoSpaceLeft>;
-
-    /// `t.modes`
-    fn modes(&self) -> &ModeState;
-
-    /// `t.screens.active.cursor.cursor_style`
-    fn cursor_style(&self) -> CursorStyle;
-
-    /// `t.scrolling_region`
-    fn scrolling_region(&self) -> ScrollingRegion;
-}
 
 /// Writer error (Zig: `error.WriteFailed` on a fixed writer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,9 +362,9 @@ impl Decrqss {
     pub const MAX_RESPONSE_BYTES: usize = 256;
 
     /// Encode the response for this request.
-    pub fn encode<'r, T: DecrqssTerminal + ?Sized>(
+    pub fn encode<'r>(
         self,
-        t: &mut T,
+        t: &Terminal,
         response: &'r mut [u8],
     ) -> Result<&'r [u8], NoSpaceLeft> {
         // const prefix_fmt = "\x1bP{d}$r";
@@ -419,13 +380,13 @@ impl Decrqss {
             match self {
                 Decrqss::None => {}
                 Decrqss::Sgr => {
-                    let n = t.print_attributes(writer)?;
+                    let n = t.print_attributes(writer)?.len();
                     writer = &mut writer[n..];
                     writer.write_all(b"m")?;
                 }
                 Decrqss::Decscusr => {
-                    let blink = t.modes().get(Mode::CursorBlinking);
-                    let style: u8 = match t.cursor_style() {
+                    let blink = t.modes.get(Mode::CursorBlinking);
+                    let style: u8 = match t.screens.active.cursor.cursor_style {
                         CursorStyle::Block | CursorStyle::BlockHollow => {
                             if blink {
                                 1
@@ -451,12 +412,12 @@ impl Decrqss {
                     write!(writer, "{} q", style)?;
                 }
                 Decrqss::Decstbm => {
-                    let r = t.scrolling_region();
+                    let r = t.scrolling_region;
                     write!(writer, "{};{}r", r.top as u32 + 1, r.bottom as u32 + 1)?;
                 }
                 Decrqss::Decslrm => {
-                    if t.modes().get(Mode::EnableLeftAndRightMargin) {
-                        let r = t.scrolling_region();
+                    if t.modes.get(Mode::EnableLeftAndRightMargin) {
+                        let r = t.scrolling_region;
                         write!(writer, "{};{}s", r.left as u32 + 1, r.right as u32 + 1)?;
                     }
                 }
@@ -525,6 +486,9 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::ansi;
+    use crate::terminal::color::Rgb;
+    use crate::terminal::sgr::{Attribute, Underline};
 
     fn dcs<'a>(intermediates: &'a [u8], params: &'a [u16], r#final: u8) -> Dcs<'a> {
         Dcs {
@@ -631,204 +595,7 @@ mod tests {
         assert!(h.unhook().is_none());
     }
 
-    // ---------------------------------------------------------------
-    // Minimal terminal stand-in for the DECRQSS encoding tests.
-    // TODO(port-dedupe): use `crate::terminal::Terminal` once ported.
-    // ---------------------------------------------------------------
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    #[repr(u8)]
-    enum Underline {
-        #[default]
-        None = 0,
-        Single = 1,
-        #[allow(dead_code)]
-        Double = 2,
-        Curly = 3,
-        #[allow(dead_code)]
-        Dotted = 4,
-        Dashed = 5,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    enum Color {
-        #[default]
-        None,
-        #[allow(dead_code)]
-        Palette(u8),
-        Rgb(u8, u8, u8),
-    }
-
-    #[derive(Debug, Clone, Copy, Default)]
-    struct Pen {
-        bold: bool,
-        faint: bool,
-        italic: bool,
-        underline: Underline,
-        overline: bool,
-        blink: bool,
-        inverse: bool,
-        invisible: bool,
-        strikethrough: bool,
-        fg_color: Color,
-        bg_color: Color,
-    }
-
-    /// Subset of `sgr.Attribute` used by the tests.
-    enum Attribute {
-        Bold,
-        Faint,
-        Italic,
-        Underline(Underline),
-        Blink,
-        Inverse,
-        Invisible,
-        Strikethrough,
-        Overline,
-        DirectColorFg(u8, u8, u8),
-        DirectColorBg(u8, u8, u8),
-    }
-
-    /// Subset of `ansi.CursorStyle` used by the tests.
-    enum AnsiCursorStyle {
-        SteadyUnderline,
-    }
-
-    struct TestTerminal {
-        modes: ModeState,
-        cursor_style: CursorStyle,
-        scrolling_region: ScrollingRegion,
-        pen: Pen,
-    }
-
-    impl TestTerminal {
-        fn init(cols: CellCountInt, rows: CellCountInt) -> Self {
-            TestTerminal {
-                modes: ModeState::default(),
-                cursor_style: CursorStyle::Block,
-                scrolling_region: ScrollingRegion {
-                    top: 0,
-                    bottom: rows - 1,
-                    left: 0,
-                    right: cols - 1,
-                },
-                pen: Pen::default(),
-            }
-        }
-
-        fn set_attribute(&mut self, attr: Attribute) {
-            let p = &mut self.pen;
-            match attr {
-                Attribute::Bold => p.bold = true,
-                Attribute::Faint => p.faint = true,
-                Attribute::Italic => p.italic = true,
-                Attribute::Underline(u) => p.underline = u,
-                Attribute::Blink => p.blink = true,
-                Attribute::Inverse => p.inverse = true,
-                Attribute::Invisible => p.invisible = true,
-                Attribute::Strikethrough => p.strikethrough = true,
-                Attribute::Overline => p.overline = true,
-                Attribute::DirectColorFg(r, g, b) => p.fg_color = Color::Rgb(r, g, b),
-                Attribute::DirectColorBg(r, g, b) => p.bg_color = Color::Rgb(r, g, b),
-            }
-        }
-
-        fn set_cursor_style(&mut self, value: AnsiCursorStyle) {
-            match value {
-                AnsiCursorStyle::SteadyUnderline => {
-                    self.modes.set(Mode::CursorBlinking, false);
-                    self.cursor_style = CursorStyle::Underline;
-                }
-            }
-        }
-    }
-
-    impl DecrqssTerminal for TestTerminal {
-        /// Port of `Terminal.printAttributes`.
-        fn print_attributes(&mut self, buf: &mut [u8]) -> Result<usize, NoSpaceLeft> {
-            let total = buf.len();
-            let mut writer: &mut [u8] = buf;
-
-            // The SGR response always starts with a 0. See https://vt100.net/docs/vt510-rm/DECRPSS
-            writer.write_all(b"0")?;
-
-            let pen = self.pen;
-            let mut attrs = [0u8; 9];
-            let mut i = 0;
-            let flags = [
-                (pen.bold, 1),
-                (pen.faint, 2),
-                (pen.italic, 3),
-                (pen.underline != Underline::None, 4),
-                (pen.overline, 53),
-                (pen.blink, 5),
-                (pen.inverse, 7),
-                (pen.invisible, 8),
-                (pen.strikethrough, 9),
-            ];
-            for (set, attr) in flags {
-                if set {
-                    attrs[i] = attr;
-                    i += 1;
-                }
-            }
-
-            for &attr in &attrs[..i] {
-                // Preserve underline styles. Kind of a hack to special case 4
-                // here but its easier than changing how we do all attributes.
-                if attr == 4 && pen.underline != Underline::Single {
-                    write!(writer, ";4:{}", pen.underline as u8)?;
-                    continue;
-                }
-
-                write!(writer, ";{}", attr)?;
-            }
-
-            match pen.fg_color {
-                Color::None => {}
-                Color::Palette(idx) => {
-                    if idx >= 16 {
-                        write!(writer, ";38:5:{}", idx)?
-                    } else if idx >= 8 {
-                        write!(writer, ";9{}", idx - 8)?
-                    } else {
-                        write!(writer, ";3{}", idx)?
-                    }
-                }
-                Color::Rgb(r, g, b) => write!(writer, ";38:2::{}:{}:{}", r, g, b)?,
-            }
-
-            match pen.bg_color {
-                Color::None => {}
-                Color::Palette(idx) => {
-                    if idx >= 16 {
-                        write!(writer, ";48:5:{}", idx)?
-                    } else if idx >= 8 {
-                        write!(writer, ";10{}", idx - 8)?
-                    } else {
-                        write!(writer, ";4{}", idx)?
-                    }
-                }
-                Color::Rgb(r, g, b) => write!(writer, ";48:2::{}:{}:{}", r, g, b)?,
-            }
-
-            Ok(total - writer.len())
-        }
-
-        fn modes(&self) -> &ModeState {
-            &self.modes
-        }
-
-        fn cursor_style(&self) -> CursorStyle {
-            self.cursor_style
-        }
-
-        fn scrolling_region(&self) -> ScrollingRegion {
-            self.scrolling_region
-        }
-    }
-
-    fn expect_response(term: &mut TestTerminal, request: Decrqss, expected: &[u8]) {
+    fn expect_response(term: &mut Terminal, request: Decrqss, expected: &[u8]) {
         let mut buf = [0u8; Decrqss::MAX_RESPONSE_BYTES];
         let encoded = request.encode(term, &mut buf).unwrap();
         assert_eq!(
@@ -837,18 +604,22 @@ mod tests {
         );
     }
 
+    fn term(cols: u16, rows: u16) -> Terminal {
+        Terminal::init(crate::terminal::terminal::Options::new(cols, rows)).unwrap()
+    }
+
     #[test]
     fn decrqss_response_encoding() {
-        let mut t = TestTerminal::init(80, 24);
+        let mut t = term(80, 24);
 
         expect_response(&mut t, Decrqss::None, b"\x1BP0$r\x1B\\");
         expect_response(&mut t, Decrqss::Sgr, b"\x1BP1$r0m\x1B\\");
 
-        t.set_attribute(Attribute::Bold);
-        t.set_attribute(Attribute::Underline(Underline::Curly));
+        t.set_attribute(Attribute::Bold).unwrap();
+        t.set_attribute(Attribute::Underline(Underline::Curly)).unwrap();
         expect_response(&mut t, Decrqss::Sgr, b"\x1BP1$r0;1;4:3m\x1B\\");
 
-        t.set_cursor_style(AnsiCursorStyle::SteadyUnderline);
+        t.set_cursor_style(ansi::CursorStyle::SteadyUnderline);
         expect_response(&mut t, Decrqss::Decscusr, b"\x1BP1$r4 q\x1B\\");
 
         t.scrolling_region.top = 4;
@@ -864,22 +635,22 @@ mod tests {
 
     #[test]
     fn decrqss_largest_response_fits_fixed_buffer() {
-        let mut t = TestTerminal::init(80, 24);
+        let mut t = term(80, 24);
 
-        t.set_attribute(Attribute::Bold);
-        t.set_attribute(Attribute::Faint);
-        t.set_attribute(Attribute::Italic);
-        t.set_attribute(Attribute::Underline(Underline::Dashed));
-        t.set_attribute(Attribute::Blink);
-        t.set_attribute(Attribute::Inverse);
-        t.set_attribute(Attribute::Invisible);
-        t.set_attribute(Attribute::Strikethrough);
-        t.set_attribute(Attribute::Overline);
-        t.set_attribute(Attribute::DirectColorFg(255, 255, 255));
-        t.set_attribute(Attribute::DirectColorBg(255, 255, 255));
+        t.set_attribute(Attribute::Bold).unwrap();
+        t.set_attribute(Attribute::Faint).unwrap();
+        t.set_attribute(Attribute::Italic).unwrap();
+        t.set_attribute(Attribute::Underline(Underline::Dashed)).unwrap();
+        t.set_attribute(Attribute::Blink).unwrap();
+        t.set_attribute(Attribute::Inverse).unwrap();
+        t.set_attribute(Attribute::Invisible).unwrap();
+        t.set_attribute(Attribute::Strikethrough).unwrap();
+        t.set_attribute(Attribute::Overline).unwrap();
+        t.set_attribute(Attribute::DirectColorFg(Rgb { r: 255, g: 255, b: 255 })).unwrap();
+        t.set_attribute(Attribute::DirectColorBg(Rgb { r: 255, g: 255, b: 255 })).unwrap();
 
         let mut buf = [0u8; Decrqss::MAX_RESPONSE_BYTES];
-        let encoded = Decrqss::Sgr.encode(&mut t, &mut buf).unwrap();
+        let encoded = Decrqss::Sgr.encode(&t, &mut buf).unwrap();
 
         let expected: &[u8] = b"\x1BP1$r0;1;2;3;4:5;53;5;7;8;9;38:2::255:255:255;48:2::255:255:255m\x1B\\";
         assert_eq!(

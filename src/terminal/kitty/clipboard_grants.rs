@@ -93,6 +93,16 @@ impl Grants {
         allowed
     }
 
+    /// The number of recorded grants (Zig: `entries.items.len`).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True if no grants are recorded.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     fn find_index(&self, pw: &[u8]) -> Option<usize> {
         self.entries.iter().position(|entry| entry.pw == pw)
     }
