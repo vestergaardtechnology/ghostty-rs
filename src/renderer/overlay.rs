@@ -1,7 +1,6 @@
 //! Port of `src/renderer/Overlay.zig`.
 //!
-//! STATUS: ported (against a stand-in for `renderer.image.Image.Pending`,
-//! see [`standin`]; TODO(port-dedupe)).
+//! STATUS: ported
 //!
 //! The debug overlay that can be drawn on top of the terminal
 //! during the rendering process.
@@ -40,60 +39,9 @@ use self::standin::{Pending, PixelFormat};
 
 const LOG: &str = "renderer_overlay";
 
-/// Stand-ins for types whose Zig files are not ported yet.
+/// The pending image types this overlay produces (formerly stand-ins).
 pub mod standin {
-    /// TODO(port-dedupe): replace with `crate::renderer::image::Image::Pending`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct Pending {
-        pub height: u32,
-        pub width: u32,
-        pub pixel_format: PixelFormat,
-
-        /// Data is always expected to be (width * height * bpp).
-        pub data: *mut u8,
-    }
-
-    impl Pending {
-        pub fn len(&self) -> usize {
-            self.width as usize * self.height as usize * self.pixel_format.bpp()
-        }
-
-        pub fn is_empty(&self) -> bool {
-            self.len() == 0
-        }
-    }
-
-    /// TODO(port-dedupe): replace with
-    /// `crate::renderer::image::Image::Pending::PixelFormat`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum PixelFormat {
-        /// 1 byte per pixel grayscale.
-        Gray,
-        /// 2 bytes per pixel grayscale + alpha.
-        GrayAlpha,
-        /// 3 bytes per pixel RGB.
-        Rgb,
-        /// 3 bytes per pixel BGR.
-        Bgr,
-        /// 4 byte per pixel RGBA.
-        Rgba,
-        /// 4 byte per pixel BGRA.
-        Bgra,
-    }
-
-    impl PixelFormat {
-        /// Get bytes per pixel for this format.
-        pub fn bpp(self) -> usize {
-            match self {
-                PixelFormat::Gray => 1,
-                PixelFormat::GrayAlpha => 2,
-                PixelFormat::Rgb => 3,
-                PixelFormat::Bgr => 3,
-                PixelFormat::Rgba => 4,
-                PixelFormat::Bgra => 4,
-            }
-        }
-    }
+    pub use crate::renderer::image::{Pending, PixelFormat};
 }
 
 /// An RGB pixel (z2d `pixel.RGB`).

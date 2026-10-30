@@ -15,6 +15,13 @@
 //!   `target/tmp` (not under `/tmp`, matching Zig's `.zig-cache/tmp`, since
 //!   files under `/tmp` are always accepted as temporary files).
 
+/// Maximum file name length (`NAME_MAX`). The libc crate doesn't export it
+/// for Apple targets; Darwin's `sys/syslimits.h` defines it as 255.
+#[cfg(not(target_vendor = "apple"))]
+const NAME_MAX: usize = libc::NAME_MAX as usize;
+#[cfg(target_vendor = "apple")]
+const NAME_MAX: usize = 255;
+
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -307,7 +314,7 @@ impl LoadingImage {
         // unmodified to shm_open, including names without a leading slash:
         // sandboxed macOS apps can only use names of the form
         // `<app group id>/<name>`. We only reject clearly malformed names.
-        if !valid_shared_memory_name(path, libc::NAME_MAX as usize) {
+        if !valid_shared_memory_name(path, NAME_MAX) {
             log::warn!(target: LOG_TARGET, "invalid shared memory name");
             return Err(Error::InvalidData);
         }

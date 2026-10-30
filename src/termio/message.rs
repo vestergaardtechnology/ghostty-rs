@@ -6,38 +6,14 @@
 //! Kitty clipboard grant password) are owned `Box`es freed on drop, so the
 //! allocator fields are gone and `deinit` consumes the message. The
 //! `write_*` variants hold the [`MessageData`] payload types directly.
-//!
-//! Stand-in for `terminal.Terminal.ScrollViewport` lives in [`standin`]
-//! (TODO(port-dedupe)).
 
 use crate::datastruct::message_data::Small;
 use crate::datastruct::MessageData;
 use crate::renderer;
 use crate::termio::DerivedConfig;
 
-pub use self::standin::ScrollViewport;
-
-/// Stand-ins for types whose Zig files are not ported yet.
-pub mod standin {
-    /// Options for scrolling the viewport of the terminal grid.
-    ///
-    /// TODO(port-dedupe): replace with `crate::terminal::terminal::ScrollViewport`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ScrollViewport {
-        /// Scroll to the top of the scrollback
-        Top,
-
-        /// Scroll to the bottom, i.e. the top of the active area
-        Bottom,
-
-        /// Scroll by some delta amount, up is negative.
-        Delta(isize),
-
-        /// Scroll to the given absolute row offset from the top of the
-        /// scrollable area.
-        Row(usize),
-    }
-}
+/// Zig: `terminal.Terminal.ScrollViewport`.
+pub use crate::terminal::terminal::ScrollViewport;
 
 /// Represents a write request. Magic number comes from the largest
 /// other union value. It can be upped if we add a larger union member

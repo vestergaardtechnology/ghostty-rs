@@ -12,7 +12,7 @@
 //! * `Preedit.codepoints` is an owned `Vec` (Zig: an allocated slice with
 //!   explicit `deinit`/`clone`).
 //!
-//! Stand-ins for `Terminal` and the inspector live in [`standin`]
+//! A stand-in for the inspector lives in [`standin`]
 //! (TODO(port-dedupe)).
 
 use std::ptr::NonNull;
@@ -24,17 +24,119 @@ use crate::lib::tinyio::{Mutex, Timeout, TinyIo};
 use crate::terminal::point::Coordinate;
 use crate::terminal::size::CellCountInt;
 
-use self::standin::{Inspector, Terminal};
+use self::standin::Inspector;
+use crate::terminal::terminal::Terminal;
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
-    /// TODO(port-dedupe): replace with `crate::terminal::Terminal`.
-    #[derive(Debug, Default)]
-    pub struct Terminal {}
+    use crate::renderer::overlay::Feature;
+
+    /// The terminal the state points at. This used to be a stand-in and
+    /// is kept as an alias for modules that still name it.
+    pub type Terminal = crate::terminal::terminal::Terminal;
+
+    /// A default terminal for modules that construct the former
+    /// stand-in with `Terminal::default()` (an 80x24 terminal).
+    ///
+    /// TODO(port-dedupe): remove once those callers construct the
+    /// terminal with `Terminal::init`.
+    impl Default for crate::terminal::terminal::Terminal {
+        fn default() -> Self {
+            crate::terminal::terminal::Terminal::init(crate::terminal::terminal::Options::new(80, 24))
+                .expect("default terminal")
+        }
+    }
 
     /// TODO(port-dedupe): replace with `crate::inspector::Inspector`.
     #[derive(Debug, Default)]
-    pub struct Inspector {}
+    pub struct Inspector {
+        pub renderer_info: RendererInfo,
+
+        /// Mouse state (Zig: `widgets.surface.Mouse`), written by the core
+        /// surface.
+        pub mouse: InspectorMouse,
+
+        /// The recorded key events.
+        pub key_events: Vec<KeyEvent>,
+    }
+
+    /// TODO(port-dedupe): replace with
+    /// `crate::inspector::widgets::surface::Mouse`.
+    #[derive(Debug, Default)]
+    pub struct InspectorMouse {
+        /// Last reported mouse position.
+        pub last_xpos: f64,
+        pub last_ypos: f64,
+
+        /// Last hovered screen point.
+        pub last_point: Option<crate::terminal::page_list::Pin>,
+    }
+
+    /// A key event recorded by the inspector.
+    ///
+    /// TODO(port-dedupe): replace with `crate::inspector::KeyEvent`
+    /// (`widgets.key.Event`).
+    #[derive(Debug, Clone, Default)]
+    pub struct KeyEvent {
+        /// The input event (its text lives in `utf8`).
+        pub event: crate::input::KeyEvent<'static>,
+
+        /// The event text (Zig: an allocated copy of `event.utf8`).
+        pub utf8: Vec<u8>,
+
+        /// The binding that was triggered as a result of this event.
+        /// Multiple bindings are possible if they are chained.
+        pub binding: Vec<crate::input::binding::Action>,
+
+        /// The data sent to the pty as a result of this keyboard event.
+        /// This is allocated using the inspector allocator.
+        pub pty: Vec<u8>,
+    }
+
+    impl Inspector {
+        /// Zig: `Inspector.init`.
+        pub fn init() -> Inspector {
+            Inspector::default()
+        }
+
+        /// Record a keyboard event (Zig: `Inspector.recordKeyEvent`).
+        pub fn record_key_event(&mut self, ev: KeyEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.key_events.push(ev);
+            Ok(())
+        }
+
+        /// Record data read from the pty (Zig: `Inspector.recordPtyRead`).
+        /// The stand-in records nothing.
+        pub fn record_pty_read(
+            &mut self,
+            _t: &mut crate::terminal::terminal::Terminal,
+            _data: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
+        /// Zig: `Inspector.rendererInfo`.
+        pub fn renderer_info(&self) -> &RendererInfo {
+            &self.renderer_info
+        }
+    }
+
+    /// TODO(port-dedupe): replace with
+    /// `crate::inspector::widgets::renderer::Info`.
+    #[derive(Debug, Default)]
+    pub struct RendererInfo {
+        /// The enabled overlay features.
+        pub features: Vec<Feature>,
+    }
+
+    impl RendererInfo {
+        /// Zig: `Info.overlayFeatures`: a copy of the enabled features.
+        pub fn overlay_features(&self) -> Vec<Feature> {
+            // For now we do a dumb copy since the features have no managed
+            // memory.
+            self.features.clone()
+        }
+    }
 }
 
 #[derive(Debug)]

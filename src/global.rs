@@ -347,6 +347,12 @@ pub fn tmp_dir_path() -> String {
     with_state(|s| s.tmp_dir_path.clone().expect("tmp dir path not set"))
 }
 
+/// Like [`tmp_dir_path`] but returns `None` instead of asserting when the
+/// global state (or its temporary directory) is not initialized.
+pub fn try_tmp_dir_path() -> Option<String> {
+    STATE.read().ok()?.as_ref()?.tmp_dir_path.clone()
+}
+
 /// Returns the global state resources_dir, or an empty one when testing.
 ///
 /// Asserts that the global state is initialized when not running as a test.
