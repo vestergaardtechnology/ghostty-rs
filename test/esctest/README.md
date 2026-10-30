@@ -49,3 +49,9 @@ esctest resets the terminal with DECSTR before each test, and
 libghostty-vt doesn't implement DECSTR, so modes and margins one test
 leaves behind can make the next one fail. The terminal never resizes
 either, so the tests that resize it with XTWINOPS or DECCOLM fail.
+
+## Compared with Zig Ghostty
+
+At the reference revision (`93967b7`), the Rust port and Zig Ghostty's
+libghostty-vt produce the same result, `411 tests passed, 42 known bugs,
+114 TESTS FAILED`, and fail exactly the same tests.
