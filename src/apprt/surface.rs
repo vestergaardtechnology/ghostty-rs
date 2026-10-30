@@ -9,11 +9,9 @@
 //!   pointers like in Zig; Kitty clipboard request states are owned
 //!   `Box`es (the receiver takes ownership, as documented in Zig).
 //! * `newConfig` drops the allocator and cannot fail.
-//!
-//! Stand-ins for the core `App` (App.zig) live in [`standin`]
-//! (TODO(port-dedupe)).
 
-use crate::apprt::action::standin::CoreSurface;
+use crate::app::{App, Mailbox as AppMailbox, Message as AppMessage};
+use crate::surface::Surface as CoreSurface;
 use crate::terminal::page_list::Scrollbar;
 use crate::config::config::WorkingDirectory;
 use crate::config::Config;
@@ -27,72 +25,6 @@ use crate::terminal::osc::ProgressReport;
 
 use crate::terminal::stream::ResizeWindow;
 
-use self::standin::{App, AppMailbox, AppMessage};
-
-/// Stand-ins for types whose Zig files are not ported yet.
-pub mod standin {
-    use super::{Message, QueueSize, QueueTimeout};
-    use crate::apprt;
-    use crate::apprt::action::standin::CoreSurface;
-    use crate::datastruct::BlockingQueue;
-
-    /// TODO(port-dedupe): replace with `crate::app::App` (App.zig).
-    #[derive(Debug, Default)]
-    pub struct App {
-        /// The last focused surface. This surface may not be valid;
-        /// stand-in for App.focused_surface + hasSurface.
-        pub focused_surface: Option<*mut CoreSurface>,
-    }
-
-    impl App {
-        /// Zig: `App.focusedSurface`.
-        pub fn focused_surface(&self) -> Option<*mut CoreSurface> {
-            self.focused_surface
-        }
-    }
-
-    /// TODO(port-dedupe): replace with `crate::app::Message` (App.zig).
-    #[derive(Debug)]
-    pub enum AppMessage {
-        /// Quit
-        Quit,
-
-        /// A message for a specific surface.
-        SurfaceMessage {
-            surface: *mut CoreSurface,
-            message: Message,
-        },
-    }
-
-    /// The type used for sending messages to the app thread.
-    pub type AppQueue = BlockingQueue<AppMessage, 64>;
-
-    /// TODO(port-dedupe): replace with `crate::app::Mailbox` (App.zig).
-    #[derive(Debug, Clone, Copy)]
-    pub struct AppMailbox {
-        pub rt_app: *const apprt::App,
-        pub mailbox: *const AppQueue,
-    }
-
-    // SAFETY: the mailbox is a pair of pointers to thread-safe objects (the
-    // blocking queue and the runtime app's wakeup) that outlive every
-    // mailbox copy, exactly like the Zig struct.
-    unsafe impl Send for AppMailbox {}
-    unsafe impl Sync for AppMailbox {}
-
-    impl AppMailbox {
-        /// Send a message to the surface.
-        pub fn push(&self, msg: AppMessage, timeout: QueueTimeout) -> QueueSize {
-            // SAFETY: see the Send/Sync impls above.
-            let result = unsafe { (*self.mailbox).push(msg, timeout) };
-
-            // Wake up our app loop
-            unsafe { (*self.rt_app).wakeup() };
-
-            result
-        }
-    }
-}
 
 /// Represents a write request. Magic number comes from the max size
 /// we want this union to be.
@@ -342,7 +274,9 @@ pub fn new_config(app: &App, config: &Config, context: NewSurfaceContext) -> Con
         if should_inherit_working_directory(context, config) {
             // SAFETY: focused_surface only returns live surfaces.
             if let Some(pwd) = unsafe { (*p).pwd() } {
-                copy.working_directory = Some(WorkingDirectory::Path(pwd));
+                copy.working_directory = Some(WorkingDirectory::Path(
+                    String::from_utf8_lossy(&pwd).into_owned(),
+                ));
             }
         }
     }
@@ -415,17 +349,17 @@ mod tests {
         assert_eq!("abcЯ".as_bytes(), slice_to_nul(&dst));
     }
 
-    // Extra (not in Zig): mailbox rewrapping and new config inheritance.
+    // Extra (not in Zig): mailbox rewrapping. (New config working
+    // directory inheritance needs a live core surface and is covered by
+    // the integration test in `crate::surface`.)
     #[test]
     fn mailbox_push_wraps_surface_message() {
         let rt_app = crate::apprt::App::default();
-        let queue = standin::AppQueue::new();
-        let mut core = CoreSurface {
-            rt_surface: std::ptr::null_mut(),
-            pwd: None,
-        };
+        let queue = crate::app::MailboxQueue::new();
+        // The surface pointer is only an identifier here.
+        let core = std::ptr::NonNull::<CoreSurface>::dangling().as_ptr();
         let mb = Mailbox {
-            surface: &mut core,
+            surface: core,
             app: AppMailbox {
                 rt_app: &rt_app,
                 mailbox: &queue,
@@ -434,28 +368,21 @@ mod tests {
         assert_eq!(1, mb.push(Message::RingBell, QueueTimeout::Instant));
         match queue.pop() {
             Some(AppMessage::SurfaceMessage { surface, message }) => {
-                assert_eq!(&mut core as *mut CoreSurface, surface);
+                assert_eq!(core, surface);
                 assert!(matches!(message, Message::RingBell));
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert_eq!(1, rt_app.wakeups());
     }
 
     #[test]
-    fn new_config_inherits_working_directory() {
-        let mut core = CoreSurface {
-            rt_surface: std::ptr::null_mut(),
-            pwd: Some("/tmp".to_string()),
-        };
-        let app = App {
-            focused_surface: Some(&mut core),
-        };
+    fn new_config_without_focused_surface() {
+        let app = App::create().unwrap();
         let mut config = Config::default();
         config.window_inherit_working_directory = true;
-        config.tab_inherit_working_directory = false;
         let c = new_config(&app, &config, NewSurfaceContext::Window);
-        assert_eq!(Some(WorkingDirectory::Path("/tmp".to_string())), c.working_directory);
-        let c = new_config(&app, &config, NewSurfaceContext::Tab);
         assert_eq!(None, c.working_directory);
+        app.destroy();
     }
 }

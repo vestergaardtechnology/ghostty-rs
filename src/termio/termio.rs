@@ -27,7 +27,6 @@ use std::io::{self, Cursor, Read as _};
 use std::time::Instant;
 
 use crate::apprt;
-use crate::crash::sentry::{CrashSurface, SurfaceDimensions};
 use crate::config::config::{
     Color as ConfigColor, GraphemeWidthMethod, OSCColorReportFormat, TerminalColor,
     XtChecksumExtension,
@@ -998,25 +997,10 @@ impl Termio {
     }
 }
 
-/// The surface recorded in the crash metadata of the IO threads.
-///
-/// TODO(port-dedupe): Zig records `io.surface_mailbox.surface` (a
-/// `*Surface`); until `Surface` is ported (and implements
-/// [`CrashSurface`]) the IO threads record this placeholder.
-struct NoCrashSurface;
-
-impl CrashSurface for NoCrashSurface {
-    fn crash_dimensions(&self) -> SurfaceDimensions {
-        SurfaceDimensions::default()
-    }
-}
-
-static NO_CRASH_SURFACE: NoCrashSurface = NoCrashSurface;
-
 /// The crash-metadata surface for a surface mailbox (Zig:
 /// `surface_mailbox.surface`).
-pub fn crash_surface(_mailbox: &apprt::surface::Mailbox) -> *const dyn CrashSurface {
-    &NO_CRASH_SURFACE as &dyn CrashSurface as *const dyn CrashSurface
+pub fn crash_surface(mailbox: &apprt::surface::Mailbox) -> *const crate::surface::Surface {
+    mailbox.surface
 }
 
 /// Read a whole file up to `max_bytes` (Zig:
@@ -1071,7 +1055,7 @@ impl Default for ThreadData {
             renderer_state: std::ptr::null_mut(),
             surface_mailbox: apprt::surface::Mailbox {
                 surface: std::ptr::null_mut(),
-                app: apprt::surface::standin::AppMailbox {
+                app: crate::app::Mailbox {
                     rt_app: std::ptr::null(),
                     mailbox: std::ptr::null(),
                 },

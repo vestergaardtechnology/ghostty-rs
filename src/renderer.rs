@@ -1,7 +1,6 @@
 //! Port of `src/renderer.zig`.
 //!
-//! STATUS: ported (the crash-reporting surface is a stand-in in
-//! [`standin`] until `Surface.zig` is ported; TODO(port-dedupe)).
+//! STATUS: ported
 //!
 //! Renderer implementation and utilities. The renderer is responsible for
 //! taking the internal screen state and turning into some output format,
@@ -96,6 +95,13 @@ pub type Device = metal::device::Device;
 #[cfg(not(target_os = "macos"))]
 pub type Device = opengl::device::Device;
 
+/// The options of [`Device::init`] (Zig: `Device.Options`).
+#[cfg(target_os = "macos")]
+pub type DeviceOptions = metal::device::Options;
+/// The options of [`Device::init`] (Zig: `Device.Options`).
+#[cfg(not(target_os = "macos"))]
+pub type DeviceOptions = opengl::device::Options;
+
 crate::lib_enum! {
     /// The health status of a renderer. These must be shared across all
     /// renderers even if some states aren't reachable so that our API users
@@ -110,27 +116,16 @@ crate::lib_enum! {
 /// kept for modules that still name the former stand-ins.
 pub mod standin {
     use crate::apprt;
-    use crate::crash::sentry::CrashSurface;
 
     pub use super::generic::{
         AnimationWake, AnimationWakeKind, AtomicHealth, DerivedConfig as RendererDerivedConfig, Error,
         GraphicsApi, InitError, LatestFrame,
     };
 
-    /// The crash-reporting view of the surface behind a mailbox.
-    ///
-    /// TODO(port-dedupe): Zig stores `surface_mailbox.surface` (`*Surface`)
-    /// in the crash thread state; until the core `Surface` is ported there
-    /// is nothing to report.
-    pub fn crash_surface(_mailbox: &apprt::surface::Mailbox) -> *const dyn CrashSurface {
-        struct NoCrashSurface;
-        impl CrashSurface for NoCrashSurface {
-            fn crash_dimensions(&self) -> crate::crash::sentry::SurfaceDimensions {
-                crate::crash::sentry::SurfaceDimensions::default()
-            }
-        }
-        static NO_CRASH_SURFACE: NoCrashSurface = NoCrashSurface;
-        &NO_CRASH_SURFACE as &dyn CrashSurface as *const dyn CrashSurface
+    /// The surface recorded in the crash thread state (Zig:
+    /// `surface_mailbox.surface`).
+    pub fn crash_surface(mailbox: &apprt::surface::Mailbox) -> *const crate::surface::Surface {
+        mailbox.surface
     }
 
     /// The type used for sending messages to the renderer thread.

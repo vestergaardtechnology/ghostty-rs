@@ -101,7 +101,7 @@ impl Frame {
 mod tests {
     // Not a Zig test: Frame.zig has none.
     use super::*;
-    use crate::apprt::surface::standin::{AppMessage, AppQueue};
+    use crate::app::{MailboxQueue as AppQueue, Message as AppMessage};
     use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
     use crate::renderer::opengl::test_util::test_options_with_mailbox;
     use crate::renderer::opengl::OpenGL;

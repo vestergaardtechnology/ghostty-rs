@@ -1115,7 +1115,7 @@ mod tests {
     use crate::lib::tinyio::Mutex;
     use crate::renderer::message::SearchMatches;
     use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
-    use crate::apprt::surface::standin::AppQueue;
+    use crate::app::MailboxQueue as AppQueue;
     use crate::renderer::opengl::test_util::test_options_with_mailbox;
     use crate::renderer::{Health, ScreenSize, Size};
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};

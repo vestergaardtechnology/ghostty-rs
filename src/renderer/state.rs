@@ -51,9 +51,60 @@ pub mod standin {
     #[derive(Debug, Default)]
     pub struct Inspector {
         pub renderer_info: RendererInfo,
+
+        /// Mouse state (Zig: `widgets.surface.Mouse`), written by the core
+        /// surface.
+        pub mouse: InspectorMouse,
+
+        /// The recorded key events.
+        pub key_events: Vec<KeyEvent>,
+    }
+
+    /// TODO(port-dedupe): replace with
+    /// `crate::inspector::widgets::surface::Mouse`.
+    #[derive(Debug, Default)]
+    pub struct InspectorMouse {
+        /// Last reported mouse position.
+        pub last_xpos: f64,
+        pub last_ypos: f64,
+
+        /// Last hovered screen point.
+        pub last_point: Option<crate::terminal::page_list::Pin>,
+    }
+
+    /// A key event recorded by the inspector.
+    ///
+    /// TODO(port-dedupe): replace with `crate::inspector::KeyEvent`
+    /// (`widgets.key.Event`).
+    #[derive(Debug, Clone, Default)]
+    pub struct KeyEvent {
+        /// The input event (its text lives in `utf8`).
+        pub event: crate::input::KeyEvent<'static>,
+
+        /// The event text (Zig: an allocated copy of `event.utf8`).
+        pub utf8: Vec<u8>,
+
+        /// The binding that was triggered as a result of this event.
+        /// Multiple bindings are possible if they are chained.
+        pub binding: Vec<crate::input::binding::Action>,
+
+        /// The data sent to the pty as a result of this keyboard event.
+        /// This is allocated using the inspector allocator.
+        pub pty: Vec<u8>,
     }
 
     impl Inspector {
+        /// Zig: `Inspector.init`.
+        pub fn init() -> Inspector {
+            Inspector::default()
+        }
+
+        /// Record a keyboard event (Zig: `Inspector.recordKeyEvent`).
+        pub fn record_key_event(&mut self, ev: KeyEvent) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.key_events.push(ev);
+            Ok(())
+        }
+
         /// Record data read from the pty (Zig: `Inspector.recordPtyRead`).
         /// The stand-in records nothing.
         pub fn record_pty_read(
