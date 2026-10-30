@@ -2017,10 +2017,10 @@ impl<G: GraphicsApi> Renderer<G> {
 
         let overlay_features: Vec<overlay::Feature> = match state.inspector {
             None => Vec::new(),
-            Some(insp) => {
+            Some(mut insp) => {
                 // SAFETY: the inspector is alive while it is set and we
                 // hold the terminal mutex.
-                let insp = unsafe { insp.as_ref() };
+                let insp = unsafe { insp.as_mut() };
                 insp.renderer_info().overlay_features()
             }
         };

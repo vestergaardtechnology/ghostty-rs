@@ -1,8 +1,6 @@
 //! Port of `src/apprt/gtk/class/inspector_widget.zig`.
 //!
-//! STATUS: partial — `src/inspector` is not ported, so the inspector UI
-//! itself (`Inspector.setup`/`render`) is a no-op stand-in. Only built with
-//! the `inspector` Cargo feature.
+//! STATUS: ported (only built with the `inspector` Cargo feature)
 //!
 //! Zig keeps an unreferenced surface pointer plus a weak notify and reads
 //! the core surface from the dying surface in the notify. The port keeps a
@@ -37,17 +35,7 @@ pub mod properties {
     pub const SURFACE: &str = "surface";
 }
 
-/// Stand-in for `src/inspector/Inspector.zig`.
-// TODO(port-dedupe): replace with crate::inspector::Inspector
-struct Inspector;
-
-impl Inspector {
-    /// `Inspector.setup()`
-    fn setup() {}
-
-    /// `inspector.render(core_surface)`
-    fn render(_core_surface: &CoreSurface) {}
-}
+use crate::inspector::Inspector;
 
 mod imp {
     use super::*;
@@ -134,11 +122,13 @@ mod imp {
                 return;
             };
             // SAFETY: the core surface is live while its GTK surface is.
-            let core_surface = unsafe { &*core_surface };
-            if core_surface.inspector.is_none() {
+            let Some(inspector) = (unsafe { (*core_surface).inspector.as_deref_mut() }) else {
                 return;
-            }
-            Inspector::render(core_surface);
+            };
+            let inspector: *mut Inspector = inspector;
+            // SAFETY: the inspector is owned by the live core surface and
+            // the ImGui widget made its context current for this callback.
+            unsafe { (*inspector).render(core_surface) };
         }
     }
 }
