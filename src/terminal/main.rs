@@ -1,6 +1,6 @@
 //! Port of `src/terminal/main.zig`.
 //!
-//! STATUS: partial — re-exports of unported modules (render, SelectionGesture, stream_terminal, paste) pending.
+//! STATUS: ported
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "ansi.rs"]
@@ -146,10 +146,17 @@ pub use self::selection_gesture::SelectionGesture;
 pub use self::string_map::StringMap;
 pub use self::style::Style;
 pub use self::terminal::Terminal;
+pub use self::stream_terminal::Stream as TerminalStream;
 pub use self::stream::Stream;
 pub use self::stream::Action as StreamAction;
 pub use self::stream::Boundary as StreamBoundary;
+pub use self::stream_terminal::SemanticPrompt;
+pub use self::stream_terminal::UnknownSequence;
+pub use self::paste::Request as Paste;
+pub use self::paste::Contents as PasteContents;
+pub use self::paste::Source as PasteSource;
 pub use self::clipboard::MimeReader;
+pub use self::stream_terminal::PasteError;
 pub use self::screen::Cursor;
 pub use self::cursor::Style as CursorStyle;
 pub use self::ansi::CursorStyle as CursorStyleReq;
@@ -170,11 +177,7 @@ pub use self::build_options::Options;
 /// (Zig: `options`, the `terminal_options` build module.)
 pub use self::build_options as options;
 
-// TODO(port-dedupe): the following re-exports are pending the ports of
-// their modules: `SelectionGesture`
-// (SelectionGesture.zig), `TerminalStream`, `SemanticPrompt`,
-// `UnknownSequence`, `PasteError` (stream_terminal.zig), `Paste`,
-// `PasteContents`, `PasteSource` (paste.zig). `c_api` is the `c` module.
+// (Zig: `c_api` is the `c` module.)
 
 /// Whether this target supports terminal page compression.
 pub const COMPRESSION_ENABLED: bool = self::mem::can_reclaim(self::mem::DecommitMode::Strict);
