@@ -17,6 +17,14 @@ path = "src/root.rs"
 name = "ghostty"
 path = "src/main.rs"
 
+[[bin]]
+name = "ghostty-bench"
+path = "src/bin/ghostty-bench.rs"
+
+[[bin]]
+name = "ghostty-gen"
+path = "src/bin/ghostty-gen.rs"
+
 [features]
 default = []
 inspector = []
