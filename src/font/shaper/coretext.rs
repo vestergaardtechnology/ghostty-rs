@@ -55,6 +55,7 @@ pub enum Error {
     Macos(macos::Error),
     GetFace(GetFaceError),
     ThreadSpawnFailed,
+    Xev(crate::pkg::xev::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -131,7 +132,7 @@ pub struct Shaper {
     /// Dedicated thread for releasing CoreFoundation objects. Some objects,
     /// such as those produced by CoreText, have excessively slow release
     /// callback logic.
-    cf_release_thread: std::sync::Arc<cf_release_thread::Thread>,
+    cf_release_thread: Box<cf_release_thread::Thread>,
     cf_release_thr: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -259,16 +260,33 @@ impl Shaper {
         };
 
         // Create the CF release thread.
-        let cf_release_thread = std::sync::Arc::new(cf_release_thread::Thread::init());
+        let mut cf_release_thread = match cf_release_thread::Thread::init() {
+            Ok(v) => Box::new(v),
+            Err(err) => {
+                features.release();
+                features_no_default.release();
+                typesetter_attr_dict.release();
+                return Err(Error::Xev(err));
+            }
+        };
 
         // Start the CF release thread.
-        let thr_state = cf_release_thread.clone();
+        struct ThreadPtr(*mut cf_release_thread::Thread);
+        // SAFETY: the boxed thread outlives the OS thread (joined on drop).
+        unsafe impl Send for ThreadPtr {}
+        let thr_state = ThreadPtr(&mut *cf_release_thread);
         let cf_release_thr = std::thread::Builder::new()
             .name("cf_release".to_string())
-            .spawn(move || thr_state.thread_main());
+            .spawn(move || {
+                let thr_state = thr_state;
+                // SAFETY: the boxed thread does not move and is only freed
+                // after this thread is joined.
+                unsafe { cf_release_thread::Thread::thread_main(thr_state.0) }
+            });
         let cf_release_thr = match cf_release_thr {
             Ok(v) => v,
             Err(_) => {
+                cf_release_thread.deinit();
                 features.release();
                 features_no_default.release();
                 typesetter_attr_dict.release();
@@ -307,7 +325,12 @@ impl Shaper {
             crate::datastruct::blocking_queue::Timeout::Forever,
         );
         if pushed != 0 {
-            self.cf_release_thread.handle().notify_wakeup();
+            if let Err(err) = self.cf_release_thread.wakeup.notify() {
+                log::warn!(
+                    target: LOG,
+                    "error notifying cf release thread to wake up, may stall err={err}"
+                );
+            }
             return;
         }
 
@@ -823,11 +846,17 @@ impl Drop for Shaper {
 
         // Stop the CF release thread
         {
-            self.cf_release_thread.handle().notify_stop();
+            if let Err(err) = self.cf_release_thread.stop.notify() {
+                log::error!(
+                    target: LOG,
+                    "error notifying cf release thread to stop, may stall err={err}"
+                );
+            }
             if let Some(thr) = self.cf_release_thr.take() {
                 let _ = thr.join();
             }
         }
+        self.cf_release_thread.deinit();
     }
 }
 

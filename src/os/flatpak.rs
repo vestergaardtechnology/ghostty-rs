@@ -38,10 +38,13 @@ mod host_command {
 
     /// The event loop used to deliver asynchronous wait results.
     ///
-    /// TODO(port-dedupe): replace with `xev.Loop` + `xev.Timer` once the
-    /// libxev port exists. Zig arms a zero-duration xev timer so the
-    /// callback runs on the loop's thread on its next tick; implementors
-    /// of this trait must do the same with `run_soon`.
+    /// NOTE(port): Zig arms a zero-duration `xev.Timer` on the caller's
+    /// `xev.Loop` so the callback runs on the loop's thread on its next
+    /// tick, but `onExit` arms it from the GLib thread, which is a data race
+    /// on the single-threaded loop (UB in Rust). Implementors of this trait
+    /// must hand `f` to the loop thread in a thread-safe way (e.g. a queue
+    /// plus `xev.Async`). Flatpak host commands are not built into the
+    /// Ghostty application (`build_config::FLATPAK`), so nothing calls this.
     pub trait XevLoop: Send + Sync {
         fn run_soon(&self, f: Box<dyn FnOnce() + Send>);
     }
