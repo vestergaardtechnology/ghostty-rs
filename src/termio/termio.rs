@@ -1149,4 +1149,477 @@ mod tests {
         let derived = DerivedConfig::init(&config);
         assert_eq!(terminal_color::Rgb { r: 1, g: 2, b: 3 }, derived.palette[1]);
     }
+
+    /// Tests that drive the stream handler through a real termio (with
+    /// stand-in renderer and surface mailboxes; the IO thread is not
+    /// started unless noted).
+    #[cfg(unix)]
+    mod handler {
+        use super::*;
+        use crate::apprt::surface::Message as SurfaceMessage;
+        use crate::terminal::mouse;
+        use crate::termio::exec::testing::{direct_config, Harness};
+
+        fn harness() -> Harness {
+            Harness::new(direct_config(&["/bin/sh", "-c", "exit 0"]))
+        }
+
+        /// The messages the stream handler queued for the IO thread.
+        fn io_messages(h: &mut Harness) -> Vec<Message> {
+            let Mailbox::Spsc { queue, .. } = &h.io.mailbox;
+            let mut result = Vec::new();
+            while let Some(m) = queue.pop() {
+                result.push(m);
+            }
+            result
+        }
+
+        /// The bytes of the write messages queued for the pty.
+        fn writes(h: &mut Harness) -> Vec<Vec<u8>> {
+            io_messages(h)
+                .into_iter()
+                .filter_map(|m| match m {
+                    Message::WriteSmall(v) => Some(v.data[..v.len as usize].to_vec()),
+                    Message::WriteStable(v) => Some(v.to_vec()),
+                    Message::WriteAlloc(v) => Some(v.to_vec()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn surface_messages(h: &mut Harness) -> Vec<SurfaceMessage> {
+            h.collect_messages();
+            std::mem::take(&mut h.messages)
+        }
+
+        // The integration test: a real Exec, Thread and Termio running a
+        // command on a pty, with the output parsed into the terminal.
+        #[test]
+        fn exec_thread_termio_printf_hello() {
+            let mut h = Harness::new(direct_config(&["/bin/sh", "-c", "printf hello"]));
+            h.start();
+            h.wait_output("hello");
+            h.wait_message(|m| matches!(m, SurfaceMessage::ChildExited(e) if e.exit_code == 0));
+            h.stop();
+
+            let screen = h.with_io(|io| io.terminal.plain_string().unwrap());
+            assert_eq!("hello", screen.trim_end());
+            assert_eq!(5, h.with_io(|io| io.terminal.screens.active.cursor.x));
+
+            // The renderer was asked to reset the cursor blink.
+            h.collect_renderer_messages();
+            assert!(h
+                .renderer_messages
+                .iter()
+                .any(|m| matches!(m, renderer::Message::ResetCursorBlink)));
+        }
+
+        #[test]
+        fn print_and_cursor() {
+            let mut h = harness();
+            h.io.process_output(b"hello\r\nworld");
+            assert_eq!("hello\nworld", h.io.terminal.plain_string().unwrap().trim_end());
+            assert_eq!(1, h.io.terminal.screens.active.cursor.y);
+            assert_eq!(5, h.io.terminal.screens.active.cursor.x);
+            assert!(io_messages(&mut h).is_empty());
+            assert!(!h.io.terminal_stream.handler.termio_messaged);
+        }
+
+        #[test]
+        fn device_status_reports() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b[3;5H\x1b[6n\x1b[?6n\x1b[5n");
+            assert_eq!(
+                vec![b"\x1b[3;5R".to_vec(), b"\x1b[?3;5;1R".to_vec(), b"\x1b[0n".to_vec()],
+                writes(&mut h)
+            );
+
+            // Origin mode reports relative to the scrolling region.
+            h.io.process_output(b"\x1b[2;10r\x1b[?6h\x1b[2;3H\x1b[6n");
+            assert_eq!(vec![b"\x1b[2;3R".to_vec()], writes(&mut h));
+
+            h.io.process_output(b"\x1b[?996n\x1b[?998n");
+            let msgs = io_messages(&mut h);
+            assert!(matches!(msgs[0], Message::ColorSchemeReport { force: true }));
+            assert!(matches!(
+                msgs[1],
+                Message::VisibilityReport {
+                    visible: true,
+                    force: true
+                }
+            ));
+        }
+
+        #[test]
+        fn device_attributes() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b[c\x1b[>c");
+            assert_eq!(
+                vec![b"\x1b[?62;22;52c".to_vec(), b"\x1b[>1;10;0c".to_vec()],
+                writes(&mut h)
+            );
+
+            h.io.terminal_stream.handler.clipboard_write = ClipboardAccess::Deny;
+            h.io.process_output(b"\x1b[c");
+            assert_eq!(vec![b"\x1b[?62;22c".to_vec()], writes(&mut h));
+        }
+
+        #[test]
+        fn enquiry_xtversion_kitty_keyboard() {
+            let mut h = harness();
+            h.io.terminal_stream.handler.enquiry_response = b"answer".to_vec();
+            h.io.process_output(b"\x05\x1b[>q\x1b[>1u\x1b[?u");
+            let w = writes(&mut h);
+            assert_eq!(b"answer".to_vec(), w[0]);
+            assert_eq!(
+                format!("\x1bP>|ghostty {}\x1b\\", crate::build_config::VERSION_STRING).into_bytes(),
+                w[1]
+            );
+            assert_eq!(b"\x1b[?1u".to_vec(), w[2]);
+            // processOutput woke the IO thread and cleared the flag.
+            assert!(!h.io.terminal_stream.handler.termio_messaged);
+        }
+
+        #[test]
+        fn mode_reports_and_side_effects() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b[?2026$p\x1b[?2026h\x1b[?2026$p\x1b[?9999$p");
+            let msgs = io_messages(&mut h);
+            let w: Vec<Vec<u8>> = msgs
+                .iter()
+                .filter_map(|m| match m {
+                    Message::WriteSmall(v) => Some(v.data[..v.len as usize].to_vec()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                vec![
+                    b"\x1b[?2026;2$y".to_vec(),
+                    b"\x1b[?2026;1$y".to_vec(),
+                    b"\x1b[?9999;0$y".to_vec()
+                ],
+                w
+            );
+            assert!(msgs.iter().any(|m| matches!(m, Message::StartSynchronizedOutput)));
+
+            // Linefeed mode, size reports, focus events.
+            h.io.process_output(b"\x1b[20h\x1b[?2048h\x1b[?1004h\x1b[14t");
+            let msgs = io_messages(&mut h);
+            assert!(matches!(msgs[0], Message::LinefeedMode(true)));
+            assert!(matches!(msgs[1], Message::SizeReport(SizeReport::Mode2048)));
+            assert!(matches!(msgs[2], Message::Focused(true)));
+            assert!(matches!(msgs[3], Message::SizeReport(SizeReport::Csi14T)));
+
+            // Mouse tracking changes the mouse shape once.
+            h.io.process_output(b"\x1b[?1000h\x1b[?1006h");
+            assert_eq!(mouse::Event::Normal, h.io.terminal.flags.mouse_event);
+            assert_eq!(mouse::Format::Sgr, h.io.terminal.flags.mouse_format);
+            h.io.process_output(b"\x1b[?1000l");
+            let shapes: Vec<_> = surface_messages(&mut h)
+                .into_iter()
+                .filter_map(|m| match m {
+                    SurfaceMessage::SetMouseShape(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(vec![mouse::Shape::Default, mouse::Shape::Text], shapes);
+
+            // The alternate screen.
+            h.io.process_output(b"\x1b[?1049h");
+            assert_eq!(ScreenKey::Alternate, h.io.terminal.screens.active_key);
+            h.io.process_output(b"\x1b[?1049l");
+            assert_eq!(ScreenKey::Primary, h.io.terminal.screens.active_key);
+        }
+
+        #[test]
+        fn cursor_blinking_ignored_with_configured_default() {
+            let mut h = harness();
+            h.io.terminal.cursor.default_blink = Some(true);
+            let before = h.io.terminal.modes.get(Mode::CursorBlinking);
+            h.io.process_output(if before { b"\x1b[?12l" } else { b"\x1b[?12h" });
+            assert_eq!(before, h.io.terminal.modes.get(Mode::CursorBlinking));
+
+            h.io.terminal.cursor.default_blink = None;
+            h.io.process_output(b"\x1b[?12l");
+            assert!(!h.io.terminal.modes.get(Mode::CursorBlinking));
+        }
+
+        #[test]
+        fn bell_title_and_notifications() {
+            let mut h = harness();
+            h.io.process_output(b"\x07\x1b]2;my title\x1b\\\x1b]9;hi there\x1b\\");
+            let msgs = surface_messages(&mut h);
+            assert!(matches!(msgs[0], SurfaceMessage::RingBell));
+            match &msgs[1] {
+                SurfaceMessage::SetTitle(buf) => {
+                    assert_eq!(b"my title\0", &buf[..9]);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(matches!(&msgs[2], SurfaceMessage::DesktopNotification(_)));
+            assert_eq!(Some(&b"my title"[..]), h.io.terminal.get_title());
+            assert!(h.io.terminal_stream.handler.seen_title);
+
+            // An empty title resets the title behavior.
+            h.io.process_output(b"\x1b]2;\x1b\\");
+            assert!(!h.io.terminal_stream.handler.seen_title);
+            match &surface_messages(&mut h)[0] {
+                SurfaceMessage::SetTitle(buf) => assert_eq!(0, buf[0]),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        #[test]
+        fn report_pwd() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b]7;file://localhost/tmp/a%20b\x1b\\");
+            assert_eq!(Some(&b"/tmp/a b"[..]), h.io.terminal.get_pwd());
+            let msgs = surface_messages(&mut h);
+            match &msgs[0] {
+                SurfaceMessage::PwdChange(req) => {
+                    let crate::datastruct::MessageData::Small(v) = req else {
+                        panic!("unexpected {req:?}")
+                    };
+                    assert_eq!(b"/tmp/a b", &v.data[..v.len as usize]);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            // Without a title the pwd becomes the title.
+            match &msgs[1] {
+                SurfaceMessage::SetTitle(buf) => assert_eq!(b"/tmp/a b\0", &buf[..9]),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(!h.io.terminal_stream.handler.seen_title);
+
+            // A remote host is rejected.
+            h.io.process_output(b"\x1b]7;file://not-this-host.invalid/etc\x1b\\");
+            assert_eq!(Some(&b"/tmp/a b"[..]), h.io.terminal.get_pwd());
+            assert!(surface_messages(&mut h).is_empty());
+
+            // An empty URL resets the pwd.
+            h.io.process_output(b"\x1b]7;\x1b\\");
+            assert_eq!(None, h.io.terminal.get_pwd());
+        }
+
+        #[test]
+        fn color_operations() {
+            let mut h = harness();
+            // Query the default foreground (16-bit report format).
+            h.io.process_output(b"\x1b]10;?\x1b\\");
+            assert_eq!(vec![b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\".to_vec()], writes(&mut h));
+
+            // Set a palette color and query it in 8-bit format.
+            h.io.terminal_stream.handler.osc_color_report_format = OSCColorReportFormat::Bit8;
+            h.io.process_output(b"\x1b]4;1;rgb:12/34/56\x07\x1b]4;1;?\x07");
+            assert_eq!(vec![b"\x1b]4;1;rgb:12/34/56\x07".to_vec()], writes(&mut h));
+            assert!(h.io.terminal.flags.dirty.palette);
+            let msgs = surface_messages(&mut h);
+            assert!(matches!(&msgs[0], SurfaceMessage::ColorChange(_)));
+
+            // Reset the palette.
+            h.io.process_output(b"\x1b]104\x07");
+            assert_eq!(
+                h.io.terminal.colors.palette.original()[1],
+                h.io.terminal.colors.palette.current[1]
+            );
+
+            // Reporting disabled.
+            h.io.terminal_stream.handler.osc_color_report_format = OSCColorReportFormat::None;
+            h.io.process_output(b"\x1b]10;?\x1b\\");
+            assert!(writes(&mut h).is_empty());
+        }
+
+        #[test]
+        fn kitty_color_report() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b]21;foreground=?;2=#ff0000;2=?\x1b\\");
+            assert_eq!(
+                vec![b"\x1b]21;foreground=rgb:ff/ff/ff;2=rgb:ff/00/00\x1b\\".to_vec()],
+                writes(&mut h)
+            );
+        }
+
+        #[test]
+        fn dcs_xtgettcap_and_decrqss() {
+            let mut h = harness();
+            // TN = 544E
+            h.io.process_output(b"\x1bP+q544E\x1b\\");
+            let w = writes(&mut h);
+            assert_eq!(1, w.len());
+            assert!(w[0].starts_with(b"\x1bP1+r544E="), "{w:?}");
+
+            h.io.process_output(b"\x1b[1m\x1bP$qm\x1b\\");
+            assert_eq!(vec![b"\x1bP1$r0;1m\x1b\\".to_vec()], writes(&mut h));
+        }
+
+        #[test]
+        fn clipboard_osc52() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b]52;c;?\x07\x1b]52;p;aGVsbG8=\x07");
+            let msgs = surface_messages(&mut h);
+            assert!(matches!(msgs[0], SurfaceMessage::ClipboardRead(apprt::Clipboard::Standard)));
+            match &msgs[1] {
+                SurfaceMessage::ClipboardWrite { clipboard_type, req } => {
+                    assert_eq!(apprt::Clipboard::Primary, *clipboard_type);
+                    let crate::datastruct::MessageData::Small(v) = req else {
+                        panic!("unexpected {req:?}")
+                    };
+                    assert_eq!(b"aGVsbG8=", &v.data[..v.len as usize]);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        #[test]
+        fn kitty_clipboard_read_request() {
+            let mut h = harness();
+            // type=read with the text/plain MIME type (base64).
+            h.io.process_output(b"\x1b]5522;type=read;dGV4dC9wbGFpbg==\x1b\\");
+            match &surface_messages(&mut h)[0] {
+                SurfaceMessage::KittyClipboardRead(req) => {
+                    assert_eq!(1, req.mimes.len());
+                    assert_eq!(b"text/plain", req.mimes[0].as_bytes());
+                    assert!(!req.list);
+                    assert!(!req.granted);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        #[test]
+        fn kitty_clipboard_write_denied() {
+            let mut h = harness();
+            h.io.terminal_stream.handler.clipboard_write = ClipboardAccess::Deny;
+            h.io.process_output(b"\x1b]5522;type=write:id=x\x1b\\");
+            assert_eq!(
+                vec![b"\x1b]5522;type=write:status=EPERM:id=x\x1b\\".to_vec()],
+                writes(&mut h)
+            );
+            assert!(h.io.terminal_stream.handler.kitty_clipboard_write.is_none());
+        }
+
+        #[test]
+        fn kitty_clipboard_write_commit() {
+            let mut h = harness();
+            // dGV4dC9wbGFpbg== is "text/plain", aGk= is "hi".
+            h.io.process_output(
+                b"\x1b]5522;type=write\x1b\\\x1b]5522;type=wdata:mime=dGV4dC9wbGFpbg==;aGk=\x1b\\\x1b]5522;type=wdata\x1b\\",
+            );
+            assert!(h.io.terminal_stream.handler.kitty_clipboard_write.is_none());
+            match &surface_messages(&mut h)[0] {
+                SurfaceMessage::KittyClipboardWrite(req) => {
+                    assert_eq!(1, req.contents.len());
+                    assert_eq!(b"text/plain", req.contents[0].mime.as_bytes());
+                    assert_eq!(b"hi", &req.contents[0].data[..]);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        #[test]
+        fn full_reset() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b[?1000hhello\x1bc");
+            assert_eq!("", h.io.terminal.plain_string().unwrap().trim_end());
+            let msgs = io_messages(&mut h);
+            assert!(msgs
+                .iter()
+                .any(|m| matches!(m, Message::ColorSchemeReport { force: false })));
+            let surface = surface_messages(&mut h);
+            assert!(surface.iter().any(|m| matches!(
+                m,
+                SurfaceMessage::ProgressReport(osc::ProgressReport {
+                    state: osc::ProgressReportState::Remove,
+                    ..
+                })
+            )));
+        }
+
+        #[test]
+        fn semantic_prompt_commands() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07\r\n\x1b]133;D;3\x07");
+            let msgs = surface_messages(&mut h);
+            assert!(matches!(msgs[0], SurfaceMessage::StartCommand));
+            assert!(matches!(msgs[1], SurfaceMessage::StopCommand(Some(3))));
+
+            h.io.process_output(b"\x1b]133;D;300\x07");
+            assert!(matches!(surface_messages(&mut h)[0], SurfaceMessage::StopCommand(Some(1))));
+        }
+
+        #[test]
+        fn resize_window_and_title_report() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b[8;30;100t\x1b[21t");
+            let msgs = surface_messages(&mut h);
+            match &msgs[0] {
+                SurfaceMessage::ResizeWindow(v) => {
+                    assert_eq!(30, v.rows);
+                    assert_eq!(100, v.columns);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(matches!(msgs[1], SurfaceMessage::ReportTitle(_)));
+        }
+
+        #[test]
+        fn kitty_graphics_response() {
+            let mut h = harness();
+            // Query support for a 1x1 RGB image.
+            h.io.process_output(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+            assert_eq!(vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()], writes(&mut h));
+        }
+
+        #[test]
+        fn hyperlinks() {
+            let mut h = harness();
+            h.io.process_output(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+            assert_eq!("link", h.io.terminal.plain_string().unwrap().trim_end());
+        }
+
+        #[test]
+        fn clear_screen_not_at_prompt() {
+            let mut h = harness();
+            h.start();
+            h.with_io(|io| io.process_output_locked(b"one\r\ntwo\r\nthree"));
+            h.send(Message::ClearScreen { history: true });
+            h.wait_io(|io| {
+                let s = io.terminal.plain_string().unwrap();
+                !s.contains("one") && !s.contains("two")
+            });
+            assert!(h.screen().contains("three"));
+            h.stop();
+        }
+
+        #[test]
+        fn termio_messages_on_the_thread() {
+            let mut h = harness();
+            h.start();
+
+            h.send(Message::ScrollViewport(ScrollViewport::Top));
+            h.send(Message::JumpToPrompt(1));
+            h.send(Message::KittyClipboardGrantRead(crate::termio::message::KittyClipboardGrant {
+                pw: b"pw".to_vec().into_boxed_slice(),
+            }));
+            h.wait_io(|io| {
+                io.terminal_stream
+                    .handler
+                    .kitty_clipboard_grants
+                    .clone()
+                    .r#use(b"pw", KittyClipboardDirection::Read)
+            });
+
+            // A config change updates the handler and terminal defaults.
+            let mut config = Config::default();
+            config.enquiry_response = "changed".into();
+            config.foreground = crate::config::config::Color { r: 1, g: 2, b: 3 };
+            h.send(Message::ChangeConfig(Box::new(DerivedConfig::init(&config))));
+            h.wait_io(|io| io.terminal_stream.handler.enquiry_response == b"changed");
+            assert_eq!(
+                Some(terminal_color::Rgb { r: 1, g: 2, b: 3 }),
+                h.with_io(|io| io.terminal.colors.foreground.default)
+            );
+            h.stop();
+        }
+    }
 }

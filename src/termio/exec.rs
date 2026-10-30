@@ -23,6 +23,9 @@
 //! * Flatpak host-command execution (`build_config::FLATPAK`) is compiled
 //!   out exactly like a non-flatpak Zig build: [`FlatpakHostCommand`] is the
 //!   empty struct Zig uses in that case.
+//! * When the read thread's poll reports a hangup together with pending
+//!   data (a child that writes and exits immediately), the data is read
+//!   once before the thread exits; Zig exits right away and drops it.
 //! * The apprt `pre_exec`/`post_fork` hooks are
 //!   [`command::RT_PRE_EXEC`]/[`command::RT_POST_FORK`] (the GTK runtime's
 //!   hooks with the `gtk` feature, none otherwise).
@@ -2111,6 +2114,9 @@ impl ReadThread {
             },
         ];
 
+        // Whether we already drained the data that came with a hangup.
+        let mut hup_drained = false;
+
         loop {
             // Claim the next free buffer. This blocks only when the
             // parse stage is a full ring behind, which is exactly when
@@ -2306,8 +2312,15 @@ impl ReadThread {
             // If our pty fd is closed, then we're also done with our
             // read thread.
             if pollfds[0].revents & libc::POLLHUP != 0 {
-                log::info!(target: LOG, "pty fd closed, read thread exiting");
-                return;
+                // Deviation from Zig: output the child wrote right before
+                // exiting arrives together with the hangup (POLLIN |
+                // POLLHUP). Zig exits here and loses it; we drain it once
+                // first (the next read ends in EIO, or we get here again).
+                if pollfds[0].revents & libc::POLLIN == 0 || hup_drained {
+                    log::info!(target: LOG, "pty fd closed, read thread exiting");
+                    return;
+                }
+                hup_drained = true;
             }
         }
     }
