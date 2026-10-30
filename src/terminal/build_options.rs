@@ -373,6 +373,28 @@ impl Options {
         }
     }
 
+    /// The options of libghostty-vt's C library, as `zig build
+    /// -Demit-lib-vt` builds it: `Config.terminalOptions(.lib, optimize)`
+    /// with the overrides of `GhosttyZig.zig` (`artifact = .lib`,
+    /// `oniguruma = false`, and `c_abi = true` for the `vt_c` module). The
+    /// version is the libghostty-vt version (`build.zig` `lib_version`).
+    /// The crate is built with these options when compiled with
+    /// `--cfg ghostty_lib_vt` (`GHOSTTY_LIB_VT=1`, see
+    /// `tools/build_lib_vt.sh`).
+    pub const fn lib_vt() -> Options {
+        Options {
+            artifact: Artifact::Lib,
+            simd: !cfg!(target_family = "wasm") && !cfg!(target_os = "none"),
+            // "We presently don't allow Oniguruma in our Zig module at all."
+            oniguruma: false,
+            c_abi: true,
+            // -Dvt-features (Config.vt_features) defaults to every feature.
+            features: Features::ALL,
+            version: LIB_VERSION,
+            slow_runtime_safety: cfg!(debug_assertions),
+        }
+    }
+
     /// Whether the Kitty graphics feature is effectively enabled for
     /// the given target. Kitty graphics requires the ability to get
     /// timestamps and there is no way to do that on freestanding
@@ -430,20 +452,46 @@ const APP_VERSION: SemanticVersion = SemanticVersion {
     build: None,
 };
 
+const fn env_or(value: Option<&'static str>, default: &'static str) -> &'static str {
+    match value {
+        Some(v) => v,
+        None => default,
+    }
+}
+
+/// The libghostty-vt version: `build.zig`'s `lib_version` (`0.1.0-dev`),
+/// or the `GHOSTTY_LIB_VT_VERSION` given to `tools/build_lib_vt.sh` (Zig:
+/// `-Dlib-version-string`), which `build.rs` splits into its parts.
+const LIB_VERSION: SemanticVersion = SemanticVersion {
+    major: parse_usize(env_or(option_env!("GHOSTTY_LIB_VT_VERSION_MAJOR"), "0")),
+    minor: parse_usize(env_or(option_env!("GHOSTTY_LIB_VT_VERSION_MINOR"), "1")),
+    patch: parse_usize(env_or(option_env!("GHOSTTY_LIB_VT_VERSION_PATCH"), "0")),
+    pre: non_empty(env_or(option_env!("GHOSTTY_LIB_VT_VERSION_PRE"), "dev")),
+    build: non_empty(env_or(option_env!("GHOSTTY_LIB_VT_VERSION_BUILD"), "")),
+};
+
+/// The libghostty-vt version as a string (`LIB_VERSION` formatted).
+const LIB_VERSION_STRING: &str = env_or(option_env!("GHOSTTY_LIB_VT_VERSION_STRING"), "0.1.0-dev");
+
 // ---------------------------------------------------------------------------
 // The `terminal_options` module values (what `Options.add` emits) for the
-// Ghostty application build.
+// Ghostty application build, or for libghostty-vt's C library when the
+// crate is compiled with `--cfg ghostty_lib_vt`.
 // ---------------------------------------------------------------------------
 
 /// The options this crate is built with.
-pub const OPTIONS: Options = Options::ghostty();
+pub const OPTIONS: Options = if cfg!(ghostty_lib_vt) {
+    Options::lib_vt()
+} else {
+    Options::ghostty()
+};
 
-/// `terminal_options.artifact`: the target artifact. Always the Ghostty
-/// application for this crate.
+/// `terminal_options.artifact`: the target artifact. The Ghostty
+/// application, or `Lib` for libghostty-vt (`--cfg ghostty_lib_vt`).
 pub const ARTIFACT: Artifact = OPTIONS.artifact;
 
 /// `terminal_options.c_abi`: whether the terminal package exports a C ABI.
-/// False for the application build.
+/// False for the application build, true for libghostty-vt.
 pub const C_ABI: bool = OPTIONS.c_abi;
 
 /// `terminal_options.oniguruma`: whether Oniguruma regex support is available.
@@ -482,7 +530,11 @@ pub const GLYPH_PROTOCOL: bool = OPTIONS.features.glyph_protocol;
 pub const KITTY_GRAPHICS: bool = OPTIONS.kitty_graphics_current_target();
 
 /// `terminal_options.version_string`: the full version string.
-pub const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION_STRING: &str = if cfg!(ghostty_lib_vt) {
+    LIB_VERSION_STRING
+} else {
+    env!("CARGO_PKG_VERSION")
+};
 /// `terminal_options.version_major`.
 pub const VERSION_MAJOR: usize = OPTIONS.version.major;
 /// `terminal_options.version_minor`.
@@ -557,6 +609,19 @@ mod tests {
     }
 
     #[test]
+    fn lib_vt_options() {
+        let opts = Options::lib_vt();
+        assert_eq!(opts.artifact, Artifact::Lib);
+        assert!(opts.c_abi);
+        assert!(!opts.oniguruma);
+        assert_eq!(opts.features, Features::ALL);
+        assert_eq!(opts.slow_runtime_safety, cfg!(debug_assertions));
+        assert_eq!(opts.version, LIB_VERSION);
+        assert_eq!(LIB_VERSION.to_string(), LIB_VERSION_STRING);
+    }
+
+    #[test]
+    #[cfg(not(ghostty_lib_vt))]
     fn ghostty_app_options() {
         assert_eq!(ARTIFACT, Artifact::Ghostty);
         assert!(!C_ABI);
