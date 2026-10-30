@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 
 use crate::apprt;
 use crate::apprt::structs::{ClipboardContentBuf, KittyRead, KittyWrite};
-use crate::apprt::surface::standin::AppMessage;
+use crate::app::Message as AppMessage;
 use crate::apprt::surface::Message as SurfaceMessage;
 use crate::build_config;
 use crate::config::config::OSCColorReportFormat;
@@ -2145,7 +2145,7 @@ mod tests {
             termio_mailbox: std::ptr::null(),
             surface_mailbox: apprt::surface::Mailbox {
                 surface: std::ptr::null_mut(),
-                app: apprt::surface::standin::AppMailbox {
+                app: crate::app::Mailbox {
                     rt_app: std::ptr::null(),
                     mailbox: std::ptr::null(),
                 },

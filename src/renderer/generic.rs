@@ -4017,7 +4017,7 @@ mod tests {
 
     use super::*;
     use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
-    use crate::apprt::surface::standin::AppQueue;
+    use crate::app::MailboxQueue as AppQueue;
     use crate::renderer::opengl::test_util::test_options_with_mailbox;
     use crate::renderer::opengl::{ExportedFrame, Memory, OpenGL};
     use crate::terminal::render::test_vt::VtStreamExt;

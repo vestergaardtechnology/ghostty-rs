@@ -657,7 +657,7 @@ impl ImageTextureFormat {
 #[cfg(test)]
 pub(crate) mod test_util {
     use super::*;
-    use crate::apprt::surface::standin::{AppMailbox, AppQueue};
+    use crate::app::{Mailbox as AppMailbox, MailboxQueue as AppQueue};
 
     /// Renderer options for `device` whose surface mailbox points at
     /// `app`/`queue` (or nowhere when they are null).

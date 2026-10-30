@@ -17,9 +17,6 @@
 //!   the GTK apprt registers its own GObject types.
 //! * Zig's `format` methods are `Display` impls.
 //! * [`Target::Surface`] holds a raw pointer like Zig's `*CoreSurface`.
-//!
-//! Stand-ins for types from files that are not ported yet live in the
-//! [`standin`] module (marked `TODO(port-dedupe)`).
 
 use std::ffi::{c_char, c_int, CStr};
 use std::fmt;
@@ -34,29 +31,8 @@ use crate::terminal::osc::{ProgressReport, ProgressReportC};
 use crate::config::config::Duration as ConfigDuration;
 use crate::config::Config;
 
-use self::standin::CoreSurface;
+use crate::surface::Surface as CoreSurface;
 use crate::terminal::page_list::{Scrollbar, ScrollbarC};
-
-/// Stand-ins for types whose Zig files are not ported yet.
-pub mod standin {
-    /// TODO(port-dedupe): replace with `crate::surface::Surface` (Surface.zig).
-    #[derive(Debug)]
-    pub struct CoreSurface {
-        /// The apprt surface.
-        pub rt_surface: *mut crate::apprt::Surface,
-
-        /// The current working directory (stand-in state for `pwd`).
-        pub pwd: Option<String>,
-    }
-
-    impl CoreSurface {
-        /// Returns the current working directory, if known. Zig:
-        /// `Surface.pwd(alloc)`.
-        pub fn pwd(&self) -> Option<String> {
-            self.pwd.clone()
-        }
-    }
-}
 
 /// The target for an action. This is generally the thing that had focus
 /// while the action was made but the concept of "focus" is not guaranteed
@@ -1442,11 +1418,12 @@ mod tests {
     #[test]
     fn target_cval() {
         let mut rt = apprt::Surface::default();
-        let mut core = CoreSurface {
-            rt_surface: &mut rt,
-            pwd: None,
-        };
-        let t = Target::Surface(&mut core);
+        // Only the `rt_surface` field is read, so the rest of the (large)
+        // core surface can stay uninitialized.
+        let mut core = std::mem::MaybeUninit::<CoreSurface>::uninit();
+        // SAFETY: writing a field of the uninitialized struct in place.
+        unsafe { std::ptr::addr_of_mut!((*core.as_mut_ptr()).rt_surface).write(&mut rt) };
+        let t = Target::Surface(core.as_mut_ptr());
         let c = t.cval();
         assert_eq!(TargetKey::Surface, c.key);
         assert_eq!(&mut rt as *mut apprt::Surface, unsafe { c.value.surface });

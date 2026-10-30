@@ -2706,7 +2706,7 @@ pub(crate) mod testing {
 
     use super::{Config, Exec};
     use crate::apprt;
-    use crate::apprt::surface::standin::{AppMailbox, AppMessage, AppQueue};
+    use crate::app::{Mailbox as AppMailbox, MailboxQueue as AppQueue, Message as AppMessage};
     use crate::apprt::surface::Message as SurfaceMessage;
     use crate::config::Command as ConfigCommand;
     use crate::global::xev;
