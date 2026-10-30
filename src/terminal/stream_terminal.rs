@@ -3435,4 +3435,1113 @@ mod tests {
         s.next_slice(b"Test");
         assert_eq!("Test", plain(s.handler.terminal));
     }
+
+    fn rgb(r: u8, g: u8, b: u8) -> color::Rgb {
+        color::Rgb { r, g, b }
+    }
+
+    #[test]
+    fn osc_4_set_and_reset_palette() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Save default color
+        let default_color_0 = s.handler.terminal.colors.palette.original()[0];
+
+        // Set color 0 to red
+        s.next_slice(b"\x1b]4;0;rgb:ff/00/00\x1b\\");
+        let p = &s.handler.terminal.colors.palette;
+        assert_eq!(0xff, p.current[0].r);
+        assert_eq!(0x00, p.current[0].g);
+        assert_eq!(0x00, p.current[0].b);
+        assert!(p.mask.is_set(0));
+
+        // Reset color 0
+        s.next_slice(b"\x1b]104;0\x1b\\");
+        let p = &s.handler.terminal.colors.palette;
+        assert_eq!(default_color_0, p.current[0]);
+        assert!(!p.mask.is_set(0));
+    }
+
+    #[test]
+    fn osc_104_reset_all_palette_colors() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set multiple colors
+        s.next_slice(b"\x1b]4;0;rgb:ff/00/00\x1b\\");
+        s.next_slice(b"\x1b]4;1;rgb:00/ff/00\x1b\\");
+        s.next_slice(b"\x1b]4;2;rgb:00/00/ff\x1b\\");
+        let p = &s.handler.terminal.colors.palette;
+        assert!(p.mask.is_set(0));
+        assert!(p.mask.is_set(1));
+        assert!(p.mask.is_set(2));
+
+        // Reset all palette colors
+        s.next_slice(b"\x1b]104\x1b\\");
+        let p = &s.handler.terminal.colors.palette;
+        assert_eq!(p.original()[0], p.current[0]);
+        assert_eq!(p.original()[1], p.current[1]);
+        assert_eq!(p.original()[2], p.current[2]);
+        assert!(!p.mask.is_set(0));
+        assert!(!p.mask.is_set(1));
+        assert!(!p.mask.is_set(2));
+    }
+
+    #[test]
+    fn osc_10_set_and_reset_foreground_color() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Initially unset
+        assert!(s.handler.terminal.colors.foreground.get().is_none());
+
+        // Set foreground to red
+        s.next_slice(b"\x1b]10;rgb:ff/00/00\x1b\\");
+        let fg = s.handler.terminal.colors.foreground.get().unwrap();
+        assert_eq!(0xff, fg.r);
+        assert_eq!(0x00, fg.g);
+        assert_eq!(0x00, fg.b);
+
+        // Reset foreground
+        s.next_slice(b"\x1b]110\x1b\\");
+        assert!(s.handler.terminal.colors.foreground.get().is_none());
+    }
+
+    #[test]
+    fn osc_11_set_and_reset_background_color() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        let default = rgb(0x10, 0x20, 0x30);
+        s.handler.terminal.colors.background.default = Some(default);
+
+        // Set background to green
+        s.next_slice(b"\x1b]11;rgb:00/ff/00\x1b\\");
+        let bg = s.handler.terminal.colors.background.get().unwrap();
+        assert_eq!(0x00, bg.r);
+        assert_eq!(0xff, bg.g);
+        assert_eq!(0x00, bg.b);
+
+        // Reset background
+        s.next_slice(b"\x1b]111\x1b\\");
+        assert_eq!(Some(default), s.handler.terminal.colors.background.get());
+        assert_eq!(None, s.handler.terminal.colors.background.r#override);
+
+        // A reset color continues to follow later configuration changes.
+        let updated = rgb(0x40, 0x50, 0x60);
+        s.handler.terminal.colors.background.default = Some(updated);
+        assert_eq!(Some(updated), s.handler.terminal.colors.background.get());
+    }
+
+    #[test]
+    fn osc_12_set_and_reset_cursor_color() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set cursor to blue
+        s.next_slice(b"\x1b]12;rgb:00/00/ff\x1b\\");
+        let cursor = s.handler.terminal.colors.cursor.get().unwrap();
+        assert_eq!(0x00, cursor.r);
+        assert_eq!(0x00, cursor.g);
+        assert_eq!(0xff, cursor.b);
+
+        // Reset cursor
+        s.next_slice(b"\x1b]112\x1b\\");
+        // After reset, cursor might be null (using default)
+    }
+
+    #[test]
+    fn osc_color_query_responses() {
+        pty_reset();
+        let mut t = term(10, 10);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b]10;?\x1b\\");
+        assert!(pty_last().is_none());
+
+        s.next_slice(b"\x1b]11;?\x1b\\");
+        assert!(pty_last().is_none());
+
+        s.next_slice(b"\x1b]4;2;rgb:12/34/56;2;?\x1b\\");
+        assert_bytes(b"\x1b]4;2;rgb:1212/3434/5656\x1b\\", &pty_last().unwrap());
+
+        s.next_slice(b"\x1b]10;rgb:01/02/03\x1b\\");
+        s.next_slice(b"\x1b]11;rgb:04/05/06\x1b\\");
+        s.next_slice(b"\x1b]12;rgb:07/08/09\x1b\\");
+        s.next_slice(b"\x1b]10;?;?;?\x1b\\");
+        assert_bytes(
+            b"\x1b]10;rgb:0101/0202/0303\x1b\\\x1b]11;rgb:0404/0505/0606\x1b\\\x1b]12;rgb:0707/0808/0909\x1b\\",
+            &pty_last().unwrap(),
+        );
+
+        s.next_slice(b"\x1b]112\x1b\\");
+        s.next_slice(b"\x1b]12;?\x07");
+        assert_bytes(b"\x1b]12;rgb:0101/0202/0303\x07", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn kitty_color_protocol_set_palette() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set palette color 5 to magenta using kitty protocol
+        s.next_slice(b"\x1b]21;5=rgb:ff/00/ff\x1b\\");
+        let t = &s.handler.terminal;
+        assert_eq!(0xff, t.colors.palette.current[5].r);
+        assert_eq!(0x00, t.colors.palette.current[5].g);
+        assert_eq!(0xff, t.colors.palette.current[5].b);
+        assert!(t.colors.palette.mask.is_set(5));
+        assert!(t.flags.dirty.palette);
+    }
+
+    #[test]
+    fn kitty_color_protocol_reset_palette() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set and then reset palette color
+        let original = s.handler.terminal.colors.palette.original()[7];
+        s.next_slice(b"\x1b]21;7=rgb:aa/bb/cc\x1b\\");
+        assert!(s.handler.terminal.colors.palette.mask.is_set(7));
+
+        s.next_slice(b"\x1b]21;7=\x1b\\");
+        assert_eq!(original, s.handler.terminal.colors.palette.current[7]);
+        assert!(!s.handler.terminal.colors.palette.mask.is_set(7));
+    }
+
+    #[test]
+    fn kitty_color_protocol_set_foreground() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set foreground using kitty protocol
+        s.next_slice(b"\x1b]21;foreground=rgb:12/34/56\x1b\\");
+        let fg = s.handler.terminal.colors.foreground.get().unwrap();
+        assert_eq!(0x12, fg.r);
+        assert_eq!(0x34, fg.g);
+        assert_eq!(0x56, fg.b);
+    }
+
+    #[test]
+    fn kitty_color_protocol_set_background() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set background using kitty protocol
+        s.next_slice(b"\x1b]21;background=rgb:78/9a/bc\x1b\\");
+        let bg = s.handler.terminal.colors.background.get().unwrap();
+        assert_eq!(0x78, bg.r);
+        assert_eq!(0x9a, bg.g);
+        assert_eq!(0xbc, bg.b);
+    }
+
+    #[test]
+    fn kitty_color_protocol_set_cursor() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set cursor using kitty protocol
+        s.next_slice(b"\x1b]21;cursor=rgb:de/f0/12\x1b\\");
+        let cursor = s.handler.terminal.colors.cursor.get().unwrap();
+        assert_eq!(0xde, cursor.r);
+        assert_eq!(0xf0, cursor.g);
+        assert_eq!(0x12, cursor.b);
+    }
+
+    #[test]
+    fn kitty_color_protocol_reset_foreground() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set and reset foreground
+        s.next_slice(b"\x1b]21;foreground=rgb:11/22/33\x1b\\");
+        assert!(s.handler.terminal.colors.foreground.get().is_some());
+
+        s.next_slice(b"\x1b]21;foreground=\x1b\\");
+        // After reset, should be unset
+        assert!(s.handler.terminal.colors.foreground.get().is_none());
+    }
+
+    #[test]
+    fn kitty_color_protocol_query_responses() {
+        pty_reset();
+        let mut t = term(10, 10);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b]21;background=?\x1b\\");
+        assert_bytes(b"\x1b]21;background=\x1b\\", &pty_last().unwrap());
+
+        s.next_slice(b"\x1b]21;foreground=rgb:12/34/56;2=rgb:aa/bb/cc\x1b\\");
+        s.next_slice(b"\x1b]21;foreground=?;background=?;2=?\x1b\\");
+        assert_bytes(
+            b"\x1b]21;foreground=rgb:12/34/56;background=;2=rgb:aa/bb/cc\x1b\\",
+            &pty_last().unwrap(),
+        );
+    }
+
+    #[test]
+    fn palette_dirty_flag_set_on_color_change() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Clear dirty flag
+        s.handler.terminal.flags.dirty.palette = false;
+
+        // Setting palette color should set dirty flag
+        s.next_slice(b"\x1b]4;0;rgb:ff/00/00\x1b\\");
+        assert!(s.handler.terminal.flags.dirty.palette);
+
+        // Clear and test reset
+        s.handler.terminal.flags.dirty.palette = false;
+        s.next_slice(b"\x1b]104;0\x1b\\");
+        assert!(s.handler.terminal.flags.dirty.palette);
+
+        // Clear and test kitty protocol
+        s.handler.terminal.flags.dirty.palette = false;
+        s.next_slice(b"\x1b]21;1=rgb:00/ff/00\x1b\\");
+        assert!(s.handler.terminal.flags.dirty.palette);
+    }
+
+    #[test]
+    fn semantic_prompt_fresh_line() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"Hello");
+        s.next_slice(b"\x1b]133;L\x07");
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(1, s.handler.terminal.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn semantic_prompt_fresh_line_new_prompt() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Write some text and then send OSC 133;A (fresh_line_new_prompt)
+        s.next_slice(b"Hello");
+        s.next_slice(b"\x1b]133;A\x07");
+
+        // Should do a fresh line (carriage return + index)
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(1, s.handler.terminal.screens.active.cursor.y);
+
+        // Should set cursor semantic_content to prompt
+        assert_eq!(SemanticContent::Prompt, s.handler.terminal.screens.active.cursor.semantic_content);
+
+        // Test with redraw option
+        s.next_slice(b"prompt$ ");
+        s.next_slice(b"\x1b]133;A;redraw=1\x07");
+        assert_eq!(osc_sp::Redraw::True, s.handler.terminal.flags.shell_redraws_prompt);
+    }
+
+    #[test]
+    fn semantic_prompt_end_of_input_then_start_output() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Write some text and then send OSC 133;A (fresh_line_new_prompt)
+        s.next_slice(b"Hello");
+        s.next_slice(b"\x1b]133;A\x07");
+        s.next_slice(b"prompt$ ");
+        s.next_slice(b"\x1b]133;B\x07");
+        assert_eq!(SemanticContent::Input, s.handler.terminal.screens.active.cursor.semantic_content);
+        s.next_slice(b"\x1b]133;C\x07");
+        assert_eq!(SemanticContent::Output, s.handler.terminal.screens.active.cursor.semantic_content);
+    }
+
+    #[test]
+    fn semantic_prompt_prompt_start() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Write some text
+        s.next_slice(b"Hello");
+
+        // OSC 133;P marks the start of a prompt (without fresh line behavior)
+        s.next_slice(b"\x1b]133;P\x07");
+        assert_eq!(SemanticContent::Prompt, s.handler.terminal.screens.active.cursor.semantic_content);
+        assert_eq!(5, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn semantic_prompt_new_command() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Write some text
+        s.next_slice(b"Hello");
+        s.next_slice(b"\x1b]133;N\x07");
+
+        // Should behave like fresh_line_new_prompt - cursor moves to column 0
+        // on next line since we had content
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(1, s.handler.terminal.screens.active.cursor.y);
+        assert_eq!(SemanticContent::Prompt, s.handler.terminal.screens.active.cursor.semantic_content);
+    }
+
+    #[test]
+    fn semantic_prompt_new_command_at_column_zero() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // OSC 133;N when already at column 0 should stay on same line
+        s.next_slice(b"\x1b]133;N\x07");
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+        assert_eq!(SemanticContent::Prompt, s.handler.terminal.screens.active.cursor.semantic_content);
+    }
+
+    #[test]
+    fn semantic_prompt_end_prompt_start_input_terminate_eol_clears_on_linefeed() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set input terminated by EOL
+        s.next_slice(b"\x1b]133;I\x07");
+        assert_eq!(SemanticContent::Input, s.handler.terminal.screens.active.cursor.semantic_content);
+
+        // Linefeed should reset semantic content to output
+        s.next_slice(b"\n");
+        assert_eq!(SemanticContent::Output, s.handler.terminal.screens.active.cursor.semantic_content);
+    }
+
+    #[test]
+    fn bell_effect_callback() {
+        let mut t = term(80, 24);
+
+        // Test bell with null callback (default readonly effects) doesn't crash
+        {
+            let mut s = stream(Handler::init(&mut t));
+
+            s.next_slice(b"\x07");
+
+            // Terminal should still be functional after bell
+            s.next_slice(b"AfterBell");
+            assert_eq!("AfterBell", plain(s.handler.terminal));
+        }
+
+        t.full_reset();
+
+        // Test bell with a callback
+        {
+            thread_local! {
+                static BELL_COUNT: Cell<usize> = const { Cell::new(0) };
+            }
+            fn bell(_: &mut Handler<'_>) {
+                BELL_COUNT.with(|c| c.set(c.get() + 1));
+            }
+
+            let mut handler = Handler::init(&mut t);
+            handler.effects.bell = Some(bell);
+            let mut s = stream(handler);
+
+            s.next_slice(b"\x07");
+            assert_eq!(1, BELL_COUNT.with(|c| c.get()));
+
+            s.next_slice(b"\x07\x07");
+            assert_eq!(3, BELL_COUNT.with(|c| c.get()));
+        }
+    }
+
+    #[test]
+    fn desktop_notification_effect_callback() {
+        let mut t = term(80, 24);
+
+        // A null callback (the default readonly effects) silently ignores
+        // notifications and leaves the terminal usable.
+        {
+            let mut s = stream(Handler::init(&mut t));
+
+            s.next_slice(b"\x1B]9;Ignored\x1B\\AfterNotification");
+            assert_eq!("AfterNotification", plain(s.handler.terminal));
+        }
+
+        t.full_reset();
+
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+            static LAST: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+        }
+        fn desktop_notification(_: &mut Handler<'_>, notification: stream::ShowDesktopNotification<'_>) {
+            COUNT.with(|c| c.set(c.get() + 1));
+            LAST.with(|l| *l.borrow_mut() = (notification.title.to_vec(), notification.body.to_vec()));
+        }
+        let count = || COUNT.with(|c| c.get());
+        let last = || LAST.with(|l| l.borrow().clone());
+
+        let mut handler = Handler::init(&mut t);
+        handler.effects.desktop_notification = Some(desktop_notification);
+        let mut s = stream(handler);
+
+        // OSC 9 is split across writes and carries only a body.
+        s.next_slice(b"\x1B]9;Build ");
+        assert_eq!(0, count());
+        s.next_slice(b"complete\x1B\\");
+        assert_eq!(1, count());
+        assert_bytes(b"", &last().0);
+        assert_bytes(b"Build complete", &last().1);
+
+        // OSC 777 preserves its separate title and body fields.
+        s.next_slice(b"\x1B]777;notify;Codex;Needs attention\x07");
+        assert_eq!(2, count());
+        assert_bytes(b"Codex", &last().0);
+        assert_bytes(b"Needs attention", &last().1);
+    }
+
+    #[test]
+    fn resize_window_effect_callback() {
+        thread_local! {
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+            static LAST: Cell<ResizeWindowGrid> = const { Cell::new(ResizeWindowGrid { rows: 0, columns: 0 }) };
+        }
+        fn resize_window(_: &mut Handler<'_>, request: ResizeWindow) {
+            CALLS.with(|c| c.set(c.get() + 1));
+            match request {
+                ResizeWindow::Grid(grid) => LAST.with(|l| l.set(grid)),
+            }
+        }
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.resize_window = Some(resize_window);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b[8;30;100t");
+        assert_eq!(1, CALLS.with(|c| c.get()));
+        assert_eq!(ResizeWindowGrid { rows: 30, columns: 100 }, LAST.with(|l| l.get()));
+
+        // An omitted dimension is reported as zero.
+        s.next_slice(b"\x1b[8;;120t");
+        assert_eq!(2, CALLS.with(|c| c.get()));
+        assert_eq!(ResizeWindowGrid { rows: 0, columns: 120 }, LAST.with(|l| l.get()));
+
+        // The request alone doesn't resize the terminal.
+        assert_eq!(80, s.handler.terminal.cols);
+        assert_eq!(24, s.handler.terminal.rows);
+    }
+
+    #[test]
+    fn resize_window_without_effect() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"\x1b[8;30;100t");
+        assert_eq!(80, s.handler.terminal.cols);
+        assert_eq!(24, s.handler.terminal.rows);
+    }
+
+    #[test]
+    fn progress_report_effect_callback() {
+        let mut t = term(80, 24);
+
+        // A null callback (the default readonly effects) silently ignores reports.
+        {
+            let mut s = stream(Handler::init(&mut t));
+            s.next_slice(b"\x1B]9;4;1;25\x1B\\");
+        }
+
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+            static LAST: Cell<Option<osc::ProgressReport>> = const { Cell::new(None) };
+        }
+        fn progress_report(_: &mut Handler<'_>, report: osc::ProgressReport) {
+            COUNT.with(|c| c.set(c.get() + 1));
+            LAST.with(|l| l.set(Some(report)));
+        }
+        let count = || COUNT.with(|c| c.get());
+        let last = || LAST.with(|l| l.get()).unwrap();
+
+        let mut handler = Handler::init(&mut t);
+        handler.effects.progress_report = Some(progress_report);
+        let mut s = stream(handler);
+
+        use osc::ProgressReportState as State;
+        let cases: [(&[u8], State, Option<u8>); 5] = [
+            (b"\x1B]9;4;0;\x1B\\", State::Remove, None),
+            (b"\x1B]9;4;1;42\x07", State::Set, Some(42)),
+            (b"\x1B]9;4;2;7\x1B\\", State::Error, Some(7)),
+            (b"\x1B]9;4;3\x1B\\", State::Indeterminate, None),
+            (b"\x1B]9;4;4;75\x1B\\", State::Pause, Some(75)),
+        ];
+
+        for (i, (sequence, state, progress)) in cases.iter().enumerate() {
+            let expected_count = i + 1;
+            // Split each sequence to verify parsing survives PTY read boundaries.
+            let midpoint = sequence.len() / 2;
+            s.next_slice(&sequence[..midpoint]);
+            assert_eq!(expected_count - 1, count());
+            s.next_slice(&sequence[midpoint..]);
+            assert_eq!(expected_count, count());
+            assert_eq!(*state, last().state);
+            assert_eq!(*progress, last().progress);
+        }
+
+        // A full reset (RIS) removes any active progress bar.
+        s.next_slice(b"\x1B]9;4;1;50\x1B\\");
+        assert_eq!(cases.len() + 1, count());
+        assert_eq!(State::Set, last().state);
+        s.next_slice(b"\x1Bc");
+        assert_eq!(cases.len() + 2, count());
+        assert_eq!(State::Remove, last().state);
+        assert_eq!(None, last().progress);
+    }
+
+    #[test]
+    fn program_status_effect_callback() {
+        #[derive(Default)]
+        struct S {
+            count: usize,
+            last_state: Option<program_status::State>,
+            last_id: Option<Vec<u8>>,
+            last_message: Option<Vec<u8>>,
+            written: Vec<u8>,
+        }
+        thread_local! {
+            static ST: RefCell<S> = RefCell::new(S::default());
+        }
+        fn program_status_cb(_: &mut Handler<'_>, report: program_status::Report<'_>) {
+            ST.with(|st| {
+                let mut st = st.borrow_mut();
+                st.count += 1;
+                st.last_state = Some(report.state);
+                st.last_id = report.read_option::<program_status::options::Id>().map(|v| v.to_vec());
+                let mut message: Vec<u8> = Vec::new();
+                report.write_text::<program_status::options::Msg, _>(&mut message).unwrap();
+                st.last_message = Some(message);
+            });
+        }
+        fn write_pty(_: &mut Handler<'_>, data: &[u8]) {
+            ST.with(|st| st.borrow_mut().written.extend_from_slice(data));
+        }
+        fn reset() {
+            ST.with(|st| *st.borrow_mut() = S::default());
+        }
+        fn written() -> Vec<u8> {
+            ST.with(|st| st.borrow().written.clone())
+        }
+        fn clear_written() {
+            ST.with(|st| st.borrow_mut().written.clear());
+        }
+        fn count() -> usize {
+            ST.with(|st| st.borrow().count)
+        }
+
+        let mut t = term(80, 24);
+
+        // Without a callback, reports are ignored and the query isn't
+        // answered so the program sees the protocol as unsupported.
+        {
+            reset();
+            let mut handler = Handler::init(&mut t);
+            handler.effects.write_pty = Some(write_pty);
+            let mut s = stream(handler);
+            s.next_slice(b"\x1B]7501;?\x1B\\\x1B]7501;state=idle\x1B\\");
+            assert!(written().is_empty());
+        }
+
+        reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(write_pty);
+        handler.effects.program_status = Some(program_status_cb);
+        let mut s = stream(handler);
+
+        // The query is answered with `?`, the states and kinds we accept,
+        // and the same terminator the query used.
+        let reply = "\x1B]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth";
+        s.next_slice(b"\x1B]7501;?\x1B\\");
+        assert_bytes(format!("{}\x1B\\", reply).as_bytes(), &written());
+        clear_written();
+        s.next_slice(b"\x1B]7501;?\x07");
+        assert_bytes(format!("{}\x07", reply).as_bytes(), &written());
+        assert_eq!(0, count());
+        clear_written();
+
+        // A report split across writes. "Syncing photos"
+        s.next_slice(b"\x1B]7501;state=working:id=sync:msg=U3lu");
+        assert_eq!(0, count());
+        s.next_slice(b"Y2luZyBwaG90b3M=\x1B\\");
+        assert_eq!(1, count());
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(Some(program_status::State::Working), st.last_state);
+            assert_bytes(b"sync", st.last_id.as_ref().unwrap());
+            assert_bytes(b"Syncing photos", st.last_message.as_ref().unwrap());
+        });
+
+        // A full reset clears every record.
+        s.next_slice(b"\x1Bc");
+        assert_eq!(2, count());
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(Some(program_status::State::Clear), st.last_state);
+            assert!(st.last_id.is_none());
+            assert_eq!(Some(0), st.last_message.as_ref().map(|m| m.len()));
+        });
+
+        // Nothing from the reports was echoed back.
+        assert!(written().is_empty());
+    }
+
+    #[test]
+    fn semantic_prompt_effect_callback() {
+        let mut t = term(80, 24);
+
+        // A null callback (the default readonly effects) silently ignores events.
+        {
+            let mut s = stream(Handler::init(&mut t));
+            s.next_slice(b"\x1B]133;C;cmdline_url=ls\x1B\\");
+        }
+
+        #[derive(Clone)]
+        struct Last {
+            kind: SemanticPromptKind,
+            prompt_kind: SemanticPromptPromptKind,
+            exit_code: Option<i32>,
+            command: Vec<u8>,
+            err: Vec<u8>,
+        }
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+            static LAST: RefCell<Last> = const {
+                RefCell::new(Last {
+                    kind: SemanticPromptKind::Invalid,
+                    prompt_kind: SemanticPromptPromptKind::Primary,
+                    exit_code: None,
+                    command: Vec::new(),
+                    err: Vec::new(),
+                })
+            };
+            static LAST_CURSOR_X: Cell<usize> = const { Cell::new(0) };
+        }
+        fn semantic_prompt_cb(handler: &mut Handler<'_>, event: SemanticPrompt<'_>) {
+            COUNT.with(|c| c.set(c.get() + 1));
+            LAST_CURSOR_X.with(|c| c.set(handler.terminal.screens.active.cursor.x as usize));
+
+            // The strings are borrowed, so copy them.
+            LAST.with(|l| {
+                *l.borrow_mut() = Last {
+                    kind: event.kind,
+                    prompt_kind: event.prompt_kind,
+                    exit_code: event.exit_code,
+                    command: event.command.to_vec(),
+                    err: event.err.to_vec(),
+                }
+            });
+        }
+        let count = || COUNT.with(|c| c.get());
+        let last = || LAST.with(|l| l.borrow().clone());
+
+        let mut handler = Handler::init(&mut t);
+        handler.effects.semantic_prompt = Some(semantic_prompt_cb);
+        let mut s = stream(handler);
+
+        // The effect fires after the terminal applied the fresh line.
+        s.next_slice(b"abc");
+        s.next_slice(b"\x1B]133;A\x07");
+        assert_eq!(1, count());
+        assert_eq!(SemanticPromptKind::PromptStart, last().kind);
+        assert_eq!(SemanticPromptPromptKind::Primary, last().prompt_kind);
+        assert_eq!(0, LAST_CURSOR_X.with(|c| c.get()));
+
+        s.next_slice(b"\x1B]133;P;k=r\x07");
+        assert_eq!(2, count());
+        assert_eq!(SemanticPromptKind::PromptStart, last().kind);
+        assert_eq!(SemanticPromptPromptKind::Right, last().prompt_kind);
+
+        s.next_slice(b"\x1B]133;P;k=c\x07");
+        assert_eq!(3, count());
+        assert_eq!(SemanticPromptPromptKind::Continuation, last().prompt_kind);
+
+        s.next_slice(b"\x1B]133;P;k=s\x07");
+        assert_eq!(4, count());
+        assert_eq!(SemanticPromptPromptKind::Secondary, last().prompt_kind);
+
+        // An unknown prompt kind is primary.
+        s.next_slice(b"\x1B]133;P;k=x\x07");
+        assert_eq!(5, count());
+        assert_eq!(SemanticPromptPromptKind::Primary, last().prompt_kind);
+
+        s.next_slice(b"\x1B]133;N\x07");
+        assert_eq!(6, count());
+        assert_eq!(SemanticPromptKind::PromptStart, last().kind);
+        assert_eq!(SemanticPromptPromptKind::Primary, last().prompt_kind);
+
+        s.next_slice(b"\x1B]133;B\x07");
+        assert_eq!(7, count());
+        assert_eq!(SemanticPromptKind::InputStart, last().kind);
+
+        s.next_slice(b"\x1B]133;I\x07");
+        assert_eq!(8, count());
+        assert_eq!(SemanticPromptKind::InputStart, last().kind);
+
+        s.next_slice(b"\x1B]133;C;cmdline_url=ls%20-la\x07");
+        assert_eq!(9, count());
+        assert_eq!(SemanticPromptKind::OutputStart, last().kind);
+        assert_bytes(b"ls -la", &last().command);
+
+        s.next_slice(b"\x1B]133;C;cmdline='echo hi'\x07");
+        assert_eq!(10, count());
+        assert_bytes(b"echo hi", &last().command);
+
+        // No command line, and an undecodable one, are both empty.
+        s.next_slice(b"\x1B]133;C\x07");
+        assert_eq!(11, count());
+        assert_eq!(SemanticPromptKind::OutputStart, last().kind);
+        assert_bytes(b"", &last().command);
+
+        s.next_slice(b"\x1B]133;C;cmdline='bad\x07");
+        assert_eq!(12, count());
+        assert_bytes(b"", &last().command);
+
+        s.next_slice(b"\x1B]133;D;1\x07");
+        assert_eq!(13, count());
+        assert_eq!(SemanticPromptKind::CommandEnd, last().kind);
+        assert_eq!(Some(1), last().exit_code);
+        assert_bytes(b"", &last().err);
+
+        s.next_slice(b"\x1B]133;D\x07");
+        assert_eq!(14, count());
+        assert_eq!(SemanticPromptKind::CommandEnd, last().kind);
+        assert_eq!(None, last().exit_code);
+
+        s.next_slice(b"\x1B]133;D;-2;err=boom\x07");
+        assert_eq!(15, count());
+        assert_eq!(Some(-2), last().exit_code);
+        assert_bytes(b"boom", &last().err);
+
+        // Fresh line alone is layout, not lifecycle.
+        s.next_slice(b"\x1B]133;L\x07");
+        assert_eq!(15, count());
+
+        // Sequences the parser rejects report nothing.
+        s.next_slice(b"\x1B]133;Lx\x07");
+        s.next_slice(b"\x1B]133;Z\x07");
+        assert_eq!(15, count());
+    }
+
+    #[test]
+    fn reset_effect_callback() {
+        thread_local! {
+            static EVENTS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+            static RESET_CURSOR_X: Cell<usize> = const { Cell::new(0) };
+        }
+        fn progress_report(_: &mut Handler<'_>, _: osc::ProgressReport) {
+            EVENTS.with(|e| e.borrow_mut().push(b'p'));
+        }
+        fn reset(handler: &mut Handler<'_>) {
+            RESET_CURSOR_X.with(|c| c.set(handler.terminal.screens.active.cursor.x as usize));
+            EVENTS.with(|e| e.borrow_mut().push(b'r'));
+        }
+        let events = || EVENTS.with(|e| e.borrow().clone());
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.progress_report = Some(progress_report);
+        handler.effects.reset = Some(reset);
+        let mut s = stream(handler);
+
+        // A soft reset (DECSTR) doesn't report a reset.
+        s.next_slice(b"\x1B[!p");
+        assert_bytes(b"", &events());
+
+        // A full reset reports the progress removal first, and the terminal
+        // already reset itself when the reset is reported.
+        s.next_slice(b"abc\x1Bc");
+        assert_bytes(b"pr", &events());
+        assert_eq!(0, RESET_CURSOR_X.with(|c| c.get()));
+    }
+
+    #[test]
+    fn clipboard_write_effect_callback() {
+        let mut t = term(80, 24);
+
+        // A null callback (the default readonly effects) silently ignores writes.
+        {
+            let mut s = stream(Handler::init(&mut t));
+
+            s.next_slice(b"\x1B]52;c;aGVsbG8=\x1B\\");
+
+            // Terminal should still be functional after the ignored sequence
+            s.next_slice(b"AfterClipboard");
+            assert_eq!("AfterClipboard", plain(s.handler.terminal));
+        }
+
+        t.full_reset();
+
+        #[derive(Default)]
+        struct S {
+            count: usize,
+            last_location: Option<clipboard::Location>,
+            last_contents_len: usize,
+            last_mime: Option<Vec<u8>>,
+            last_data: Option<Vec<u8>>,
+        }
+        thread_local! {
+            static ST: RefCell<S> = RefCell::new(S::default());
+            static RESULT: Cell<clipboard::WriteResult> = const { Cell::new(clipboard::WriteResult::Denied) };
+        }
+        fn clipboard_write(_: &mut Handler<'_>, write: clipboard::Write<'_>) {
+            ST.with(|st| {
+                let mut st = st.borrow_mut();
+                st.count += 1;
+                st.last_location = Some(write.location);
+                st.last_contents_len = write.contents.len();
+                st.last_mime = write.contents.first().map(|c| c.mime.to_vec());
+                st.last_data = write.contents.first().map(|c| c.data.to_vec());
+            });
+            write.reply(RESULT.with(|r| r.get()));
+        }
+        let count = || ST.with(|st| st.borrow().count);
+
+        let mut handler = Handler::init(&mut t);
+        handler.effects.clipboard_write = Some(clipboard_write);
+        let mut s = stream(handler);
+
+        // Selectors are normalized and payloads are decoded before the callback.
+        let cases: [(&[u8], clipboard::Location, &[u8]); 7] = [
+            (b"\x1B]52;c;aGVsbG8=\x1B\\", clipboard::Location::STANDARD, b"hello"),
+            (b"\x1B]52;s;d29ybGQ=\x07", clipboard::Location::SELECTION, b"world"),
+            (b"\x1B]52;p;cHJpbWFyeQ==\x1B\\", clipboard::Location::PRIMARY, b"primary"),
+            (b"\x1B]52;0;Y3V0\x1B\\", clipboard::Location::STANDARD, b"cut"),
+            (b"\x1B]52;x;ZmFsbGJhY2s=\x1B\\", clipboard::Location::STANDARD, b"fallback"),
+            (b"\x1B]52;c;YQBi\x1B\\", clipboard::Location::STANDARD, b"a\x00b"),
+            // Missing padding is tolerated for OSC 52 since it has no way
+            // to report errors to the client, matching kitty.
+            (b"\x1B]52;c;dW5wYWRkZWQ\x1B\\", clipboard::Location::STANDARD, b"unpadded"),
+        ];
+
+        for (i, (sequence, location, data)) in cases.iter().enumerate() {
+            s.next_slice(sequence);
+            ST.with(|st| {
+                let st = st.borrow();
+                assert_eq!(i + 1, st.count);
+                assert_eq!(Some(*location), st.last_location);
+                assert_eq!(1, st.last_contents_len);
+                assert_bytes(b"text/plain", st.last_mime.as_ref().unwrap());
+                assert_bytes(data, st.last_data.as_ref().unwrap());
+            });
+        }
+
+        // Empty data is a clear, represented by an empty contents slice.
+        s.next_slice(b"\x1B]52;s;\x1B\\");
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(cases.len() + 1, st.count);
+            assert_eq!(Some(clipboard::Location::SELECTION), st.last_location);
+            assert_eq!(0, st.last_contents_len);
+            assert!(st.last_mime.is_none());
+            assert!(st.last_data.is_none());
+        });
+
+        // Reads and malformed base64 are ignored. The whole request is
+        // discarded on invalid characters (including whitespace) rather
+        // than decoding around them, per the Kitty clipboard spec that
+        // governs OSC 52 base64 handling.
+        s.next_slice(b"\x1B]52;c;?\x1B\\");
+        s.next_slice(b"\x1B]52;c;***\x1B\\");
+        s.next_slice(b"\x1B]52;c;SGVs!!!bG8=\x1B\\");
+        s.next_slice(b"\x1B]52;c;aGVs bG8=\x1B\\");
+        assert_eq!(cases.len() + 1, count());
+
+        // OSC 1337 Copy shares the normalized clipboard write path.
+        s.next_slice(b"\x1B]1337;Copy=:aVRlcm0y\x1B\\");
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(cases.len() + 2, st.count);
+            assert_eq!(Some(clipboard::Location::STANDARD), st.last_location);
+            assert_bytes(b"text/plain", st.last_mime.as_ref().unwrap());
+            assert_bytes(b"iTerm2", st.last_data.as_ref().unwrap());
+        });
+
+        // Parsing across write boundaries still invokes exactly one atomic write.
+        s.next_slice(b"\x1B]52;p;ZnJh");
+        s.next_slice(b"Z21lbnRlZA==\x1B");
+        s.next_slice(b"\\");
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(cases.len() + 3, st.count);
+            assert_eq!(Some(clipboard::Location::PRIMARY), st.last_location);
+            assert_bytes(b"text/plain", st.last_mime.as_ref().unwrap());
+            assert_bytes(b"fragmented", st.last_data.as_ref().unwrap());
+        });
+
+        // Reply results are intentionally ignored for protocols without a
+        // write acknowledgement. The denied reply above did not stop later writes.
+        assert_eq!(clipboard::WriteResult::Denied, RESULT.with(|r| r.get()));
+    }
+
+    #[test]
+    fn clipboard_read_effect_callback() {
+        const HELLO: &[clipboard::Content<'static>] = &[clipboard::Content {
+            mime: b"text/plain",
+            data: b"hello",
+        }];
+        const AGAIN: &[clipboard::Content<'static>] = &[clipboard::Content {
+            mime: b"text/plain",
+            data: b"again",
+        }];
+        const MIXED: &[clipboard::Content<'static>] = &[
+            clipboard::Content {
+                mime: b"image/png",
+                data: b"\x89PNG",
+            },
+            clipboard::Content {
+                mime: b"UTF8_STRING",
+                data: b"hi",
+            },
+        ];
+        fn success(contents: &'static [clipboard::Content<'static>]) -> clipboard::ReadResult<'static> {
+            clipboard::ReadResult::Success(clipboard::ReadSuccess {
+                contents,
+                ..Default::default()
+            })
+        }
+
+        #[derive(Default)]
+        struct S {
+            written: Vec<u8>,
+            count: usize,
+            last_location: Option<clipboard::Location>,
+            last_mimes: Vec<Vec<u8>>,
+            last_list: bool,
+            last_name: Vec<u8>,
+            last_granted: bool,
+            last_can_remember: bool,
+        }
+        thread_local! {
+            static ST: RefCell<S> = RefCell::new(S::default());
+            static RESULT: Cell<Option<clipboard::ReadResult<'static>>> = const { Cell::new(None) };
+            static REPLY_TWICE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn write_pty(_: &mut Handler<'_>, data: &[u8]) {
+            ST.with(|st| st.borrow_mut().written.extend_from_slice(data));
+        }
+        fn clipboard_read(_: &mut Handler<'_>, read: clipboard::Read<'_>) {
+            ST.with(|st| {
+                let mut st = st.borrow_mut();
+                st.count += 1;
+                st.last_location = Some(read.location);
+                st.last_mimes = read.mimes.iter().map(|m| m.to_vec()).collect();
+                st.last_list = read.list;
+                st.last_name = read.name.to_vec();
+                st.last_granted = read.granted;
+                st.last_can_remember = read.can_remember;
+            });
+            if let Some(r) = RESULT.with(|r| r.get()) {
+                read.reply(r);
+            }
+            if REPLY_TWICE.with(|r| r.get()) {
+                read.reply(success(AGAIN));
+            }
+        }
+        let written = || ST.with(|st| st.borrow().written.clone());
+        let clear_written = || ST.with(|st| st.borrow_mut().written.clear());
+        RESULT.with(|r| r.set(Some(success(HELLO))));
+
+        let mut t = term(80, 24);
+
+        // A null callback (the default readonly effects) silently ignores reads.
+        {
+            let mut handler = Handler::init(&mut t);
+            handler.effects.write_pty = Some(write_pty);
+            let mut s = stream(handler);
+
+            s.next_slice(b"\x1B]52;c;?\x1B\\");
+            assert!(written().is_empty());
+        }
+
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(write_pty);
+        handler.effects.clipboard_read = Some(clipboard_read);
+        let mut s = stream(handler);
+
+        // Success echoes the normalized selector and request terminator.
+        s.next_slice(b"\x1B]52;c;?\x1B\\");
+        ST.with(|st| {
+            let st = st.borrow();
+            assert_eq!(1, st.count);
+            assert_eq!(Some(clipboard::Location::STANDARD), st.last_location);
+            assert_eq!(1, st.last_mimes.len());
+            assert_bytes(b"text/plain", &st.last_mimes[0]);
+            assert!(!st.last_list);
+            assert_bytes(b"", &st.last_name);
+            assert!(!st.last_granted);
+            assert!(!st.last_can_remember);
+        });
+        assert_bytes(b"\x1B]52;c;aGVsbG8=\x1B\\", &written());
+
+        clear_written();
+        s.next_slice(b"\x1B]52;p;?\x07");
+        assert_eq!(Some(clipboard::Location::PRIMARY), ST.with(|st| st.borrow().last_location));
+        assert_bytes(b"\x1B]52;p;aGVsbG8=\x07", &written());
+
+        // Only the first text representation is used.
+        clear_written();
+        RESULT.with(|r| {
+            r.set(Some(clipboard::ReadResult::Success(clipboard::ReadSuccess {
+                contents: MIXED,
+                // OSC 52 has no session passwords, so remember is ignored.
+                remember: true,
+                ..Default::default()
+            })))
+        });
+        s.next_slice(b"\x1B]52;s;?\x1B\\");
+        assert_eq!(Some(clipboard::Location::SELECTION), ST.with(|st| st.borrow().last_location));
+        assert_bytes(b"\x1B]52;s;aGk=\x1B\\", &written());
+
+        // Every failure, no text, and no reply all answer with an empty
+        // clipboard.
+        for result in [
+            Some(clipboard::ReadResult::Denied),
+            Some(clipboard::ReadResult::Unsupported),
+            Some(clipboard::ReadResult::Busy),
+            Some(clipboard::ReadResult::IoError),
+            Some(clipboard::ReadResult::Success(clipboard::ReadSuccess::default())),
+            None,
+        ] {
+            clear_written();
+            RESULT.with(|r| r.set(result));
+            s.next_slice(b"\x1B]52;c;?\x1B\\");
+            assert_bytes(b"\x1B]52;c;\x1B\\", &written());
+        }
+
+        // A second reply is ignored.
+        clear_written();
+        RESULT.with(|r| r.set(Some(success(HELLO))));
+        REPLY_TWICE.with(|r| r.set(true));
+        s.next_slice(b"\x1B]52;c;?\x1B\\");
+        assert_bytes(b"\x1B]52;c;aGVsbG8=\x1B\\", &written());
+    }
+
+    #[test]
+    fn clipboard_write_allocation_failure_is_ignored() {
+        // Port note: the Zig test swaps in a failing allocator for the
+        // decode scratch buffer; the same allocation fails here through
+        // the `VT_TW` tripwire.
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+        }
+        fn clipboard_write(_: &mut Handler<'_>, write: clipboard::Write<'_>) {
+            COUNT.with(|c| c.set(c.get() + 1));
+            write.reply(clipboard::WriteResult::Success(Default::default()));
+        }
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.clipboard_write = Some(clipboard_write);
+        let mut s = stream(handler);
+
+        VT_TW.error_always(FailPoint::ClipboardDecode, OutOfMemory);
+        s.next_slice(b"\x1B]52;c;aGVsbG8=\x1B\\");
+        VT_TW.end(tripwire::ResetMode::Reset).unwrap();
+        assert_eq!(0, COUNT.with(|c| c.get()));
+        assert!(!s.handler.semantic_failure);
+    }
 }
