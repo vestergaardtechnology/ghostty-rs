@@ -23,6 +23,7 @@ use crate::terminal::charsets;
 use crate::terminal::color;
 use crate::terminal::hyperlink;
 use crate::terminal::kitty;
+use crate::terminal::modes;
 use crate::terminal::page::{Cell, ContentTag, Page, Row, Wide};
 use crate::terminal::page_list::{Direction, NodePtr, PageList, Pin};
 use crate::terminal::point::{Coordinate, Tag};
@@ -30,6 +31,7 @@ use crate::terminal::screen::Screen;
 use crate::terminal::selection::Selection;
 use crate::terminal::size::CellCountInt;
 use crate::terminal::style::{self, Style};
+use crate::terminal::terminal::Terminal;
 
 /// Formats available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,7 +280,348 @@ impl PinMap<'_> {
     }
 }
 
-// TODO(port): `TerminalFormatter` is pending the `Terminal` port.
+/// Terminal formatter formats the active terminal screen.
+///
+/// This will always only emit data related to the currently active screen.
+/// If you want to emit data for a specific screen (e.g. primary vs alt), then
+/// switch to that screen in the terminal prior to using this.
+///
+/// If you want to emit data for all screens (a less common operation), then
+/// you must create a no-content TerminalFormatter followed by multiple
+/// explicit ScreenFormatter calls. This isn't a common operation so this
+/// little extra work should be acceptable.
+///
+/// For styled formatting, this will emit the palette colors at the
+/// beginning so that the output can be rendered properly according to
+/// the current terminal state.
+pub struct TerminalFormatter<'a> {
+    /// The terminal to format.
+    pub terminal: &'a Terminal,
+
+    /// The common options
+    pub opts: Options<'a>,
+
+    /// The content to include.
+    pub content: ScreenFormatterContent,
+
+    /// Extra stuff to emit, such as terminal modes, palette, cursor, etc.
+    /// This information is ONLY emitted when the format is "vt".
+    pub extra: TerminalFormatterExtra,
+
+    /// If non-null, then `map` will contain the Pin of every byte
+    /// byte written to the writer offset by the byte index. It is the
+    /// caller's responsibility to free the map.
+    ///
+    /// Note that some emitted bytes may not correspond to any Pin, such as
+    /// the extra data around terminal state (palette, modes, etc.). For these,
+    /// we'll map it to the most previous pin so there is some continuity but
+    /// its an arbitrary choice.
+    ///
+    /// Warning: there is a significant performance hit to track this
+    pub pin_map: Option<PinMap<'a>>,
+}
+
+/// (Zig: `TerminalFormatter.Extra`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalFormatterExtra {
+    /// Emit the palette using OSC 4 sequences.
+    pub palette: bool,
+
+    /// Emit terminal modes that differ from their defaults using CSI h/l
+    /// sequences. Defaults are according to the Ghostty defaults which
+    /// are generally match most terminal defaults. This will include
+    /// things like current screen, bracketed mode, mouse event reporting,
+    /// etc.
+    pub modes: bool,
+
+    /// Emit scrolling region state using DECSTBM and DECSLRM sequences.
+    pub scrolling_region: bool,
+
+    /// Emit tabstop positions by clearing all tabs (CSI 3 g) and setting
+    /// each configured tabstop with HTS.
+    pub tabstops: bool,
+
+    /// Emit the present working directory using OSC 7.
+    pub pwd: bool,
+
+    /// Emit keyboard modes such as ModifyOtherKeys using CSI > 4 m
+    /// sequences.
+    pub keyboard: bool,
+
+    /// The screen extras to emit. TerminalFormatter always only
+    /// emits data for the currently active screen. If you want to emit
+    /// data for all screens, you should manually construct a no-content
+    /// terminal formatter, followed by screen formatters.
+    pub screen: ScreenFormatterExtra,
+}
+
+impl TerminalFormatterExtra {
+    /// Emit nothing.
+    pub const NONE: TerminalFormatterExtra = TerminalFormatterExtra {
+        palette: false,
+        modes: false,
+        scrolling_region: false,
+        tabstops: false,
+        pwd: false,
+        keyboard: false,
+        screen: ScreenFormatterExtra::NONE,
+    };
+
+    /// Emit style-relevant information only such as palettes.
+    pub const STYLES: TerminalFormatterExtra = TerminalFormatterExtra {
+        palette: true,
+        modes: false,
+        scrolling_region: false,
+        tabstops: false,
+        pwd: false,
+        keyboard: false,
+        screen: ScreenFormatterExtra::STYLES,
+    };
+
+    /// Emit everything. This reconstructs the terminal state as closely
+    /// as possible.
+    pub const ALL: TerminalFormatterExtra = TerminalFormatterExtra {
+        palette: true,
+        modes: true,
+        scrolling_region: true,
+        tabstops: true,
+        pwd: true,
+        keyboard: true,
+        screen: ScreenFormatterExtra::ALL,
+    };
+}
+
+impl<'a> TerminalFormatter<'a> {
+    pub fn init(terminal: &'a Terminal, opts: Options<'a>) -> TerminalFormatter<'a> {
+        TerminalFormatter {
+            terminal,
+            opts,
+            content: ScreenFormatterContent::Selection(None),
+            extra: TerminalFormatterExtra::STYLES,
+            pin_map: None,
+        }
+    }
+
+    /// The active screen of the terminal.
+    fn active_screen(&self) -> &'a Screen {
+        let terminal: &'a Terminal = self.terminal;
+        &terminal.screens.active
+    }
+
+    /// Count the bytes a formatter with no content, no pin map and only
+    /// the given extras writes (Zig: the `extra_formatter` formatted into
+    /// a `Discarding` writer).
+    fn count_extra(&self, extra: TerminalFormatterExtra) -> io::Result<usize> {
+        let mut discarding = Discarding::default();
+        let mut extra_formatter = TerminalFormatter {
+            terminal: self.terminal,
+            opts: self.opts.clone(),
+            content: ScreenFormatterContent::None,
+            extra,
+            pin_map: None,
+        };
+        extra_formatter.format(&mut discarding)?;
+        usize::try_from(discarding.count).map_err(|_| write_failed())
+    }
+
+    /// Map `n` bytes of extra state to the top left pin of the screen.
+    fn map_top_left(&mut self, n: usize) {
+        let screen = self.active_screen();
+        if let Some(m) = self.pin_map.as_mut() {
+            m.map.append(screen.pages.get_top_left(Tag::Screen), n);
+        }
+    }
+
+    pub fn format(&mut self, writer: &mut dyn Write) -> io::Result<()> {
+        let terminal = self.terminal;
+        let screen = self.active_screen();
+
+        // Emit palette before screen content if using VT format. Technically
+        // we could do this after but this way if replay is slow for whatever
+        // reason the colors will be right right away.
+        if self.extra.palette {
+            'palette: {
+                match self.opts.emit {
+                    Format::Plain => break 'palette,
+
+                    Format::Vt => {
+                        for (i, rgb) in terminal.colors.palette.current.iter().enumerate() {
+                            write!(writer, "\x1b]4;{};rgb:{:02x}/{:02x}/{:02x}\x1b\\", i, rgb.r, rgb.g, rgb.b)?;
+                        }
+                    }
+
+                    // For HTML, we emit CSS to setup our palette variables.
+                    Format::Html => {
+                        writer.write_all(b"<style>:root{")?;
+                        for (i, rgb) in terminal.colors.palette.current.iter().enumerate() {
+                            write!(writer, "--vt-palette-{}: #{:02x}{:02x}{:02x};", i, rgb.r, rgb.g, rgb.b)?;
+                        }
+                        writer.write_all(b"}</style>")?;
+                    }
+                }
+
+                // If we have a pin_map, add the bytes we wrote to map.
+                if self.pin_map.is_some() {
+                    let mut extra = TerminalFormatterExtra::NONE;
+                    extra.palette = true;
+                    let n = self.count_extra(extra)?;
+
+                    // Map all those bytes to the same pin. Use the top left to ensure
+                    // the node pointer is always properly initialized.
+                    self.map_top_left(n);
+                }
+            }
+        }
+
+        // Emit terminal modes that differ from defaults. We probably have
+        // some modes we want to emit before and some after, but for now for
+        // simplicity we just emit them all before. If we make this more complex
+        // later we should add test cases for it.
+        if self.opts.emit == Format::Vt && self.extra.modes {
+            for mode in modes::Mode::all() {
+                let current = terminal.modes.get(mode);
+                let default_val = terminal.modes.get_default(mode);
+
+                if current != default_val {
+                    let tag = mode.tag();
+                    let prefix = if tag.ansi { "" } else { "?" };
+                    let suffix = if current { "h" } else { "l" };
+                    write!(writer, "\x1b[{}{}{}", prefix, tag.value, suffix)?;
+                }
+            }
+
+            // If we have a pin_map, add the bytes we wrote to map.
+            if self.pin_map.is_some() {
+                let mut extra = TerminalFormatterExtra::NONE;
+                extra.modes = true;
+                let n = self.count_extra(extra)?;
+
+                // Map all those bytes to the same pin. Use the top left to ensure
+                // the node pointer is always properly initialized.
+                self.map_top_left(n);
+            }
+        }
+
+        // Emit tabstop positions before the screen contents because setting
+        // them moves the cursor. Screen formatting will restore the requested
+        // cursor position afterwards.
+        if self.opts.emit == Format::Vt && self.extra.tabstops {
+            // Clear all tabs (CSI 3 g)
+            writer.write_all(b"\x1b[3g")?;
+
+            // Set each configured tabstop by moving cursor and using HTS
+            for col in 0..terminal.cols as usize {
+                if terminal.tabstops.get(col) {
+                    // Move cursor to the column (1-indexed)
+                    write!(writer, "\x1b[{}G", col + 1)?;
+                    // Set tab (HTS)
+                    writer.write_all(b"\x1bH")?;
+                }
+            }
+
+            // Screen contents are formatted relative to the top-left.
+            writer.write_all(b"\x1b[H")?;
+
+            // If we have a pin_map, add the bytes we wrote to map.
+            if self.pin_map.is_some() {
+                let mut extra = TerminalFormatterExtra::NONE;
+                extra.tabstops = true;
+                let n = self.count_extra(extra)?;
+
+                // Map all those bytes to the same pin. Use the top left to ensure
+                // the node pointer is always properly initialized.
+                self.map_top_left(n);
+            }
+        }
+
+        {
+            let mut screen_formatter = ScreenFormatter::init(screen, self.opts.clone());
+            screen_formatter.content = self.content;
+            screen_formatter.pin_map = self.pin_map.as_mut().map(|m| PinMap { map: &mut *m.map });
+            screen_formatter.format(writer)?;
+        }
+
+        // Extra terminal state to emit after the screen contents so that
+        // it doesn't impact the emitted contents.
+        if self.opts.emit == Format::Vt {
+            // Emit scrolling region using DECSTBM and DECSLRM
+            if self.extra.scrolling_region {
+                let region = &terminal.scrolling_region;
+
+                // DECSTBM: top and bottom margins (1-indexed)
+                // Only emit if not the full screen
+                if region.top != 0 || region.bottom != terminal.rows - 1 {
+                    write!(writer, "\x1b[{};{}r", region.top as u32 + 1, region.bottom as u32 + 1)?;
+                }
+
+                // DECSLRM: left and right margins (1-indexed)
+                // Only emit if not the full width
+                if region.left != 0 || region.right != terminal.cols - 1 {
+                    write!(writer, "\x1b[{};{}s", region.left as u32 + 1, region.right as u32 + 1)?;
+                }
+            }
+
+            // Emit keyboard modes such as ModifyOtherKeys
+            if self.extra.keyboard {
+                // Only emit if modify_other_keys_2 is true
+                if terminal.flags.modify_other_keys_2 {
+                    writer.write_all(b"\x1b[>4;2m")?;
+                }
+            }
+
+            // Emit present working directory using OSC 7
+            if self.extra.pwd {
+                let pwd = &terminal.pwd;
+                if !pwd.is_empty() {
+                    writer.write_all(b"\x1b]7;")?;
+                    writer.write_all(pwd)?;
+                    writer.write_all(b"\x1b\\")?;
+                }
+            }
+
+            // If we have a pin_map, add the bytes we wrote to map.
+            if self.pin_map.is_some() {
+                let mut extra = TerminalFormatterExtra::NONE;
+                extra.scrolling_region = self.extra.scrolling_region;
+                extra.keyboard = self.extra.keyboard;
+                extra.pwd = self.extra.pwd;
+                let n = self.count_extra(extra)?;
+
+                if let Some(m) = self.pin_map.as_mut() {
+                    let pin = m
+                        .map
+                        .get_last_or_null()
+                        .unwrap_or_else(|| screen.pages.get_top_left(Tag::Screen));
+                    m.map.append(pin, n);
+                }
+            }
+        }
+
+        // Emit extra screen state last because terminal state such
+        // as scrolling regions can move the cursor, so we have to set
+        // cursor last.
+        let mut screen_formatter = ScreenFormatter::init(screen, self.opts.clone());
+        screen_formatter.pin_map = self.pin_map.as_mut().map(|m| PinMap { map: &mut *m.map });
+        screen_formatter.content = ScreenFormatterContent::None;
+        screen_formatter.extra = self.extra.screen;
+
+        // In origin mode (DECOM), which the modes above restore, CUP counts
+        // from the top-left of the scrolling region restored above, so the
+        // cursor position is written relative to it.
+        if self.opts.emit == Format::Vt
+            && self.extra.modes
+            && self.extra.scrolling_region
+            && terminal.modes.get(modes::Mode::Origin)
+        {
+            screen_formatter.cursor_origin = CursorOrigin {
+                x: terminal.scrolling_region.left,
+                y: terminal.scrolling_region.top,
+            };
+        }
+
+        screen_formatter.format(writer)
+    }
+}
 
 /// A writer that only counts bytes (Zig: `std.Io.Writer.Discarding`).
 #[derive(Debug, Default)]
@@ -2070,4 +2413,1587 @@ fn write_codepoint(emit: Format, writer: &mut dyn Write, codepoint: u32) -> io::
             }
         },
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::ansi;
+    use crate::terminal::csi;
+    use crate::terminal::osc;
+    use crate::terminal::point::Point;
+    use crate::terminal::stream::{Action, Handler, Stream};
+    use crate::terminal::terminal::{Options as TerminalOptions, SwitchScreenMode};
+
+    // ----- test helpers (Rust-only) -----
+
+    // TODO(port-dedupe): replace with crate::terminal::stream_terminal::Handler
+    // (`Terminal::vtStream`) once stream_terminal.zig is ported. This is a
+    // minimal subset of that handler: it forwards the actions the formatter
+    // tests (and the formatter's VT output) use to the terminal, with the
+    // same semantics as the Zig handler.
+    struct TestHandler<'a> {
+        terminal: &'a mut Terminal,
+    }
+
+    impl TestHandler<'_> {
+        fn set_mode(&mut self, mode: modes::Mode, enabled: bool) {
+            let t = &mut *self.terminal;
+            // Set the mode on the terminal
+            t.modes.set(mode, enabled);
+
+            // Some modes require additional processing
+            match mode {
+                modes::Mode::Origin => t.set_cursor_pos(1, 1),
+                modes::Mode::EnableLeftAndRightMargin => {
+                    if !enabled {
+                        t.scrolling_region.left = 0;
+                        t.scrolling_region.right = t.cols - 1;
+                    }
+                }
+                modes::Mode::AltScreenLegacy => t.switch_screen_mode(SwitchScreenMode::Mode47, enabled).unwrap(),
+                modes::Mode::AltScreen => t.switch_screen_mode(SwitchScreenMode::Mode1047, enabled).unwrap(),
+                modes::Mode::AltScreenSaveCursorClearEnter => {
+                    t.switch_screen_mode(SwitchScreenMode::Mode1049, enabled).unwrap()
+                }
+                modes::Mode::SaveCursor => {
+                    if enabled {
+                        t.save_cursor();
+                    } else {
+                        t.restore_cursor();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Handler for TestHandler<'_> {
+        fn vt(&mut self, action: Action<'_>) {
+            let t = &mut *self.terminal;
+            match action {
+                Action::Print(p) => t.print(p.cp).unwrap(),
+                Action::PrintSlice(p) => t.print_slice(p.cps).unwrap(),
+                Action::PrintRepeat(n) => t.print_repeat(n).unwrap(),
+                Action::Backspace => t.backspace(),
+                Action::CarriageReturn => t.carriage_return(),
+                Action::Linefeed => t.linefeed().unwrap(),
+                Action::Index => t.index().unwrap(),
+                Action::NextLine => {
+                    t.index().unwrap();
+                    t.carriage_return();
+                }
+                Action::ReverseIndex => t.reverse_index(),
+                Action::CursorUp(v) => t.cursor_up(v.value as usize),
+                Action::CursorDown(v) => t.cursor_down(v.value as usize),
+                Action::CursorLeft(v) => t.cursor_left(v.value as usize),
+                Action::CursorRight(v) => t.cursor_right(v.value as usize),
+                Action::CursorPos(v) => t.set_cursor_pos(v.row as usize, v.col as usize),
+                Action::CursorCol(v) => t.set_cursor_col(v.value as usize),
+                Action::CursorRow(v) => t.set_cursor_row(v.value as usize),
+                Action::CursorColRelative(v) => t.cursor_col_relative(v.value as usize),
+                Action::CursorRowRelative(v) => t.cursor_row_relative(v.value as usize),
+                Action::EraseDisplayBelow(p) => t.erase_display(csi::EraseDisplay::Below, p),
+                Action::EraseDisplayAbove(p) => t.erase_display(csi::EraseDisplay::Above, p),
+                Action::EraseDisplayComplete(p) => t.erase_display(csi::EraseDisplay::Complete, p),
+                Action::EraseLineRight(p) => t.erase_line(csi::EraseLine::RIGHT, p),
+                Action::EraseLineLeft(p) => t.erase_line(csi::EraseLine::LEFT, p),
+                Action::EraseLineComplete(p) => t.erase_line(csi::EraseLine::COMPLETE, p),
+                Action::DeleteChars(n) => t.delete_chars(n),
+                Action::EraseChars(n) => t.erase_chars(n),
+                Action::InsertLines(n) => t.insert_lines(n),
+                Action::InsertBlanks(n) => t.insert_blanks(n),
+                Action::DeleteLines(n) => t.delete_lines(n),
+                Action::ScrollUp(n) => t.scroll_up(n).unwrap(),
+                Action::ScrollDown(n) => t.scroll_down(n),
+                Action::HorizontalTab(count) => {
+                    for _ in 0..count {
+                        let x = t.screens.active.cursor.x;
+                        t.horizontal_tab();
+                        if x == t.screens.active.cursor.x {
+                            break;
+                        }
+                    }
+                }
+                Action::TabClearCurrent => t.tab_clear(csi::TabClear::CURRENT),
+                Action::TabClearAll => t.tab_clear(csi::TabClear::ALL),
+                Action::TabSet => t.tab_set(),
+                Action::TabReset => t.tab_reset(),
+                Action::SetMode(m) => self.set_mode(m.mode, true),
+                Action::ResetMode(m) => self.set_mode(m.mode, false),
+                Action::TopAndBottomMargin(m) => {
+                    t.set_top_and_bottom_margin(m.top_left as usize, m.bottom_right as usize)
+                }
+                Action::LeftAndRightMargin(m) => {
+                    t.set_left_and_right_margin(m.top_left as usize, m.bottom_right as usize)
+                }
+                Action::LeftAndRightMarginAmbiguous => {
+                    if t.modes.get(modes::Mode::EnableLeftAndRightMargin) {
+                        t.set_left_and_right_margin(0, 0);
+                    } else {
+                        t.save_cursor();
+                    }
+                }
+                Action::SaveCursor => t.save_cursor(),
+                Action::RestoreCursor => t.restore_cursor(),
+                Action::InvokeCharset(v) => t.invoke_charset(v.bank, v.charset, v.locking),
+                Action::ConfigureCharset(v) => t.configure_charset(v.slot, v.charset),
+                Action::SetAttribute(attr) => match attr {
+                    crate::terminal::sgr::Attribute::Unknown(_) => {}
+                    attr => t.set_attribute(attr).unwrap(),
+                },
+                Action::ProtectedModeOff => t.set_protected_mode(ansi::ProtectedMode::Off),
+                Action::ProtectedModeIso => t.set_protected_mode(ansi::ProtectedMode::Iso),
+                Action::ProtectedModeDec => t.set_protected_mode(ansi::ProtectedMode::Dec),
+                Action::KittyKeyboardPush(v) => t.screens.active.kitty_keyboard.push(v.flags),
+                Action::KittyKeyboardPop(n) => t.screens.active.kitty_keyboard.pop(n as usize),
+                Action::KittyKeyboardSet(v) => t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Set, v.flags),
+                Action::KittyKeyboardSetOr(v) => t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Or, v.flags),
+                Action::KittyKeyboardSetNot(v) => {
+                    t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Not, v.flags)
+                }
+                Action::ModifyKeyFormat(v) => {
+                    t.flags.modify_other_keys_2 = false;
+                    if v == ansi::ModifyKeyFormat::OtherKeysNumeric {
+                        t.flags.modify_other_keys_2 = true;
+                    }
+                }
+                Action::StartHyperlink(v) => t.screens.active.start_hyperlink(v.uri, v.id).unwrap(),
+                Action::EndHyperlink => t.screens.active.end_hyperlink(),
+                Action::ColorOperation(op) => {
+                    for req in op.requests.iter() {
+                        match req {
+                            osc::color::Request::Set(set) => {
+                                if let osc::color::Target::Palette(i) = set.target {
+                                    t.flags.dirty.palette = true;
+                                    t.colors.palette.set(i, set.color);
+                                }
+                            }
+                            osc::color::Request::Reset(osc::color::Target::Palette(i)) => {
+                                t.flags.dirty.palette = true;
+                                t.colors.palette.reset(*i);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Action::ReportPwd(v) => t.set_pwd(v.url).unwrap(),
+                Action::WindowTitle(v) => t.set_title(v.title).unwrap(),
+                _ => {}
+            }
+        }
+    }
+
+    /// Feed bytes to the terminal (Zig: `t.vtStream().nextSlice(bytes)`).
+    fn feed(t: &mut Terminal, bytes: impl AsRef<[u8]>) {
+        let mut s = Stream::new(TestHandler { terminal: t });
+        s.next_slice(bytes.as_ref());
+    }
+
+    fn term(cols: CellCountInt, rows: CellCountInt) -> Terminal {
+        Terminal::init(TerminalOptions::new(cols, rows)).unwrap()
+    }
+
+    fn c(x: usize, y: usize) -> Coordinate {
+        Coordinate {
+            x: x as CellCountInt,
+            y: y as u32,
+        }
+    }
+
+    /// Asserts the page list has exactly one page and returns it.
+    fn single_page<'a>(t: &Terminal) -> &'a mut Page {
+        let pages = &t.screens.active.pages;
+        assert!(pages.pages.first.is_some());
+        assert!(pages.pages.first == pages.pages.last);
+        last_page(t)
+    }
+
+    /// The last page of the active screen.
+    fn last_page<'a>(t: &Terminal) -> &'a mut Page {
+        let node = t.screens.active.pages.pages.last.unwrap();
+        // SAFETY: the node is live while the terminal is alive.
+        unsafe { (*node.as_ptr()).page() }
+    }
+
+    struct PageOut {
+        out: String,
+        state: TrailingState,
+        map: Vec<Coordinate>,
+    }
+
+    /// Format a page with a point map. `f` configures the formatter.
+    fn fmt_page(page: &Page, opts: Options<'_>, f: impl FnOnce(&mut PageFormatter<'_>)) -> PageOut {
+        let mut map: Vec<Coordinate> = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let state = {
+            let mut formatter = PageFormatter::init(page, opts);
+            f(&mut formatter);
+            formatter.point_map = Some(PointMap { map: &mut map, base: 0 });
+            formatter.format_with_state(&mut buf).unwrap()
+        };
+        PageOut {
+            out: String::from_utf8(buf).unwrap(),
+            state,
+            map,
+        }
+    }
+
+    fn opts(emit: Format) -> Options<'static> {
+        Options::new(emit)
+    }
+
+    /// Assert `n` map entries starting at `off` are `(x0 + i, y)`.
+    #[track_caller]
+    fn assert_run(map: &[Coordinate], off: usize, n: usize, x0: usize, y: usize) {
+        for i in 0..n {
+            assert_eq!(c(x0 + i, y), map[off + i], "index {}", off + i);
+        }
+    }
+
+    /// Assert `n` map entries starting at `off` are all `(x, y)`.
+    #[track_caller]
+    fn assert_same(map: &[Coordinate], off: usize, n: usize, x: usize, y: usize) {
+        for i in 0..n {
+            assert_eq!(c(x, y), map[off + i], "index {}", off + i);
+        }
+    }
+
+    // ----- tests -----
+
+    #[test]
+    fn page_plain_single_line() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, world");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello, world", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 12, r.state.cells);
+
+        // Verify our point map
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, r.out.len(), 0, 0);
+    }
+
+    #[test]
+    fn page_plain_single_line_soft_wrapped_unwrapped() {
+        let mut t = term(3, 5);
+        feed(&mut t, "hello!");
+        let page = single_page(&t);
+
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+        // Note: we don't test the trailing state, which may have bugs
+        // with unwrap...
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("hello!", r.out);
+
+        // Verify our point map
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 3, 0, 0);
+        assert_run(&r.map, 3, 3, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_single_wide_char() {
+        let mut t = term(80, 24);
+        feed(&mut t, "1A⚡");
+        let page = single_page(&t);
+
+        // Full string
+        {
+            let r = fmt_page(page, Options::PLAIN, |_| {});
+            assert_eq!("1A⚡", r.out);
+            assert_eq!(page.size.rows as usize, r.state.rows);
+            assert_eq!(page.size.cols as usize - 4, r.state.cells);
+
+            // Verify our point map
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 2, r.out.len() - 2, 2, 0);
+        }
+
+        // Wide only (from start)
+        {
+            let r = fmt_page(page, Options::PLAIN, |f| f.start_x = 2);
+            assert_eq!("⚡", r.out);
+            assert_eq!(page.size.rows as usize, r.state.rows);
+            assert_eq!(page.size.cols as usize - 4, r.state.cells);
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 0, r.out.len(), 2, 0);
+        }
+
+        // Wide only (from tail)
+        {
+            let r = fmt_page(page, Options::PLAIN, |f| f.start_x = 3);
+            assert_eq!("⚡", r.out);
+            assert_eq!(page.size.rows as usize, r.state.rows);
+            assert_eq!(page.size.cols as usize - 4, r.state.cells);
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 0, r.out.len(), 2, 0);
+        }
+    }
+
+    #[test]
+    fn page_plain_single_wide_char_soft_wrapped_unwrapped() {
+        let mut t = term(3, 24);
+        feed(&mut t, "1A⚡");
+        let page = single_page(&t);
+
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+
+        // Full string
+        {
+            let r = fmt_page(page, o.clone(), |_| {});
+            assert_eq!("1A⚡", r.out);
+            assert_eq!(page.size.rows as usize - 1, r.state.rows);
+            assert_eq!(page.size.cols as usize - 2, r.state.cells);
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 2, r.out.len() - 2, 0, 1);
+        }
+
+        // Wide only (from start)
+        {
+            let r = fmt_page(page, o.clone(), |f| f.start_x = 2);
+            assert_eq!("⚡", r.out);
+            assert_eq!(page.size.rows as usize - 1, r.state.rows);
+            assert_eq!(page.size.cols as usize - 2, r.state.cells);
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 0, r.out.len(), 0, 1);
+        }
+
+        // Wide only (from tail)
+        {
+            let r = fmt_page(page, o.clone(), |f| {
+                f.start_x = 1;
+                f.start_y = 1;
+            });
+            assert_eq!("⚡", r.out);
+            assert_eq!(page.size.rows as usize - 1, r.state.rows);
+            assert_eq!(page.size.cols as usize - 2, r.state.cells);
+            assert_eq!(r.out.len(), r.map.len());
+            assert_same(&r.map, 0, r.out.len(), 0, 1);
+        }
+    }
+
+    #[test]
+    fn page_plain_multiline() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+        assert_eq!(c(4, 0), r.map[5]); // \n
+        assert_run(&r.map, 6, 5, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_multiline_rectangle() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_x = 1;
+            f.end_x = Some(3);
+            f.rectangle = true;
+        });
+        assert_eq!("ell\norl", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(0, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 3, 1, 0);
+        assert_eq!(c(3, 0), r.map[3]); // \n
+        assert_run(&r.map, 4, 3, 1, 1);
+    }
+
+    #[test]
+    fn page_plain_multi_blank_lines() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\n\r\n\r\nworld");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello\n\n\nworld", r.out);
+        assert_eq!(page.size.rows as usize - 3, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+        assert_eq!(c(4, 0), r.map[5]); // \n after row 0
+        assert_eq!(c(0, 1), r.map[6]); // \n after blank row 1
+        assert_eq!(c(0, 2), r.map[7]); // \n after blank row 2
+        assert_run(&r.map, 8, 5, 0, 3);
+    }
+
+    #[test]
+    fn page_plain_trailing_blank_lines() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld\r\n\r\n");
+        let page = single_page(&t);
+
+        // Verify output. We expect there to be no trailing newlines because
+        // we can't differentiate trailing blank lines as being meaningful because
+        // the page formatter can't see the cursor position.
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+        assert_eq!(c(4, 0), r.map[5]); // \n
+        assert_run(&r.map, 6, 5, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_trailing_whitespace() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello   \r\nworld   ");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+        assert_eq!(c(4, 0), r.map[5]); // \n
+        assert_run(&r.map, 6, 5, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_trailing_whitespace_no_trim() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello   \r\nworld  ");
+        let page = single_page(&t);
+
+        let mut o = opts(Format::Plain);
+        o.trim = false;
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("hello   \nworld  ", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 7, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 8, 0, 0);
+        assert_eq!(c(7, 0), r.map[8]); // \n
+        assert_run(&r.map, 9, 7, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_with_prior_trailing_state_rows() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.trailing_state = Some(TrailingState { rows: 2, cells: 0 }));
+        assert_eq!("\n\nhello", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_eq!(c(0, 0), r.map[0]); // \n first blank row
+        assert_eq!(c(0, 1), r.map[1]); // \n second blank row
+        assert_run(&r.map, 2, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_with_prior_trailing_state_cells_no_wrapped_line() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.trailing_state = Some(TrailingState { rows: 0, cells: 3 }));
+        // Blank cells are reset when row is not a wrap continuation
+        assert_eq!("hello", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_with_prior_trailing_state_cells_with_wrap_continuation() {
+        let mut t = term(80, 24);
+        feed(&mut t, "world");
+        let page = single_page(&t);
+
+        // Surgically modify the first row to be a wrap continuation
+        // SAFETY: row 0 is within the page.
+        let row = unsafe { &mut *page.get_row(0) };
+        row.set_wrap_continuation(true);
+
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+        let r = fmt_page(page, o, |f| f.trailing_state = Some(TrailingState { rows: 0, cells: 3 }));
+        // Blank cells are preserved when row is a wrap continuation with unwrap enabled
+        assert_eq!("   world", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        // Verify point map - 3 spaces from prior trailing state + "world"
+        assert_eq!(r.out.len(), r.map.len());
+        // The 3 blank cells can't go back beyond (0,0) so they all map to (0,0)
+        assert_same(&r.map, 0, 3, 0, 0);
+        assert_run(&r.map, 3, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_soft_wrapped_without_unwrap() {
+        let mut t = term(10, 24);
+        feed(&mut t, "hello world test");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        // Without unwrap, wrapped lines show as separate lines
+        assert_eq!("hello worl\nd test", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 6, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 10, 0, 0);
+        assert_eq!(c(9, 0), r.map[10]); // \n
+        assert_run(&r.map, 11, 6, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_soft_wrapped_with_unwrap() {
+        let mut t = term(10, 24);
+        feed(&mut t, "hello world test");
+        let page = single_page(&t);
+
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+        let r = fmt_page(page, o, |_| {});
+        // With unwrap, wrapped lines are joined together
+        assert_eq!("hello world test", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 6, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 10, 0, 0);
+        assert_run(&r.map, 10, 6, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_soft_wrapped_3_lines_without_unwrap() {
+        let mut t = term(10, 24);
+        feed(&mut t, "hello world this is a test");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        // Without unwrap, wrapped lines show as separate lines
+        assert_eq!("hello worl\nd this is\na test", r.out);
+        assert_eq!(page.size.rows as usize - 2, r.state.rows);
+        assert_eq!(page.size.cols as usize - 6, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 10, 0, 0);
+        assert_eq!(c(9, 0), r.map[10]); // \n
+        assert_run(&r.map, 11, 9, 0, 1);
+        assert_eq!(c(8, 1), r.map[20]); // \n
+        assert_run(&r.map, 21, 6, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_soft_wrapped_3_lines_with_unwrap() {
+        let mut t = term(10, 24);
+        feed(&mut t, "hello world this is a test");
+        let page = single_page(&t);
+
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+        let r = fmt_page(page, o, |_| {});
+        // With unwrap, wrapped lines are joined together
+        assert_eq!("hello world this is a test", r.out);
+        assert_eq!(page.size.rows as usize - 2, r.state.rows);
+        assert_eq!(page.size.cols as usize - 6, r.state.cells);
+
+        // Verify point map - unwrapped text spans 3 rows
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 10, 0, 0);
+        assert_run(&r.map, 10, 10, 0, 1);
+        assert_run(&r.map, 20, 6, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_start_y_subset() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld\r\ntest");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.start_y = 1);
+        assert_eq!("world\ntest", r.out);
+        assert_eq!(page.size.rows as usize - 2, r.state.rows);
+        assert_eq!(page.size.cols as usize - 4, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 1);
+        assert_eq!(c(4, 1), r.map[5]); // \n
+        assert_run(&r.map, 6, 4, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_end_y_subset() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld\r\ntest");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.end_y = Some(1));
+        assert_eq!("hello\nworld", r.out);
+        assert_eq!(1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+        assert_eq!(c(4, 0), r.map[5]); // \n
+        assert_run(&r.map, 6, 5, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_start_y_and_end_y_range() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld\r\ntest\r\nfoo");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_y = 1;
+            f.end_y = Some(2);
+        });
+        assert_eq!("world\ntest", r.out);
+        assert_eq!(1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 4, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 1);
+        assert_eq!(c(4, 1), r.map[5]); // \n
+        assert_run(&r.map, 6, 4, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_start_y_out_of_bounds() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.start_y = 30);
+        assert_eq!("", r.out);
+        assert_eq!(0, r.state.rows);
+        assert_eq!(0, r.state.cells);
+
+        // Verify point map is empty
+        assert_eq!(0, r.map.len());
+    }
+
+    #[test]
+    fn page_plain_end_y_greater_than_rows() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.end_y = Some(30));
+        // Should clamp to page.size.rows and work normally
+        assert_eq!("hello", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_end_y_less_than_start_y() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_y = 5;
+            f.end_y = Some(2);
+        });
+        assert_eq!("", r.out);
+        assert_eq!(0, r.state.rows);
+        assert_eq!(0, r.state.cells);
+
+        // Verify point map is empty
+        assert_eq!(0, r.map.len());
+    }
+
+    #[test]
+    fn page_plain_start_x_on_first_row_only() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.start_x = 6);
+        assert_eq!("world", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 11, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 6, 0);
+    }
+
+    #[test]
+    fn page_plain_end_x_on_last_row_only() {
+        let mut t = term(80, 24);
+        feed(&mut t, "first line\r\nsecond line\r\nthird line");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.end_y = Some(2);
+            f.end_x = Some(4);
+        });
+        assert_eq!("first line\nsecond line\nthird", r.out);
+        assert_eq!(1, r.state.rows);
+        assert_eq!(0, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 10, 0, 0);
+        assert_eq!(c(9, 0), r.map[10]); // \n
+        assert_run(&r.map, 11, 11, 0, 1);
+        assert_eq!(c(10, 1), r.map[22]); // \n
+        assert_run(&r.map, 23, 5, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_start_x_and_end_x_multiline() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world\r\ntest case\r\nfoo bar");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_x = 6;
+            f.end_y = Some(2);
+            f.end_x = Some(2);
+        });
+        // First row: "world" (start_x=6 to end of row)
+        // Second row: "test case" (full row)
+        // Third row: "foo" (start to end_x=2, inclusive)
+        assert_eq!("world\ntest case\nfoo", r.out);
+        assert_eq!(1, r.state.rows);
+        assert_eq!(0, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 6, 0);
+        assert_eq!(c(10, 0), r.map[5]); // \n
+        assert_run(&r.map, 6, 9, 0, 1);
+        assert_eq!(c(8, 1), r.map[15]); // \n
+        assert_run(&r.map, 16, 3, 0, 2);
+    }
+
+    #[test]
+    fn page_plain_start_x_out_of_bounds() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.start_x = 100);
+        assert_eq!("", r.out);
+        assert_eq!(0, r.state.rows);
+        assert_eq!(0, r.state.cells);
+        assert_eq!(0, r.map.len());
+    }
+
+    #[test]
+    fn page_plain_end_x_greater_than_cols() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| f.end_x = Some(100));
+        assert_eq!("hello", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_end_x_less_than_start_x_single_row() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_x = 10;
+            f.end_y = Some(0);
+            f.end_x = Some(5);
+        });
+        assert_eq!("", r.out);
+        assert_eq!(0, r.state.rows);
+        assert_eq!(0, r.state.cells);
+        assert_eq!(0, r.map.len());
+    }
+
+    #[test]
+    fn page_plain_start_y_non_zero_ignores_trailing_state() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_y = 1;
+            f.trailing_state = Some(TrailingState { rows: 5, cells: 10 });
+        });
+        // Should NOT output the 5 newlines from trailing_state because start_y is non-zero
+        assert_eq!("world", r.out);
+        assert_eq!(page.size.rows as usize - 1, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 1);
+    }
+
+    #[test]
+    fn page_plain_start_x_non_zero_ignores_trailing_state() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_x = 6;
+            f.trailing_state = Some(TrailingState { rows: 2, cells: 8 });
+        });
+        // Should NOT output the 2 newlines or 8 spaces from trailing_state because start_x is non-zero
+        assert_eq!("world", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 11, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 6, 0);
+    }
+
+    #[test]
+    fn page_plain_start_y_and_start_x_zero_uses_trailing_state() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |f| {
+            f.start_y = 0;
+            f.start_x = 0;
+            f.trailing_state = Some(TrailingState { rows: 2, cells: 0 });
+        });
+        // SHOULD output the 2 newlines from trailing_state because both start_y and start_x are 0
+        assert_eq!("\n\nhello", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 5, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_eq!(c(0, 0), r.map[0]); // \n first blank row
+        assert_eq!(c(0, 1), r.map[1]); // \n second blank row
+        assert_run(&r.map, 2, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_plain_single_line_with_styling() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, \x1b[1mworld\x1b[0m");
+        let page = single_page(&t);
+
+        let r = fmt_page(page, Options::PLAIN, |_| {});
+        assert_eq!("hello, world", r.out);
+        assert_eq!(page.size.rows as usize, r.state.rows);
+        assert_eq!(page.size.cols as usize - 12, r.state.cells);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 12, 0, 0);
+    }
+
+    #[test]
+    fn page_vt_single_line_plain_text() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("hello", r.out);
+
+        assert_eq!(r.out.len(), r.map.len());
+        assert_run(&r.map, 0, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_vt_single_line_with_bold() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b[1mhello\x1b[0m");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b[0m\x1b[1mhello\x1b[0m", r.out);
+
+        // Verify point map - style sequences should point to first character they style
+        assert_eq!(r.out.len(), r.map.len());
+        // \x1b[0m = 4 bytes, \x1b[1m = 4 bytes, total 8 bytes of style sequences
+        // All style bytes should map to the first styled character at (0, 0)
+        assert_same(&r.map, 0, 8, 0, 0);
+        // Then "hello" maps to its respective positions
+        assert_run(&r.map, 8, 5, 0, 0);
+    }
+
+    #[test]
+    fn page_vt_multiple_styles() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b[1mhello \x1b[3mworld\x1b[0m");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b[0m\x1b[1mhello \x1b[0m\x1b[1m\x1b[3mworld\x1b[0m", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+    }
+
+    #[test]
+    fn page_vt_with_foreground_color() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b[31mred\x1b[0m");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b[0m\x1b[38;5;1mred\x1b[0m", r.out);
+
+        assert_eq!(r.out.len(), r.map.len());
+        // \x1b[0m = 4 bytes, \x1b[38;5;1m = 9 bytes, total 13 bytes of style sequences
+        assert_same(&r.map, 0, 13, 0, 0);
+        assert_run(&r.map, 13, 3, 0, 0);
+    }
+
+    #[test]
+    fn page_vt_with_background_and_foreground_colors() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+        let page = last_page(&t);
+
+        let mut o = opts(Format::Vt);
+        o.background = Some(color::Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        });
+        o.foreground = Some(color::Rgb {
+            r: 0xab,
+            g: 0xcd,
+            b: 0xef,
+        });
+        let r = fmt_page(page, o, |_| {});
+        // Should emit OSC 10 for foreground, OSC 11 for background, then the text
+        assert_eq!("\x1b]10;rgb:ab/cd/ef\x1b\\\x1b]11;rgb:12/34/56\x1b\\hello", r.out);
+    }
+
+    #[test]
+    fn page_vt_multi_line_with_styles() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b[1mfirst\x1b[0m\r\n\x1b[3msecond\x1b[0m");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        // Note: style is reset before newline to prevent background colors from
+        // bleeding to the next line's leading cells.
+        assert_eq!("\x1b[0m\x1b[1mfirst\x1b[0m\r\n\x1b[0m\x1b[3msecond\x1b[0m", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+    }
+
+    #[test]
+    fn page_vt_duplicate_style_not_emitted_twice() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b[1mhel\x1b[1mlo\x1b[0m");
+        let page = last_page(&t);
+
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b[0m\x1b[1mhello\x1b[0m", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+    }
+
+    fn node_ref<'a>(n: NodePtr) -> &'a crate::terminal::page_list::Node {
+        // SAFETY: test nodes are live while their terminal is alive.
+        unsafe { &*n.as_ptr() }
+    }
+
+    fn pin_at(node: NodePtr, x: usize, y: usize) -> Pin {
+        let mut p = Pin::new(node);
+        p.x = x as CellCountInt;
+        p.y = y as CellCountInt;
+        p
+    }
+
+    /// Format a page list with a pin map. `f` configures the formatter.
+    fn fmt_list(list: &PageList, opts: Options<'_>, f: impl FnOnce(&mut PageListFormatter<'_>)) -> (String, PinMapMap) {
+        let mut map = PinMapMap::EMPTY;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut formatter = PageListFormatter::init(list, opts);
+            f(&mut formatter);
+            formatter.pin_map = Some(PinMap { map: &mut map });
+            formatter.format(&mut buf).unwrap();
+        }
+        (String::from_utf8(buf).unwrap(), map)
+    }
+
+    /// Format a page list without a pin map.
+    fn fmt_list_nomap(list: &PageList, opts: Options<'_>, f: impl FnOnce(&mut PageListFormatter<'_>)) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut formatter = PageListFormatter::init(list, opts);
+        f(&mut formatter);
+        formatter.format(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    fn first_page_rows(t: &Terminal) -> usize {
+        node_ref(t.screens.active.pages.pages.first.unwrap()).capacity().rows as usize
+    }
+
+    fn trim_start_crlf(s: &str) -> &str {
+        s.trim_start_matches(['\r', '\n'])
+    }
+
+    #[test]
+    fn page_list_plain_single_line() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, world");
+
+        let (out, pin_map) = fmt_list(&t.screens.active.pages, Options::PLAIN, |_| {});
+        assert_eq!("hello, world", out);
+
+        // Verify pin map
+        assert_eq!(out.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..out.len() {
+            assert_eq!(pin_at(node, i, 0), pin_map.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn page_list_plain_spanning_two_pages() {
+        let mut t = term(80, 24);
+        let first_page_rows = first_page_rows(&t);
+
+        // Fill the first page almost completely
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "page one");
+
+        // Verify we're still on one page
+        assert!(t.screens.active.pages.pages.first == t.screens.active.pages.pages.last);
+
+        // Add one more newline to push content to a second page
+        feed(&mut t, "\r\n");
+        assert!(t.screens.active.pages.pages.first != t.screens.active.pages.pages.last);
+
+        // Write content on the second page
+        feed(&mut t, "page two");
+
+        // Format the entire PageList
+        let pages = &t.screens.active.pages;
+        let (full_output, pin_map) = fmt_list(pages, Options::PLAIN, |_| {});
+        let output = full_output.trim_start_matches('\n');
+        assert_eq!("page one\npage two", output);
+
+        // Verify pin map
+        assert_eq!(full_output.len(), pin_map.count());
+        let first_node = pages.pages.first.unwrap();
+        let last_node = pages.pages.last.unwrap();
+        let trimmed_count = full_output.len() - output.len();
+
+        // First part (trimmed blank lines) maps to first node
+        for i in 0..trimmed_count {
+            assert_eq!(first_node, pin_map.get(i).unwrap().node);
+        }
+
+        // "page one" (8 chars) maps to first node
+        for i in 0..8 {
+            let idx = trimmed_count + i;
+            assert_eq!(first_node, pin_map.get(idx).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(idx).unwrap().x);
+        }
+
+        // \n - maps to last node as it represents the transition to new page
+        assert_eq!(last_node, pin_map.get(trimmed_count + 8).unwrap().node);
+
+        // "page two" (8 chars) maps to last node
+        for i in 0..8 {
+            let idx = trimmed_count + 9 + i;
+            assert_eq!(last_node, pin_map.get(idx).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(idx).unwrap().x);
+        }
+    }
+
+    #[test]
+    fn page_list_soft_wrapped_line_spanning_two_pages_without_unwrap() {
+        let mut t = term(10, 3);
+        let first_page_rows = first_page_rows(&t);
+
+        // Fill the first page with soft-wrapped content
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "hello world test");
+
+        // Verify we're on two pages due to wrapping
+        let pages = &t.screens.active.pages;
+        assert!(pages.pages.first != pages.pages.last);
+
+        // Format without unwrap - should show line breaks
+        let (full_output, pin_map) = fmt_list(pages, Options::PLAIN, |_| {});
+        let output = full_output.trim_start_matches('\n');
+        assert_eq!("hello worl\nd test", output);
+
+        // Verify pin map
+        assert_eq!(full_output.len(), pin_map.count());
+        let first_node = pages.pages.first.unwrap();
+        let last_node = pages.pages.last.unwrap();
+        let trimmed_count = full_output.len() - output.len();
+
+        // First part (trimmed blank lines) maps to first node
+        for i in 0..trimmed_count {
+            assert_eq!(first_node, pin_map.get(i).unwrap().node);
+        }
+
+        // First line maps to first node
+        for i in 0..10 {
+            assert_eq!(first_node, pin_map.get(trimmed_count + i).unwrap().node);
+        }
+
+        // \n - maps to last node as it represents the transition to new page
+        assert_eq!(last_node, pin_map.get(trimmed_count + 10).unwrap().node);
+
+        // "d test" (6 chars) maps to last node
+        for i in 0..6 {
+            assert_eq!(last_node, pin_map.get(trimmed_count + 11 + i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn page_list_soft_wrapped_line_spanning_two_pages_with_unwrap() {
+        let mut t = term(10, 3);
+        let first_page_rows = first_page_rows(&t);
+
+        // Fill the first page with soft-wrapped content
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "hello world test");
+
+        // Verify we're on two pages due to wrapping
+        let pages = &t.screens.active.pages;
+        assert!(pages.pages.first != pages.pages.last);
+
+        // Format with unwrap - should join the wrapped lines
+        let mut o = opts(Format::Plain);
+        o.unwrap = true;
+        let (full_output, pin_map) = fmt_list(pages, o, |_| {});
+        let output = trim_start_crlf(&full_output);
+        assert_eq!("hello world test", output);
+
+        // Verify pin map
+        assert_eq!(full_output.len(), pin_map.count());
+        let first_node = pages.pages.first.unwrap();
+        let last_node = pages.pages.last.unwrap();
+        let trimmed_count = full_output.len() - output.len();
+
+        // First part (trimmed blank lines) maps to first node
+        for i in 0..trimmed_count {
+            assert_eq!(first_node, pin_map.get(i).unwrap().node);
+        }
+
+        // First line from first page
+        for i in 0..10 {
+            assert_eq!(first_node, pin_map.get(trimmed_count + i).unwrap().node);
+        }
+
+        // "d test" (6 chars) from last page
+        for i in 0..6 {
+            assert_eq!(last_node, pin_map.get(trimmed_count + 10 + i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn page_list_selection_ending_on_spacer_head() {
+        for across_pages in [false, true] {
+            let mut t = term(3, 3);
+            let first_node = t.screens.active.pages.pages.first.unwrap();
+            let y = if across_pages {
+                node_ref(first_node).capacity().rows as usize - 1
+            } else {
+                0
+            };
+            for _ in 0..y {
+                feed(&mut t, "\r\n");
+            }
+            feed(&mut t, "1A⚡Z");
+
+            let pages = &t.screens.active.pages;
+            let start = pin_at(first_node, 0, y);
+            let end = pin_at(first_node, 2, y);
+            let mut glyph = end.down(1).unwrap();
+            glyph.x = 0;
+            assert_eq!(across_pages, glyph.node != first_node);
+
+            let mut o = opts(Format::Plain);
+            o.unwrap = true;
+
+            for only_glyph in [true, false] {
+                let (output, pin_map) = fmt_list(pages, o.clone(), |f| {
+                    f.bottom_right = Some(end);
+                    f.top_left = Some(if only_glyph { end } else { start });
+                });
+                assert_eq!(if only_glyph { "⚡" } else { "1A⚡" }, output);
+                assert_eq!(output.len(), pin_map.count());
+                for i in output.len() - "⚡".len()..output.len() {
+                    assert_eq!(glyph, pin_map.get(i).unwrap());
+                }
+            }
+
+            // Neither wrapped output nor rectangle selections extend the end.
+            for (unwrap, rectangle) in [(false, false), (true, true)] {
+                let mut o2 = o.clone();
+                o2.unwrap = unwrap;
+                let out = fmt_list_nomap(pages, o2, |f| {
+                    f.bottom_right = Some(end);
+                    f.top_left = Some(start);
+                    f.rectangle = rectangle;
+                });
+                assert_eq!("1A", out);
+            }
+        }
+    }
+
+    #[test]
+    fn page_list_vt_spanning_two_pages() {
+        let mut t = term(80, 24);
+        let first_page_rows = first_page_rows(&t);
+
+        // Fill the first page almost completely
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "\x1b[1mpage one");
+
+        // Verify we're still on one page
+        assert!(t.screens.active.pages.pages.first == t.screens.active.pages.pages.last);
+
+        // Add one more newline to push content to a second page
+        feed(&mut t, "\r\n");
+        assert!(t.screens.active.pages.pages.first != t.screens.active.pages.pages.last);
+
+        // New content is still styled
+        feed(&mut t, "page two");
+
+        // Format the entire PageList with VT
+        let pages = &t.screens.active.pages;
+        let (full_output, pin_map) = fmt_list(pages, Options::VT, |_| {});
+        let output = trim_start_crlf(&full_output);
+        assert_eq!("\x1b[0m\x1b[1mpage one\x1b[0m\r\n\x1b[0m\x1b[1mpage two\x1b[0m", output);
+
+        // Verify pin map
+        assert_eq!(full_output.len(), pin_map.count());
+        let first_node = pages.pages.first.unwrap();
+        let last_node = pages.pages.last.unwrap();
+
+        // Just verify we have entries for both pages in the pin map
+        let mut first_count: usize = 0;
+        let mut last_count: usize = 0;
+        for byte_i in 0..pin_map.count() {
+            let pin = pin_map.get(byte_i).unwrap();
+            if pin.node == first_node {
+                first_count += 1;
+            }
+            if pin.node == last_node {
+                last_count += 1;
+            }
+        }
+        assert!(first_count > 0);
+        assert!(last_count > 0);
+    }
+
+    #[test]
+    fn page_list_plain_with_x_offset_on_single_page() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world\r\ntest case\r\nfoo bar");
+
+        let pages = &t.screens.active.pages;
+        let node = pages.pages.first.unwrap();
+
+        let (output, pin_map) = fmt_list(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pin_at(node, 6, 0));
+            f.bottom_right = Some(pin_at(node, 2, 2));
+        });
+        assert_eq!("world\ntest case\nfoo", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        for byte_i in 0..pin_map.count() {
+            assert_eq!(node, pin_map.get(byte_i).unwrap().node);
+        }
+
+        // "world" starts at x=6, y=0
+        for i in 0..5 {
+            assert_eq!((6 + i) as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(0, pin_map.get(i).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn page_list_plain_with_x_offset_spanning_two_pages() {
+        let mut t = term(80, 24);
+        let first_page_rows = first_page_rows(&t);
+
+        // Fill first page almost completely
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "hello world");
+
+        // Verify we're still on one page
+        assert!(t.screens.active.pages.pages.first == t.screens.active.pages.pages.last);
+
+        // Push to second page
+        feed(&mut t, "\r\n");
+        assert!(t.screens.active.pages.pages.first != t.screens.active.pages.pages.last);
+
+        feed(&mut t, "foo bar test");
+
+        let pages = &t.screens.active.pages;
+        let first_node = pages.pages.first.unwrap();
+        let last_node = pages.pages.last.unwrap();
+
+        let (full_output, pin_map) = fmt_list(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pin_at(first_node, 6, node_ref(first_node).rows() as usize - 1));
+            f.bottom_right = Some(pin_at(last_node, 2, 1));
+        });
+        let output = full_output.trim_start_matches('\n');
+        assert_eq!("world\nfoo", output);
+
+        // Verify pin map
+        assert_eq!(full_output.len(), pin_map.count());
+        let trimmed_count = full_output.len() - output.len();
+
+        // "world" (5 chars) from first page
+        for i in 0..5 {
+            let idx = trimmed_count + i;
+            assert_eq!(first_node, pin_map.get(idx).unwrap().node);
+            assert_eq!((6 + i) as CellCountInt, pin_map.get(idx).unwrap().x);
+        }
+
+        // \n - maps to last node as it represents the transition to new page
+        assert_eq!(last_node, pin_map.get(trimmed_count + 5).unwrap().node);
+
+        // "foo" (3 chars) from last page
+        for i in 0..3 {
+            let idx = trimmed_count + 6 + i;
+            assert_eq!(last_node, pin_map.get(idx).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(idx).unwrap().x);
+        }
+    }
+
+    #[test]
+    fn page_list_plain_with_start_x_only() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+
+        let pages = &t.screens.active.pages;
+        let node = pages.pages.first.unwrap();
+
+        let (output, pin_map) = fmt_list(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pin_at(node, 6, 0));
+        });
+        assert_eq!("world", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        for i in 0..5 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!((6 + i) as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(0, pin_map.get(i).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn page_list_plain_with_end_x_only() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world\r\ntest");
+
+        let pages = &t.screens.active.pages;
+        let node = pages.pages.first.unwrap();
+
+        let (output, pin_map) = fmt_list(pages, Options::PLAIN, |f| {
+            f.bottom_right = Some(pin_at(node, 2, 1));
+        });
+        assert_eq!("hello world\ntes", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+
+        // "hello world" (11 chars) on y=0
+        for i in 0..11 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(0, pin_map.get(i).unwrap().y);
+        }
+
+        // \n
+        assert_eq!(node, pin_map.get(11).unwrap().node);
+
+        // "tes" (3 chars) on y=1
+        for i in 0..3 {
+            assert_eq!(node, pin_map.get(12 + i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(12 + i).unwrap().x);
+            assert_eq!(1, pin_map.get(12 + i).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn page_list_vt_without_trim_keeps_trailing_blank_rows() {
+        let mut t = term(10, 6);
+        feed(&mut t, "one\r\ntwo");
+
+        let pages = &t.screens.active.pages;
+        let mut o = opts(Format::Vt);
+        o.trim = false;
+        let (output, pin_map) = fmt_list(pages, o, |_| {});
+
+        // Six rows, two with text, so five newlines.
+        assert_eq!("one\r\ntwo\r\n\r\n\r\n\r\n", output);
+
+        // Each newline maps to the row it ends: the first to the end of
+        // the text, the others to the start of a blank row.
+        assert_eq!(output.len(), pin_map.count());
+        let trailing = "one\r\ntwo".len();
+        for i in 0..4 {
+            let pin = pin_map.get(trailing + i * 2).unwrap();
+            assert_eq!(pin, pin_map.get(trailing + i * 2 + 1).unwrap());
+            assert_eq!(if i == 0 { 2 } else { 0 }, pin.x);
+            assert_eq!((1 + i) as CellCountInt, pin.y);
+        }
+
+        // Trimmed output and other formats still drop them.
+        let trimmed = fmt_list_nomap(pages, Options::VT, |_| {});
+        assert_eq!("one\r\ntwo", trimmed);
+
+        let mut po = opts(Format::Plain);
+        po.trim = false;
+        let plain = fmt_list_nomap(pages, po, |_| {});
+        assert_eq!("one\ntwo", plain);
+    }
+
+    #[test]
+    fn page_list_vt_without_trim_keeps_a_blank_screen() {
+        let t = term(10, 4);
+        let mut o = opts(Format::Vt);
+        o.trim = false;
+        let out = fmt_list_nomap(&t.screens.active.pages, o, |_| {});
+        assert_eq!("\r\n\r\n\r\n", out);
+    }
+
+    #[test]
+    fn page_list_vt_without_trim_keeps_trailing_blank_rows_across_pages() {
+        let mut t = term(10, 3);
+
+        // Text on the last row of the first page, then two blank rows on
+        // the next one.
+        let first_page_rows = first_page_rows(&t);
+        for _ in 0..first_page_rows - 1 {
+            feed(&mut t, "\r\n");
+        }
+        feed(&mut t, "x\r\n\r\n");
+        let pages = &t.screens.active.pages;
+        assert!(pages.pages.first != pages.pages.last);
+
+        let mut o = opts(Format::Vt);
+        o.trim = false;
+        let (output, pin_map) = fmt_list(pages, o, |_| {});
+        assert!(output.ends_with("x\r\n\r\n"));
+        assert_eq!(output.len(), pin_map.count());
+
+        // The first newline ends the row with text on the first page, the
+        // second the first blank row on the next page.
+        let first = pin_map.get(output.len() - 4).unwrap();
+        assert_eq!(pages.pages.first.unwrap(), first.node);
+        assert_eq!(first_page_rows - 1, first.y as usize);
+        let second = pin_map.get(output.len() - 2).unwrap();
+        assert_eq!(pages.pages.last.unwrap(), second.node);
+        assert_eq!(0, second.x);
+    }
+
+    fn scr(x: usize, y: usize) -> Point {
+        Point::Screen(c(x, y))
+    }
+
+    #[test]
+    fn page_list_plain_rectangle_basic() {
+        let mut t = term(30, 5);
+        feed(&mut t, "Lorem ipsum dolor\r\n");
+        feed(&mut t, "sit amet, consectetur\r\n");
+        feed(&mut t, "adipiscing elit, sed do\r\n");
+        feed(&mut t, "eiusmod tempor incididunt\r\n");
+        feed(&mut t, "ut labore et dolore");
+
+        let pages = &t.screens.active.pages;
+        let out = fmt_list_nomap(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pages.pin(scr(2, 1)).unwrap());
+            f.bottom_right = Some(pages.pin(scr(6, 3)).unwrap());
+            f.rectangle = true;
+        });
+
+        let expected = "t ame\nipisc\nusmod";
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    fn page_list_plain_rectangle_with_eol() {
+        let mut t = term(30, 5);
+        feed(&mut t, "Lorem ipsum dolor\r\n");
+        feed(&mut t, "sit amet, consectetur\r\n");
+        feed(&mut t, "adipiscing elit, sed do\r\n");
+        feed(&mut t, "eiusmod tempor incididunt\r\n");
+        feed(&mut t, "ut labore et dolore");
+
+        let pages = &t.screens.active.pages;
+        let out = fmt_list_nomap(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pages.pin(scr(12, 0)).unwrap());
+            f.bottom_right = Some(pages.pin(scr(26, 4)).unwrap());
+            f.rectangle = true;
+        });
+
+        let expected = "dolor\nnsectetur\nlit, sed do\nor incididunt\n dolore";
+        assert_eq!(expected, out);
+    }
+
+    #[test]
+    fn page_list_plain_rectangle_more_complex_with_breaks() {
+        let mut t = term(30, 8);
+        feed(&mut t, "Lorem ipsum dolor\r\n");
+        feed(&mut t, "sit amet, consectetur\r\n");
+        feed(&mut t, "adipiscing elit, sed do\r\n");
+        feed(&mut t, "eiusmod tempor incididunt\r\n");
+        feed(&mut t, "ut labore et dolore\r\n");
+        feed(&mut t, "\r\n");
+        feed(&mut t, "magna aliqua. Ut enim\r\n");
+        feed(&mut t, "ad minim veniam, quis");
+
+        let pages = &t.screens.active.pages;
+        let out = fmt_list_nomap(pages, Options::PLAIN, |f| {
+            f.top_left = Some(pages.pin(scr(11, 2)).unwrap());
+            f.bottom_right = Some(pages.pin(scr(26, 7)).unwrap());
+            f.rectangle = true;
+        });
+
+        let expected = "elit, sed do\npor incididunt\nt dolore\n\na. Ut enim\nniam, quis";
+        assert_eq!(expected, out);
+    }
+
+    // @@TESTS-PART-2@@
 }
