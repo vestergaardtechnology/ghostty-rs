@@ -458,6 +458,19 @@ pub struct FrameState {
     pub custom_shader_state: Option<CustomShaderState>,
 }
 
+/// A 1x1 atlas description for sizing a texture (Zig: an `Atlas`
+/// literal with undefined data; `Atlas.init` cannot make one this small).
+fn empty_atlas(format: font::atlas::Format) -> font::Atlas {
+    font::Atlas {
+        data: vec![0; format.depth() as usize],
+        size: 1,
+        nodes: Vec::new(),
+        format,
+        modified: std::sync::atomic::AtomicUsize::new(0),
+        resized: std::sync::atomic::AtomicUsize::new(0),
+    }
+}
+
 impl FrameState {
     pub fn init<G: GraphicsApi>(api: &G, custom_shaders: bool) -> Result<FrameState, Error> {
         // Uniform buffer contains exactly 1 uniform struct. The
@@ -509,9 +522,7 @@ impl FrameState {
         //
         // As with the buffers above, we start these off as small
         // as possible since they'll inevitably be resized anyway.
-        let grayscale = match font::Atlas::init(1, font::atlas::Format::Grayscale)
-            .map_err(Error::from)
-            .and_then(|a| api.init_atlas_texture(&a))
+        let grayscale = match api.init_atlas_texture(&empty_atlas(font::atlas::Format::Grayscale))
         {
             Ok(v) => v,
             Err(e) => {
@@ -519,9 +530,7 @@ impl FrameState {
                 return Err(e);
             }
         };
-        let color = match font::Atlas::init(1, font::atlas::Format::Bgra)
-            .map_err(Error::from)
-            .and_then(|a| api.init_atlas_texture(&a))
+        let color = match api.init_atlas_texture(&empty_atlas(font::atlas::Format::Bgra))
         {
             Ok(v) => v,
             Err(e) => {
@@ -3989,5 +3998,197 @@ pub(crate) mod test_util {
         .unwrap();
 
         Box::into_raw(Box::new(SharedGrid::init(CodepointResolver::new(c)).unwrap()))
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    // Not a Zig test: generic.zig has none. This renders a small terminal
+    // end to end with the real OpenGL backend into an offscreen target on
+    // a surfaceless EGL context and checks the pixels read back.
+    use std::ptr::NonNull;
+
+    use super::*;
+    use crate::renderer::opengl::device::{self, test_context::egl_lock, Device};
+    use crate::apprt::surface::standin::AppQueue;
+    use crate::renderer::opengl::test_util::test_options_with_mailbox;
+    use crate::renderer::opengl::{ExportedFrame, Memory, OpenGL};
+    use crate::terminal::render::test_vt::VtStreamExt;
+    use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
+
+    fn save_png(path: &str, width: u32, height: u32, rgba: &[u8]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().unwrap();
+        w.write_image_data(rgba).unwrap();
+    }
+
+    /// The RGBA pixel at (x, y) with y = 0 at the top of the screen.
+    /// OpenGL reads rows bottom-up.
+    fn pixel(m: &Memory, x: u32, y: u32) -> [u8; 4] {
+        let row = m.height - 1 - y;
+        let i = ((row * m.width + x) * 4) as usize;
+        [m.pixels[i], m.pixels[i + 1], m.pixels[i + 2], m.pixels[i + 3]]
+    }
+
+    /// Count the pixels in a rectangle of cells of one row matching `pred`.
+    fn count_in_cells(m: &Memory, size: Size, cols: std::ops::Range<u32>, row: u32, pred: impl Fn([u8; 4]) -> bool) -> usize {
+        let mut n = 0;
+        let y0 = size.padding.top + row * size.cell.height;
+        let x0 = size.padding.left + cols.start * size.cell.width;
+        let x1 = size.padding.left + cols.end * size.cell.width;
+        for y in y0..y0 + size.cell.height {
+            for x in x0..x1 {
+                if pred(pixel(m, x, y)) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn render_terminal_end_to_end_opengl() {
+        let _guard = egl_lock();
+        let mut device = Device::init(device::Options::default()).unwrap();
+        let app = apprt::App::default();
+        let queue = AppQueue::create();
+        let mut opts = test_options_with_mailbox(&mut *device, &app, &*queue);
+
+        // SAFETY: the test grid is leaked and lives forever.
+        let metrics = unsafe { (*opts.font_grid).metrics };
+        let cols: u16 = 24;
+        let rows: u16 = 4;
+        let cell = CellSize {
+            width: metrics.cell_width,
+            height: metrics.cell_height,
+        };
+        let padding = Padding {
+            top: 4,
+            bottom: 4,
+            left: 4,
+            right: 4,
+        };
+        let size = Size {
+            screen: ScreenSize {
+                width: cols as u32 * cell.width + padding.left + padding.right,
+                height: rows as u32 * cell.height + padding.top + padding.bottom,
+            },
+            cell,
+            padding,
+        };
+        opts.size = size;
+        opts.config.background = Rgb { r: 0x10, g: 0x10, b: 0x18 };
+        opts.config.foreground = Rgb { r: 0xFF, g: 0xFF, b: 0xFF };
+
+        let mut renderer = Renderer::<OpenGL>::init(opts).unwrap();
+        renderer.thread_enter(std::ptr::null_mut()).unwrap();
+        // Read frames back through CPU memory rather than a DMABUF.
+        renderer.set_presentation_health(Health::Unhealthy);
+        renderer.set_screen_size(size);
+
+        // A terminal with plain text, a red word, a black-on-green word
+        // and the cursor after a prompt.
+        let mut t = Terminal::init(TerminalOptions::new(cols, rows)).unwrap();
+        {
+            let mut s = t.vt_stream();
+            s.next_slice(b"Hello, world!\r\n\x1b[31mred\x1b[0m \x1b[30;42mgreen\x1b[0m\r\n$ ");
+            s.deinit();
+        }
+        let mut mutex = Mutex::new();
+        let state = State::new(NonNull::from(&mut mutex), NonNull::from(&mut t));
+
+        renderer.update_frame(&state, true).unwrap();
+
+        // The CPU cells: one glyph per visible character, a cursor, and
+        // backgrounds for the green cells.
+        assert_eq!(cols, renderer.cells.size.columns);
+        assert_eq!(rows, renderer.cells.size.rows);
+        let row0 = &renderer.cells.fg_rows[1];
+        assert_eq!("Hello,world!".len(), row0.len());
+        assert!(row0.iter().all(|c| c.color == [0xFF, 0xFF, 0xFF, 0xFF]));
+        let row1 = &renderer.cells.fg_rows[2];
+        assert_eq!("redgreen".len(), row1.len());
+        let cursor = renderer.cells.get_cursor_glyph().expect("cursor glyph");
+        assert_eq!([2, 2], cursor.grid_pos);
+        assert_eq!([2, 2], renderer.uniforms.cursor_pos);
+        // "green" has an explicit (palette 2) background, the rest does not.
+        assert_eq!(0xFF, renderer.cells.bg_cell(1, 4)[3]);
+        assert_eq!(0, renderer.cells.bg_cell(1, 0)[3]);
+        assert!(renderer.cells_rebuilt);
+
+        renderer.draw_frame(true).unwrap();
+        assert_eq!(Health::Healthy, renderer.health.load());
+        assert!(!renderer.cells_rebuilt);
+
+        let frame = renderer.take_frame().expect("exported frame");
+        let ExportedFrame::Memory(m) = &frame else {
+            panic!("expected a CPU memory frame");
+        };
+        assert_eq!(size.screen.width, m.width);
+        assert_eq!(size.screen.height, m.height);
+
+        // Save the frame so it can be looked at.
+        if let Ok(path) = std::env::var("GHOSTTY_RENDER_SMOKE_PNG") {
+            let mut top_down = Vec::with_capacity(m.pixels.len());
+            for y in 0..m.height {
+                for x in 0..m.width {
+                    top_down.extend_from_slice(&pixel(m, x, y));
+                }
+            }
+            save_png(&path, m.width, m.height, &top_down);
+        }
+
+        let is_bg = |p: [u8; 4]| p[0] <= 0x20 && p[1] <= 0x20 && p[2] <= 0x28;
+        let is_bright = |p: [u8; 4]| p[0] > 0x80 && p[1] > 0x80 && p[2] > 0x80;
+
+        // The padding and the empty cells are background colored and opaque.
+        let p = pixel(m, 1, 1);
+        assert!(is_bg(p), "padding pixel {p:?}");
+        assert_eq!(0xFF, p[3]);
+        assert_eq!(0, count_in_cells(m, size, 20..24, 0, |p| !is_bg(p)));
+
+        // "Hello, world!" drew bright glyph pixels in every non-space cell.
+        for x in (0..13).filter(|&x| x != 6) {
+            let n = count_in_cells(m, size, x..x + 1, 0, is_bright);
+            assert!(n > 0, "no glyph pixels in cell ({x}, 0)");
+        }
+        // The space between them has none.
+        assert_eq!(0, count_in_cells(m, size, 6..7, 0, |p| !is_bg(p)));
+
+        // "red" is drawn in palette red.
+        let palette = renderer.terminal_state.colors.palette;
+        let red = count_in_cells(m, size, 0..3, 1, |p| {
+            p[0] as i32 > p[1] as i32 + 0x30 && p[0] as i32 > p[2] as i32 + 0x30
+        });
+        assert!(red > 0, "no red glyph pixels");
+
+        // "green" has a palette green background with dark glyphs on it.
+        let green = palette[2];
+        let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 8;
+        let green_bg = count_in_cells(m, size, 4..9, 1, |p| {
+            near(p[0], green.r) && near(p[1], green.g) && near(p[2], green.b)
+        });
+        let cell_area = (5 * size.cell.width * size.cell.height) as usize;
+        assert!(green_bg > cell_area / 2, "green background {green_bg}/{cell_area}");
+        let dark_on_green = count_in_cells(m, size, 4..9, 1, |p| p[1] < 0x40);
+        assert!(dark_on_green > 0, "no dark glyph pixels on green");
+
+        // The block cursor at (2, 2) fills most of its cell with the
+        // foreground color.
+        let cursor_px = count_in_cells(m, size, 2..3, 2, is_bright);
+        let one_cell = (size.cell.width * size.cell.height) as usize;
+        assert!(cursor_px > one_cell / 2, "cursor pixels {cursor_px}/{one_cell}");
+
+        // A second draw without changes is skipped.
+        renderer.draw_frame(false).unwrap();
+        assert!(renderer.take_frame().is_none());
+
+        drop(frame);
+        renderer.thread_exit();
+        renderer.deinit();
+        device.deinit();
     }
 }

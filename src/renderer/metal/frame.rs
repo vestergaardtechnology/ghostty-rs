@@ -1,7 +1,6 @@
 //! Port of `src/renderer/metal/Frame.zig`.
 //!
-//! STATUS: ported (macOS only; type-checked, not run; against the
-//! stand-in generic renderer, TODO(port-dedupe))
+//! STATUS: ported (macOS only; type-checked, not run)
 //!
 //! Wrapper for handling render passes.
 
