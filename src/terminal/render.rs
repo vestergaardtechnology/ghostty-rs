@@ -4791,4 +4791,1358 @@ mod tests {
         assert_eq!(ImageLayer::AboveText, image_layer_from_z(0));
         assert_eq!(ImageLayer::BelowBackground, image_layer_from_z(i32::MIN));
     }
+
+    #[test]
+    fn fixed_row_index_of_pin_walks_pages_above_and_below() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut t = term_scrollback(10, 5, None);
+        t.width_px = 100;
+        t.height_px = 50;
+        let first = t.screens.active.pages.pages.first.unwrap();
+        // SAFETY: the nodes below are live while `t` is.
+        let page_rows: isize = unsafe { first.as_ref().capacity().rows } as isize;
+
+        // Three pages, with the viewport on the middle one, three rows down.
+        t.set_cursor_pos(5, 1);
+        for _ in 0..(2 * page_rows + 10) {
+            t.index().unwrap();
+        }
+        let middle = unsafe { first.as_ref().next.unwrap() };
+        let last = unsafe { middle.as_ref().next.unwrap() };
+        t.scroll_viewport(ScrollViewport::Top);
+        t.scroll_viewport(ScrollViewport::Delta(page_rows + 3));
+        assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == middle);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        // Deviation: the Zig test gets the chunk table from the update,
+        // where a fixed placement makes `placeRoots` build it. Until the
+        // image storage holds placements, build it from the captured row
+        // pins exactly like `place_roots` does.
+        let range = state.row_data_range();
+        let captured_pins = &state.row_data.pin[range.start..range.end];
+        let mut chunks: Vec<KittyChunk> = Vec::new();
+        for (i, pin) in captured_pins.iter().enumerate() {
+            if i > 0 && captured_pins[i - 1].node == pin.node {
+                continue;
+            }
+            chunks.push(KittyChunk {
+                node: pin.node,
+                start: pin.y,
+                index: i as isize,
+            });
+        }
+        assert_eq!(1, chunks.len());
+        assert_eq!(middle, chunks[0].node);
+        assert_eq!(0, chunks[0].index);
+        assert_eq!(3, chunks[0].start);
+        let captured: isize = 5;
+        let pin = |node: NodePtr, y: isize| Pin {
+            node,
+            y: y as CellCountInt,
+            x: 0,
+            garbage: false,
+        };
+        let row_index = kitty::row_index_of_pin;
+
+        // On a captured page, including its rows outside the captured rows.
+        assert_eq!(Some(0), row_index(&chunks, pin(middle, 3), captured, 1, 0));
+        assert_eq!(Some(-3), row_index(&chunks, pin(middle, 0), captured, 1, 0));
+        assert_eq!(Some(7), row_index(&chunks, pin(middle, 10), captured, 1, 0));
+
+        // Above: the last row of the first page is index -4. It is found when
+        // the placement can reach index 0, through its height or a positive
+        // offset, and not otherwise.
+        let above = pin(first, page_rows - 1);
+        assert_eq!(Some(-4), row_index(&chunks, above, captured, 5, 0));
+        assert_eq!(Some(-4), row_index(&chunks, above, captured, 1, 4));
+        assert_eq!(None, row_index(&chunks, above, captured, 4, 0));
+        assert_eq!(None, row_index(&chunks, above, captured, 4, -2));
+        let first_top = pin(first, 0);
+        assert_eq!(
+            Some(-3 - page_rows),
+            row_index(&chunks, first_top, captured, (page_rows + 4) as u32, 0)
+        );
+
+        // Below: the first row of the last page comes right after the middle
+        // page's rows. Only a negative offset that moves it up into the
+        // captured rows finds it.
+        let below_index: isize = -3 + unsafe { middle.as_ref().rows() } as isize;
+        let below = pin(last, 0);
+        assert_eq!(None, row_index(&chunks, below, captured, 100, 0));
+        assert_eq!(
+            Some(below_index),
+            row_index(&chunks, below, captured, 1, (captured - 1 - below_index) as i32)
+        );
+        assert_eq!(None, row_index(&chunks, below, captured, 1, (captured - below_index) as i32));
+        let below2 = pin(last, 2);
+        assert_eq!(
+            Some(below_index + 2),
+            row_index(&chunks, below2, captured, 1, (-(below_index + 2)) as i32)
+        );
+    }
+}
+
+/// The Kitty image tests that need a populated image storage
+/// (`ImageStorage.addImage`/`addPlacement`/`imageById`/`placements`/
+/// `delete`, `Placement.gridSize`/...). They are ported against the
+/// snake_case transliteration of that API.
+///
+/// TODO(port-dedupe): enable once `kitty::graphics_storage` stores images
+/// and placements (graphics_image/graphics_storage ports), and replace the
+/// render-local `PlacementKey` stand-in with the storage's.
+#[cfg(any())]
+mod kitty_image_tests {
+    use super::*;
+    use crate::terminal::kitty::graphics_image::{Image, ImageData, Format};
+    use crate::terminal::kitty::graphics_storage::{Location, Placement as StoragePlacement, Relative, DeleteCommand};
+    use crate::terminal::page_list::PageList;
+    use crate::terminal::screen_set::ScreenPtr;
+    use crate::terminal::sgr;
+    use crate::terminal::terminal::{Options as TerminalOptions, ScrollViewport, SwitchScreenMode};
+
+    fn term(cols: CellCountInt, rows: CellCountInt) -> Terminal {
+        Terminal::init(TerminalOptions::new(cols, rows)).unwrap()
+    }
+
+    fn term_unlimited(cols: CellCountInt, rows: CellCountInt) -> Terminal {
+        Terminal::init(TerminalOptions {
+            max_scrollback_bytes: None,
+            ..TerminalOptions::new(cols, rows)
+        })
+        .unwrap()
+    }
+
+    fn key(image_id: u32, id: u32) -> PlacementKey {
+        PlacementKey {
+            image_id,
+            placement_id: PlacementId {
+                tag: PlacementIdTag::External,
+                id,
+            },
+        }
+    }
+
+    /// Adds a complete `w` by `h` RGB image with the given ID.
+    fn add_image(t: &mut Terminal, image_id: u32, w: u32, h: u32) {
+        let mut s: ScreenPtr = t.screens.active;
+        let s = &mut *s;
+        s.kitty_images
+            .add_image(
+                &mut s.pages,
+                Image {
+                    id: image_id,
+                    width: w,
+                    height: h,
+                    format: Format::Rgb,
+                    data: ImageData::Complete(vec![0u8; (w * h * 3) as usize]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn add_placement(t: &mut Terminal, image_id: u32, placement_id: u32, p: StoragePlacement) {
+        let mut s: ScreenPtr = t.screens.active;
+        let s = &mut *s;
+        s.kitty_images.add_placement(&mut s.pages, image_id, placement_id, p).unwrap();
+    }
+
+    fn add_virtual(t: &mut Terminal, image_id: u32, placement_id: u32, columns: u32, rows: u32) {
+        add_placement(
+            t,
+            image_id,
+            placement_id,
+            StoragePlacement {
+                location: Location::Virtual,
+                columns,
+                rows,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn placeholder_colors(t: &mut Terminal, fg: u8, underline: u8) {
+        t.set_attribute(sgr::Attribute::Fg256(fg)).unwrap();
+        t.set_attribute(sgr::Attribute::UnderlineColor256(underline)).unwrap();
+    }
+
+    /// Adds a complete 1 by 1 pixel Kitty image with the given ID to the
+    /// active screen, for the `fixed:` tests.
+    fn test_fixed_image(t: &mut Terminal, image_id: u32) {
+        add_image(t, image_id, 1, 1);
+    }
+
+    /// Adds a fixed Kitty placement of image 1 at a cell of the active area,
+    /// for the `fixed:` tests.
+    fn test_fixed_placement(
+        t: &mut Terminal,
+        placement_id: u32,
+        x: CellCountInt,
+        y: CellCountInt,
+        columns: u32,
+        rows: u32,
+    ) {
+        let mut s: ScreenPtr = t.screens.active;
+        let pin = s
+            .pages
+            .pin(point::Point::Active(point::Coordinate { x, y: y as u32 }))
+            .unwrap();
+        let pin = s.pages.track_pin(pin).unwrap();
+        add_placement(
+            t,
+            1,
+            placement_id,
+            StoragePlacement {
+                location: Location::Pin(pin),
+                columns,
+                rows,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Adds a Kitty placement of image 1 relative to another placement of
+    /// image 1, for the `fixed: relative` tests.
+    fn test_relative_placement(
+        t: &mut Terminal,
+        placement_id: u32,
+        parent_id: u32,
+        horizontal_offset: i32,
+        vertical_offset: i32,
+        columns: u32,
+        rows: u32,
+    ) {
+        add_placement(
+            t,
+            1,
+            placement_id,
+            StoragePlacement {
+                location: Location::Relative(Relative {
+                    parent: key(1, parent_id),
+                    horizontal_offset,
+                    vertical_offset,
+                }),
+                columns,
+                rows,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Returns the only image placement of a render state, failing the test
+    /// if there isn't exactly one.
+    fn test_only_placement(state: &RenderState) -> ImagePlacement {
+        let mut it = state.image_placement_iterator();
+        let p = it.next().expect("TestExpectedPlacement");
+        assert!(it.next().is_none(), "TestUnexpectedPlacement");
+        p
+    }
+
+    /// Returns the image placement of a render state with the given
+    /// placement ID, failing the test if there isn't exactly one.
+    fn test_placement_by_id(state: &RenderState, placement_id: u32) -> ImagePlacement {
+        let mut result: Option<ImagePlacement> = None;
+        for p in state.image_placement_iterator() {
+            if p.protocol.kitty().placement_id != placement_id {
+                continue;
+            }
+            assert!(result.is_none(), "TestUnexpectedPlacement");
+            result = Some(p);
+        }
+        result.expect("TestExpectedPlacement")
+    }
+
+    /// Returns the number of placements the iterator returns.
+    fn test_placement_count(state: &RenderState) -> usize {
+        state.image_placement_iterator().count()
+    }
+
+    fn first_page_rows(t: &Terminal) -> usize {
+        // SAFETY: the first node is live.
+        unsafe { t.screens.active.pages.pages.first.unwrap().as_ref().capacity().rows as usize }
+    }
+
+    fn mark_active_row_dirty(t: &Terminal, y: u32) {
+        t.screens
+            .active
+            .pages
+            .pin(point::Point::Active(point::Coordinate { x: 0, y }))
+            .unwrap()
+            .mark_dirty();
+    }
+
+    #[test]
+    fn placeholders_resolved_virtual_placements() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        add_image(&mut t, 1, 10, 10);
+        add_virtual(&mut t, 1, 1, 2, 2);
+        placeholder_colors(&mut t, 1, 1);
+        t.screens.active.cursor_absolute(3, 1);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}").unwrap();
+        t.screens.active.cursor_absolute(3, 2);
+        t.print_string("\u{10EEEE}\u{030D}\u{0305}\u{10EEEE}").unwrap();
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        // Each run draws half of the image, like the renderer would.
+        let mut it = state.image_placement_iterator();
+        for y in 0..2u32 {
+            let p = it.next().unwrap();
+            assert_eq!(KittyPlacementKind::Virtual, p.protocol.kitty().kind);
+            assert_eq!(1, p.image_id);
+            assert_eq!(1, p.protocol.kitty().placement_id);
+            assert_eq!(3, p.x);
+            assert_eq!((y + 1) as i32, p.y);
+            assert_eq!(2, p.cols);
+            assert_eq!(1, p.rows);
+            assert_eq!(20, p.width);
+            assert_eq!(10, p.height);
+            assert_eq!(0, p.source_x);
+            assert_eq!(y * 5, p.source_y);
+            assert_eq!(10, p.source_width);
+            assert_eq!(5, p.source_height);
+            assert_eq!(-1, p.z);
+            assert_eq!(ImageLayer::BelowText, p.layer);
+            assert_eq!(ImageProtocol::Kitty, p.protocol.tag());
+            assert_eq!(
+                t.screens.active.kitty_images.image_by_id(1).unwrap().generation,
+                p.image_generation
+            );
+        }
+        assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn placeholders_only_dirty_rows_are_resolved_again() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        add_image(&mut t, 1, 10, 10);
+        add_virtual(&mut t, 1, 1, 2, 2);
+        placeholder_colors(&mut t, 1, 1);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\r\n").unwrap();
+        t.print_string("\u{10EEEE}\u{030D}\u{0305}\u{10EEEE}").unwrap();
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        // Overwrite the geometry with a marker value, so we can tell when a
+        // run is looked up again.
+        let poison = 12345;
+        for runs in &mut state.row_data.placeholders[0..2] {
+            assert_eq!(1, runs.len());
+            assert_eq!(PlaceholderState::Visible, runs[0].state);
+            runs[0].geometry.width = poison;
+        }
+
+        // An update with no changes looks up nothing.
+        state.update(&mut t);
+        assert_eq!(poison, state.row_data.placeholders[0][0].geometry.width);
+        assert_eq!(poison, state.row_data.placeholders[1][0].geometry.width);
+
+        // Only the dirty row is rebuilt and looked up again.
+        mark_active_row_dirty(&t, 1);
+        state.update(&mut t);
+        assert_eq!(poison, state.row_data.placeholders[0][0].geometry.width);
+        assert_eq!(20, state.row_data.placeholders[1][0].geometry.width);
+
+        // A change to the image storage looks up every row again.
+        t.screens.active.kitty_images.mark_mutated();
+        state.update(&mut t);
+        assert_eq!(20, state.row_data.placeholders[0][0].geometry.width);
+
+        // So does a cell size change. With wider cells, the image is
+        // centered in the placement grid.
+        state.row_data.placeholders[0][0].geometry.width = poison;
+        t.width_px = 200;
+        state.update(&mut t);
+        assert_eq!(20, state.row_data.placeholders[0][0].geometry.width);
+        assert_eq!(10, state.row_data.placeholders[0][0].geometry.offset_x);
+    }
+
+    #[test]
+    fn placeholders_relative_placement_rooted_at_a_virtual_placement() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        add_image(&mut t, 1, 10, 10);
+        add_virtual(&mut t, 1, 1, 2, 2);
+        placeholder_colors(&mut t, 1, 1);
+
+        // Placeholder cells at (3, 1) and (1, 2). Relative placements
+        // attached to the virtual placement are positioned from the smallest
+        // column and row, (1, 1), even though no cell is there.
+        t.screens.active.cursor_absolute(3, 1);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}").unwrap();
+        t.screens.active.cursor_absolute(1, 2);
+        t.print_string("\u{10EEEE}\u{030D}\u{0305}").unwrap();
+
+        add_placement(
+            &mut t,
+            1,
+            2,
+            StoragePlacement {
+                location: Location::Relative(Relative {
+                    parent: key(1, 1),
+                    horizontal_offset: 1,
+                    vertical_offset: 2,
+                }),
+                columns: 1,
+                rows: 1,
+                z: 5,
+                ..Default::default()
+            },
+        );
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let mut it = state.image_placement_iterator();
+        assert_eq!(KittyPlacementKind::Virtual, it.next().unwrap().protocol.kitty().kind);
+        assert_eq!(KittyPlacementKind::Virtual, it.next().unwrap().protocol.kitty().kind);
+        let child = it.next().unwrap();
+        assert_eq!(KittyPlacementKind::Relative, child.protocol.kitty().kind);
+        assert_eq!(1, child.image_id);
+        assert_eq!(2, child.protocol.kitty().placement_id);
+        assert_eq!(ImageLayer::AboveText, child.layer);
+        assert_eq!(2, child.x);
+        assert_eq!(3, child.y);
+        assert_eq!(1, child.cols);
+        assert_eq!(1, child.rows);
+        assert_eq!(10, child.width);
+        assert_eq!(10, child.height);
+        assert_eq!(5, child.z);
+        assert!(it.next().is_none());
+
+        // A new placeholder cell further left moves the child, even
+        // though the storage didn't change.
+        t.screens.active.cursor_absolute(0, 3);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}").unwrap();
+        state.update(&mut t);
+        let mut it = state.image_placement_iterator();
+        for _ in 0..3 {
+            assert_eq!(KittyPlacementKind::Virtual, it.next().unwrap().protocol.kitty().kind);
+        }
+        let moved = it.next().unwrap();
+        assert_eq!(1, moved.x);
+        assert_eq!(3, moved.y);
+        assert!(it.next().is_none());
+
+        // Without placeholder cells in the viewport the child isn't drawn.
+        t.erase_display(crate::terminal::csi::EraseDisplay::Complete, false);
+        state.update(&mut t);
+        assert!(state.image_placement_iterator().next().is_none());
+    }
+
+    #[test]
+    fn fixed_pin_placement_in_viewport() {
+        let mut t = term(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        test_fixed_image(&mut t, 1);
+        let mut s: ScreenPtr = t.screens.active;
+        let pin = s
+            .pages
+            .pin(point::Point::Active(point::Coordinate { x: 2, y: 1 }))
+            .unwrap();
+        let pin = s.pages.track_pin(pin).unwrap();
+        add_placement(
+            &mut t,
+            1,
+            7,
+            StoragePlacement {
+                location: Location::Pin(pin),
+                columns: 3,
+                rows: 2,
+                x_offset: 4,
+                y_offset: 3,
+                z: -5,
+                ..Default::default()
+            },
+        );
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let p = test_only_placement(&state);
+        let storage = &t.screens.active.kitty_images;
+        let image = storage.image_by_id(1).unwrap();
+        let sp = storage.placements.get(&key(1, 7)).unwrap();
+        let grid = sp.grid_size(&image, &t);
+        let dest = sp.pixel_size(&image, &t);
+        let offset = sp.cell_offset(&t);
+        let source = sp.source_rect(&image);
+        assert_eq!(KittyPlacementKind::Fixed, p.protocol.kitty().kind);
+        assert_eq!(7, p.protocol.kitty().placement_id);
+        assert_eq!(1, p.image_id);
+        assert_eq!(image.generation, p.image_generation);
+        assert_eq!(2, p.x);
+        assert_eq!(1, p.y);
+        assert_eq!(3, p.cols);
+        assert_eq!(2, p.rows);
+        assert_eq!(grid.cols, p.cols);
+        assert_eq!(grid.rows, p.rows);
+        assert_eq!(4, p.offset_x);
+        assert_eq!(3, p.offset_y);
+        assert_eq!(offset.x, p.offset_x);
+        assert_eq!(offset.y, p.offset_y);
+        assert_eq!(dest.width, p.width);
+        assert_eq!(dest.height, p.height);
+        assert_eq!(source.x, p.source_x);
+        assert_eq!(source.y, p.source_y);
+        assert_eq!(source.width, p.source_width);
+        assert_eq!(source.height, p.source_height);
+        assert_eq!(-5, p.z);
+        assert_eq!(ImageLayer::BelowText, p.layer);
+    }
+
+    #[test]
+    fn fixed_scrolled_partially_above_the_viewport() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 1, 0, 2, 3);
+
+        let mut state = RenderState::empty();
+        state.overscan_request = Overscan { above: 1, below: 0 };
+        state.update(&mut t);
+        {
+            let p = test_only_placement(&state);
+            assert_eq!(1, p.x);
+            assert_eq!(0, p.y);
+        }
+
+        // Two lines of output move the placement two rows up. Its top row is
+        // now above the one overscan row, and it is still reported whole.
+        t.set_cursor_pos(5, 1);
+        t.index().unwrap();
+        t.index().unwrap();
+        state.update(&mut t);
+        assert_eq!(1, state.overscan.above);
+        {
+            let p = test_only_placement(&state);
+            assert_eq!(1, p.x);
+            assert_eq!(-2, p.y);
+            assert_eq!(2, p.cols);
+            assert_eq!(3, p.rows);
+            assert_eq!(20, p.width);
+            assert_eq!(30, p.height);
+        }
+
+        // Scrolling the viewport up a row moves it back down.
+        t.scroll_viewport(ScrollViewport::Delta(-1));
+        state.update(&mut t);
+        {
+            let p = test_only_placement(&state);
+            assert_eq!(-1, p.y);
+            assert_eq!(30, p.height);
+        }
+
+        // Three lines up, only the overscan row shows it.
+        t.scroll_viewport(ScrollViewport::Bottom);
+        t.index().unwrap();
+        state.update(&mut t);
+        assert_eq!(-3, test_only_placement(&state).y);
+
+        // Four lines up, it doesn't reach the captured rows.
+        t.index().unwrap();
+        state.update(&mut t);
+        assert!(state.image_placement_iterator().next().is_none());
+    }
+
+    #[test]
+    fn fixed_pin_on_a_page_above_the_captured_rows() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        let first = t.screens.active.pages.pages.first.unwrap();
+        let page_rows = first_page_rows(&t);
+
+        // Scroll the first row far enough that the viewport is on the next
+        // page. The first row is then `distance` rows above the viewport.
+        test_fixed_image(&mut t, 1);
+        let distance = page_rows + 6;
+        t.set_cursor_pos(5, 1);
+        for _ in 0..distance {
+            t.index().unwrap();
+        }
+        // SAFETY: the first node is live.
+        let second = unsafe { first.as_ref().next.unwrap() };
+        assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == second);
+
+        // Placements on the first row: one tall enough to reach the second
+        // row of the viewport, and one that ends just above the viewport.
+        {
+            let top = Pin {
+                node: first,
+                y: 0,
+                x: 1,
+                garbage: false,
+            };
+            let mut s: ScreenPtr = t.screens.active;
+            let p1 = s.pages.track_pin(top).unwrap();
+            add_placement(
+                &mut t,
+                1,
+                1,
+                StoragePlacement {
+                    location: Location::Pin(p1),
+                    columns: 1,
+                    rows: (distance + 2) as u32,
+                    ..Default::default()
+                },
+            );
+            let p2 = s.pages.track_pin(top).unwrap();
+            add_placement(
+                &mut t,
+                1,
+                2,
+                StoragePlacement {
+                    location: Location::Pin(p2),
+                    columns: 1,
+                    rows: distance as u32,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        // The viewport is one chunk on the second page, so the first page is
+        // only found by the walk up.
+        assert_eq!(1, state.kitty.chunks.len());
+        assert!(state.kitty.chunks[0].node != first);
+
+        let p = test_only_placement(&state);
+        assert_eq!(1, p.protocol.kitty().placement_id);
+        assert_eq!(1, p.x);
+        assert_eq!(-(distance as i32), p.y);
+        assert_eq!((distance + 2) as u32, p.rows);
+    }
+
+    #[test]
+    fn fixed_region_scroll_moves_the_placement_without_a_generation_change() {
+        let mut t = term(10, 6);
+        t.width_px = 100;
+        t.height_px = 60;
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 2, 3, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(3, test_only_placement(&state).y);
+
+        // Mark the template so we can tell whether the roots are rebuilt.
+        let poison = 12345;
+        state.kitty.roots[0].placement.width = poison;
+
+        // Scroll rows 2 to 5 (1-based) up by one with an index at the bottom
+        // margin.
+        let generation = t.screens.active.kitty_images.generation;
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(5, 1);
+        t.index().unwrap();
+        assert_eq!(generation, t.screens.active.kitty_images.generation);
+        state.update(&mut t);
+        {
+            let p = test_only_placement(&state);
+            assert_eq!(2, p.x);
+            assert_eq!(2, p.y);
+            assert_eq!(poison, p.width);
+        }
+
+        // A storage change rebuilds the roots.
+        t.screens.active.kitty_images.mark_mutated();
+        state.update(&mut t);
+        assert_eq!(10, test_only_placement(&state).width);
+    }
+
+    #[test]
+    fn fixed_viewport_scroll_does_not_rebuild_roots() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 2, 1, 2);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..3 {
+            t.index().unwrap();
+        }
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(-1, test_only_placement(&state).y);
+        let poison = 12345;
+        state.kitty.roots[0].placement.width = poison;
+
+        t.scroll_viewport(ScrollViewport::Delta(-2));
+        state.update(&mut t);
+        let p = test_only_placement(&state);
+        assert_eq!(1, p.y);
+        assert_eq!(poison, p.width);
+    }
+
+    #[test]
+    fn fixed_dirty_row_with_only_fixed_placements_skips_the_slow_path() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 1, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        let poison = 12345;
+        state.kitty.placed[0].width = poison;
+
+        // Clear the dirty flags so we can see that the row was rebuilt.
+        state.row_data.dirty.fill(false);
+        mark_active_row_dirty(&t, 3);
+        state.update(&mut t);
+        assert!(state.row_data.dirty[3]);
+        assert_eq!(poison, test_only_placement(&state).width);
+    }
+
+    #[test]
+    fn fixed_garbage_pin_is_skipped() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        // A placement on the first page, scrolled onto the second page's
+        // history, and tall enough to reach the viewport.
+        let page_rows = first_page_rows(&t);
+        let distance = page_rows + 6;
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 0, 1, (distance + 2) as u32);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..distance {
+            t.index().unwrap();
+        }
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(-(distance as i32), test_only_placement(&state).y);
+
+        // Lowering the scrollback limit prunes the first page. The pin moves
+        // to the top of the next page, where it would still reach the
+        // viewport, and becomes garbage. The storage keeps the placement and
+        // its generation until it reaps garbage.
+        let generation = t.screens.active.kitty_images.generation;
+        t.set_scrollback_max_lines(Some(1));
+        let storage = &t.screens.active.kitty_images;
+        assert_eq!(generation, storage.generation);
+        assert_eq!(1, storage.placements.len());
+        let Location::Pin(pin) = storage.placements.values().next().unwrap().location else {
+            panic!("expected a pin placement");
+        };
+        // SAFETY: the tracked pin is live.
+        assert!(unsafe { pin.as_ref().garbage });
+        state.update(&mut t);
+        assert!(state.image_placement_iterator().next().is_none());
+    }
+
+    #[test]
+    fn fixed_screen_switch_rebuilds_roots() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 3, 2, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(3, test_only_placement(&state).x);
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+        state.update(&mut t);
+        assert!(state.image_placement_iterator().next().is_none());
+
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, false).unwrap();
+        state.update(&mut t);
+        let p = test_only_placement(&state);
+        assert_eq!(3, p.x);
+        assert_eq!(2, p.y);
+    }
+
+    #[test]
+    fn fixed_relative_child_at_parent_plus_positive_offsets() {
+        let mut t = term(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 2, 1, 1, 1);
+        test_relative_placement(&mut t, 2, 1, 3, 2, 2, 3);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let parent = test_placement_by_id(&state, 1);
+        assert_eq!(KittyPlacementKind::Fixed, parent.protocol.kitty().kind);
+        assert_eq!(2, parent.x);
+        assert_eq!(1, parent.y);
+
+        let child = test_placement_by_id(&state, 2);
+        assert_eq!(KittyPlacementKind::Relative, child.protocol.kitty().kind);
+        assert_eq!(1, child.image_id);
+        assert_eq!(5, child.x);
+        assert_eq!(3, child.y);
+        assert_eq!(2, child.cols);
+        assert_eq!(3, child.rows);
+        assert_eq!(20, child.width);
+        assert_eq!(30, child.height);
+    }
+
+    #[test]
+    fn fixed_relative_child_with_negative_offsets() {
+        let mut t = term(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        // The child hangs above and left of its parent at the top-left
+        // corner. It is reported whole even though its top-left cell is
+        // outside the screen.
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 0, 1, 1);
+        test_relative_placement(&mut t, 2, 1, -1, -1, 2, 2);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let child = test_placement_by_id(&state, 2);
+        assert_eq!(KittyPlacementKind::Relative, child.protocol.kitty().kind);
+        assert_eq!(-1, child.x);
+        assert_eq!(-1, child.y);
+        assert_eq!(2, child.cols);
+        assert_eq!(2, child.rows);
+    }
+
+    #[test]
+    fn fixed_relative_chain_two_levels_deep() {
+        let mut t = term(10, 10);
+        t.width_px = 100;
+        t.height_px = 100;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 1, 1, 1, 1);
+        test_relative_placement(&mut t, 2, 1, 1, 1, 1, 1);
+        test_relative_placement(&mut t, 3, 2, 2, 1, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let child = test_placement_by_id(&state, 2);
+        assert_eq!(2, child.x);
+        assert_eq!(2, child.y);
+        let grandchild = test_placement_by_id(&state, 3);
+        assert_eq!(KittyPlacementKind::Relative, grandchild.protocol.kitty().kind);
+        assert_eq!(4, grandchild.x);
+        assert_eq!(3, grandchild.y);
+    }
+
+    #[test]
+    fn fixed_relative_to_a_parent_above_the_captured_rows() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        let first = t.screens.active.pages.pages.first.unwrap();
+        let page_rows = first_page_rows(&t);
+
+        // The parent is on the first row, and the child is far enough below
+        // it to be on the second row of the viewport once the parent scrolls
+        // onto an earlier page.
+        let distance = page_rows + 6;
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 1, 0, 1, 1);
+        test_relative_placement(&mut t, 2, 1, 2, (distance + 1) as i32, 1, 1);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..distance {
+            t.index().unwrap();
+        }
+        // SAFETY: the first node is live.
+        let second = unsafe { first.as_ref().next.unwrap() };
+        assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == second);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        // Only the child is in the captured rows. The parent's page is only
+        // found by the walk up.
+        assert_eq!(1, state.kitty.chunks.len());
+        assert!(state.kitty.chunks[0].node != first);
+        let p = test_only_placement(&state);
+        assert_eq!(KittyPlacementKind::Relative, p.protocol.kitty().kind);
+        assert_eq!(2, p.protocol.kitty().placement_id);
+        assert_eq!(3, p.x);
+        assert_eq!(1, p.y);
+    }
+
+    #[test]
+    fn fixed_relative_to_a_parent_below_the_captured_rows() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        let first = t.screens.active.pages.pages.first.unwrap();
+        let page_rows = first_page_rows(&t);
+
+        // Enough output that the active area is on a later page than the top
+        // of the scrollback, where the viewport goes.
+        t.set_cursor_pos(5, 1);
+        for _ in 0..page_rows + 10 {
+            t.index().unwrap();
+        }
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 1, 0, 1, 1);
+        let parent_pin = t
+            .screens
+            .active
+            .pages
+            .pin(point::Point::Active(point::Coordinate { x: 1, y: 0 }))
+            .unwrap();
+        assert!(parent_pin.node != first);
+        let parent_y = t
+            .screens
+            .active
+            .pages
+            .point_from_pin(point::Tag::Screen, parent_pin)
+            .unwrap()
+            .coord()
+            .y as i32;
+
+        // The child moves up from the parent to the second row of the top of
+        // the scrollback.
+        test_relative_placement(&mut t, 2, 1, 1, 1 - parent_y, 1, 1);
+        t.scroll_viewport(ScrollViewport::Top);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        assert_eq!(1, state.kitty.chunks.len());
+        assert_eq!(first, state.kitty.chunks[0].node);
+        let p = test_only_placement(&state);
+        assert_eq!(KittyPlacementKind::Relative, p.protocol.kitty().kind);
+        assert_eq!(2, p.x);
+        assert_eq!(1, p.y);
+    }
+
+    #[test]
+    fn fixed_relative_with_a_broken_chain_is_not_drawn() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        // Placement 99 doesn't exist.
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 1, 1, 1, 1);
+        test_relative_placement(&mut t, 2, 99, 1, 1, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+
+        let p = test_only_placement(&state);
+        assert_eq!(1, p.protocol.kitty().placement_id);
+        assert_eq!(1, state.kitty.roots.len());
+    }
+
+    #[test]
+    fn fixed_relative_to_a_parent_with_a_garbage_pin_is_not_drawn() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        // The parent is on the first page, scrolled onto the second page's
+        // history. The child is far enough below it to be in the viewport.
+        let page_rows = first_page_rows(&t);
+        let distance = page_rows + 6;
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 0, 1, 1);
+        test_relative_placement(&mut t, 2, 1, 0, (distance + 1) as i32, 1, 1);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..distance {
+            t.index().unwrap();
+        }
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(2, test_only_placement(&state).protocol.kitty().placement_id);
+
+        // Pruning the first page makes the parent's pin garbage without a
+        // generation change.
+        let generation = t.screens.active.kitty_images.generation;
+        t.set_scrollback_max_lines(Some(1));
+        let storage = &t.screens.active.kitty_images;
+        assert_eq!(generation, storage.generation);
+        let Location::Pin(pin) = storage.placements.get(&key(1, 1)).unwrap().location else {
+            panic!("expected a pin placement");
+        };
+        // SAFETY: the tracked pin is live.
+        assert!(unsafe { pin.as_ref().garbage });
+        state.update(&mut t);
+        assert!(state.image_placement_iterator().next().is_none());
+    }
+
+    #[test]
+    fn fixed_relative_moves_with_its_parent_on_a_region_scroll() {
+        let mut t = term(10, 6);
+        t.width_px = 100;
+        t.height_px = 60;
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 2, 3, 1, 1);
+        test_relative_placement(&mut t, 2, 1, 1, 1, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(3, test_placement_by_id(&state, 1).y);
+        assert_eq!(4, test_placement_by_id(&state, 2).y);
+        let placements_generation = state.image_placements_generation();
+
+        // Scroll rows 2 to 5 (1-based) up by one. Both move up a row, and
+        // the storage generation stays the same.
+        let generation = t.screens.active.kitty_images.generation;
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(5, 1);
+        t.index().unwrap();
+        assert_eq!(generation, t.screens.active.kitty_images.generation);
+        state.update(&mut t);
+        {
+            let parent = test_placement_by_id(&state, 1);
+            assert_eq!(2, parent.x);
+            assert_eq!(2, parent.y);
+            let child = test_placement_by_id(&state, 2);
+            assert_eq!(3, child.x);
+            assert_eq!(3, child.y);
+        }
+        assert!(state.image_placements_generation() != placements_generation);
+    }
+
+    #[test]
+    fn placeholders_relative_rooted_at_a_virtual_placement_in_an_overscan_row() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        test_fixed_image(&mut t, 1);
+        add_virtual(&mut t, 1, 1, 1, 1);
+        add_placement(
+            &mut t,
+            1,
+            2,
+            StoragePlacement {
+                location: Location::Relative(Relative {
+                    parent: key(1, 1),
+                    horizontal_offset: 1,
+                    vertical_offset: 2,
+                }),
+                columns: 1,
+                rows: 1,
+                ..Default::default()
+            },
+        );
+
+        // A placeholder cell at (3, 0), then one line of output to move it
+        // into the overscan row above the viewport.
+        placeholder_colors(&mut t, 1, 1);
+        t.screens.active.cursor_absolute(3, 0);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}").unwrap();
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+        t.set_cursor_pos(5, 1);
+        t.index().unwrap();
+
+        let mut state = RenderState::empty();
+        state.overscan_request = Overscan { above: 1, below: 0 };
+        state.update(&mut t);
+        assert_eq!(1, state.overscan.above);
+
+        let mut it = state.image_placement_iterator();
+        let parent = it.next().unwrap();
+        assert_eq!(KittyPlacementKind::Virtual, parent.protocol.kitty().kind);
+        assert_eq!(-1, parent.y);
+        let child = it.next().unwrap();
+        assert_eq!(KittyPlacementKind::Relative, child.protocol.kitty().kind);
+        assert_eq!(4, child.x);
+        assert_eq!(1, child.y);
+        assert!(it.next().is_none());
+    }
+
+    /// Sets up image 1 with a fixed placement (ID 1) at (0, 4) and a virtual
+    /// placement (ID 2) with one placeholder run at (3, 1), on a 5x10
+    /// terminal.
+    fn test_images_generation_scene(t: &mut Terminal) {
+        t.width_px = 100;
+        t.height_px = 50;
+        t.modes.set(Mode::GraphemeCluster, true);
+
+        test_fixed_image(t, 1);
+        test_fixed_placement(t, 1, 0, 4, 1, 1);
+        add_virtual(t, 1, 2, 1, 1);
+        placeholder_colors(t, 1, 2);
+        t.screens.active.cursor_absolute(3, 1);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}").unwrap();
+        t.set_attribute(sgr::Attribute::Unset).unwrap();
+    }
+
+    #[test]
+    fn placements_generation_stable_on_a_quiet_update() {
+        let mut t = term(10, 5);
+        test_images_generation_scene(&mut t);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(2, test_placement_count(&state));
+        let generation = state.image_placements_generation();
+        assert!(generation != 0);
+
+        state.update(&mut t);
+        assert_eq!(generation, state.image_placements_generation());
+    }
+
+    #[test]
+    fn placements_generation_stable_across_a_dirty_row_with_only_fixed_placements() {
+        let mut t = term(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 1, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        let generation = state.image_placements_generation();
+
+        // The slow path would build `placed` again and drop the marker.
+        let poison = 12345;
+        state.kitty.placed[0].width = poison;
+
+        mark_active_row_dirty(&t, 3);
+        state.update(&mut t);
+        assert_eq!(generation, state.image_placements_generation());
+        assert_eq!(poison, test_only_placement(&state).width);
+    }
+
+    #[test]
+    fn placements_generation_stable_across_a_dirty_row_that_has_no_placeholders_while_virtual_runs_exist_elsewhere() {
+        let mut t = term(10, 5);
+        test_images_generation_scene(&mut t);
+
+        // A child of the virtual placement, so that a dirty row builds
+        // `placed` again and the comparison with the previous one decides.
+        add_placement(
+            &mut t,
+            1,
+            3,
+            StoragePlacement {
+                location: Location::Relative(Relative {
+                    parent: key(1, 2),
+                    horizontal_offset: 1,
+                    vertical_offset: 1,
+                }),
+                columns: 1,
+                rows: 1,
+                ..Default::default()
+            },
+        );
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(3, test_placement_count(&state));
+        assert!(state.kitty.virtual_anchors > 0);
+        let generation = state.image_placements_generation();
+
+        // Mark the row dirty directly. Moving the cursor would also rebuild
+        // the placeholder row the cursor leaves.
+        state.row_data.dirty.fill(false);
+        mark_active_row_dirty(&t, 3);
+        state.update(&mut t);
+        assert!(state.row_data.dirty[3]);
+        assert!(!state.row_data.dirty[1]);
+        assert_eq!(generation, state.image_placements_generation());
+        assert_eq!(3, test_placement_count(&state));
+    }
+
+    #[test]
+    fn placements_generation_changes_when_a_placeholder_row_is_overwritten_with_text() {
+        let mut t = term(10, 5);
+        test_images_generation_scene(&mut t);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(2, test_placement_count(&state));
+        let generation = state.image_placements_generation();
+
+        t.screens.active.cursor_absolute(3, 1);
+        t.print_string("x").unwrap();
+        state.update(&mut t);
+        assert!(generation != state.image_placements_generation());
+
+        // Only the fixed placement is left.
+        let p = test_only_placement(&state);
+        assert_eq!(KittyPlacementKind::Fixed, p.protocol.kitty().kind);
+    }
+
+    #[test]
+    fn placements_generation_changes_when_a_placeholder_run_is_added() {
+        let mut t = term(10, 5);
+        test_images_generation_scene(&mut t);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        let generation = state.image_placements_generation();
+
+        placeholder_colors(&mut t, 1, 2);
+        t.screens.active.cursor_absolute(5, 2);
+        t.print_string("\u{10EEEE}\u{0305}\u{0305}").unwrap();
+        state.update(&mut t);
+        assert!(generation != state.image_placements_generation());
+        assert_eq!(3, test_placement_count(&state));
+    }
+
+    #[test]
+    fn placements_generation_changes_on_viewport_scroll_with_a_fixed_placement() {
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 2, 1, 2);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..3 {
+            t.index().unwrap();
+        }
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(-1, test_only_placement(&state).y);
+        let generation = state.image_placements_generation();
+
+        t.scroll_viewport(ScrollViewport::Delta(-2));
+        state.update(&mut t);
+        assert_eq!(1, test_only_placement(&state).y);
+        let scrolled = state.image_placements_generation();
+        assert!(generation != scrolled);
+
+        // Stable on a second update with no changes.
+        state.update(&mut t);
+        assert_eq!(scrolled, state.image_placements_generation());
+    }
+
+    #[test]
+    fn placements_generation_changes_on_a_storage_mutation() {
+        let mut t = term(10, 5);
+        test_images_generation_scene(&mut t);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        let mut generation = state.image_placements_generation();
+
+        // Add a placement.
+        test_fixed_placement(&mut t, 4, 5, 0, 1, 1);
+        state.update(&mut t);
+        assert!(generation != state.image_placements_generation());
+        assert_eq!(3, test_placement_count(&state));
+        generation = state.image_placements_generation();
+
+        // Delete it again.
+        let mut s: ScreenPtr = t.screens.active;
+        let s = &mut *s;
+        s.kitty_images.delete(
+            &mut s.pages,
+            DeleteCommand::Id {
+                image_id: 1,
+                placement_id: 4,
+            },
+        );
+        state.update(&mut t);
+        assert!(generation != state.image_placements_generation());
+        assert_eq!(2, test_placement_count(&state));
+        generation = state.image_placements_generation();
+
+        // Any mutation, even one that doesn't move anything.
+        t.screens.active.kitty_images.mark_mutated();
+        state.update(&mut t);
+        assert!(generation != state.image_placements_generation());
+    }
+
+    #[test]
+    fn placements_generation_changes_on_a_region_scroll_that_moves_a_fixed_placement() {
+        let mut t = term(10, 6);
+        t.width_px = 100;
+        t.height_px = 60;
+        t.switch_screen_mode(SwitchScreenMode::Mode1049, true).unwrap();
+
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 2, 3, 1, 1);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        assert_eq!(3, test_only_placement(&state).y);
+        let generation = state.image_placements_generation();
+
+        let storage_generation = t.screens.active.kitty_images.generation;
+        t.set_top_and_bottom_margin(2, 5);
+        t.set_cursor_pos(5, 1);
+        t.index().unwrap();
+        assert_eq!(storage_generation, t.screens.active.kitty_images.generation);
+        state.update(&mut t);
+        assert_eq!(2, test_only_placement(&state).y);
+        assert!(generation != state.image_placements_generation());
+    }
+
+    #[test]
+    fn fixed_row_index_of_pin_walks_pages_above_and_below_with_placement() {
+        // The full Zig version of `fixed_row_index_of_pin_walks_pages_above_and_below`
+        // (the runnable one builds the chunk table by hand): the chunk table
+        // comes from an update with a pin-anchored placement.
+        let mut t = term_unlimited(10, 5);
+        t.width_px = 100;
+        t.height_px = 50;
+        let first = t.screens.active.pages.pages.first.unwrap();
+        let page_rows = first_page_rows(&t) as isize;
+
+        // Three pages, with the viewport on the middle one, three rows down.
+        test_fixed_image(&mut t, 1);
+        test_fixed_placement(&mut t, 1, 0, 0, 1, 1);
+        t.set_cursor_pos(5, 1);
+        for _ in 0..(2 * page_rows + 10) {
+            t.index().unwrap();
+        }
+        // SAFETY: the nodes are live.
+        let middle = unsafe { first.as_ref().next.unwrap() };
+        t.scroll_viewport(ScrollViewport::Top);
+        t.scroll_viewport(ScrollViewport::Delta(page_rows + 3));
+        assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == middle);
+
+        let mut state = RenderState::empty();
+        state.update(&mut t);
+        let chunks = &state.kitty.chunks;
+        assert_eq!(1, chunks.len());
+        assert_eq!(middle, chunks[0].node);
+        assert_eq!(0, chunks[0].index);
+        assert_eq!(3, chunks[0].start);
+    }
 }
