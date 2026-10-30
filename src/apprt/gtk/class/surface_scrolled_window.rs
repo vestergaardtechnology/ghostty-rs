@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/surface_scrolled_window.zig`.
 //!
-//! STATUS: ported (against the `Surface` stand-in in
-//! `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Zig stores the surface pointer without a reference (the scrolled
 //! window, our child, keeps it alive); the port holds a strong reference,
@@ -20,8 +19,7 @@ use crate::apprt::gtk::class::{self, accessor, Blueprint, Config};
 use crate::apprt::gtk::gtk_version;
 use crate::config::config::Scrollbar;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
-use crate::apprt::gtk::class::port_stubs::Surface;
+use crate::apprt::gtk::class::surface::Surface;
 
 /// The template of this class (Zig: `gresource.blueprint(...)`).
 pub const BLUEPRINT: Blueprint =
@@ -219,7 +217,7 @@ fn closure_scrollbar_policy(config: Option<&Config>) -> gtk4::PolicyType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apprt::gtk::class::port_stubs::Size;
+    use crate::apprt::gtk::class::surface::Size;
     use crate::apprt::gtk::ext::test_gtk;
 
     #[test]
@@ -240,7 +238,7 @@ mod tests {
             core.scrollbar = Scrollbar::Never;
             let config = Config::new(&core);
 
-            let surface = Surface::default();
+            let surface = Surface::new(&crate::apprt::gtk::class::overrides::Overrides::NONE);
             surface.set_property("config", &config);
             surface.set_split_min_size(Size { width: 30, height: 40 });
 

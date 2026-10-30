@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/command_palette.zig`.
 //!
-//! STATUS: ported (against the `Application`, `Surface` and `Window`
-//! stand-ins in `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Zig's `new` sinks the palette and keeps a reference that is dropped
 //! when the dialog closes; the port keeps that reference in a private
@@ -25,9 +24,9 @@ use crate::apprt::gtk::weak_ref::WeakRef;
 use crate::input::binding::Action;
 use crate::input::command::Command as InputCommand;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::{
-// application::Application, surface::Surface, window::Window}.
-use crate::apprt::gtk::class::port_stubs::{Application, Surface, Window};
+use crate::apprt::gtk::class::application::Application;
+use crate::apprt::gtk::class::surface::Surface;
+use crate::apprt::gtk::class::window::Window;
 
 const LOG: &str = "gtk_ghostty_command_palette";
 
@@ -507,7 +506,9 @@ impl Command {
             glib::Object::builder().property(command_properties::CONFIG, config).build();
 
         // Surface should be initialized at this point.
-        let sort_key = surface.core().expect("jump surface must be initialized").id as usize;
+        let core = surface.core().expect("jump surface must be initialized");
+        // SAFETY: an initialized surface's core surface is live.
+        let sort_key = unsafe { (*core).id } as usize;
         let mut jump = JumpData { surface: WeakRef::empty(), title: None, description: None, sort_key };
         jump.surface.set(Some(surface));
         this.imp().data.replace(Some(CommandData::Jump(jump)));
@@ -640,7 +641,6 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apprt::gtk::class::port_stubs::CoreSurface;
     use crate::apprt::gtk::ext::test_gtk;
     use crate::config::config::Config as CoreConfig;
     use std::borrow::Cow;
@@ -705,18 +705,10 @@ mod tests {
         test_gtk::run(|| {
             let config = Config::new(&CoreConfig::default());
 
-            let surface = Surface::default();
-            surface.set_core(Some(CoreSurface::new(7)));
-            surface.set_property("title", "vim");
-            surface.set_property("pwd", "/home");
-            Application::default().add_surface(&surface);
-
-            let jump = Command::new_jump(&config, &surface);
-            assert!(jump.is_jump());
-            assert_eq!(jump.jump_sort_key(), Some(7));
-            assert_eq!(jump.prop_get_title().as_deref(), Some("Focus: vim"));
-            assert_eq!(jump.prop_get_description().as_deref(), Some("/home"));
-            assert_eq!(jump.get_jump_surface().as_ref(), Some(&surface));
+            // Jump commands need surfaces with a core surface (a running
+            // terminal); they are covered by the GTK app smoke test in
+            // `apprt/gtk/app.rs`.
+            let n_surfaces = Application::default().surfaces().len();
 
             let palette = CommandPalette::new();
             palette.set_property(properties::CONFIG, &config);
@@ -729,13 +721,13 @@ mod tests {
                         .prop_get_title().unwrap()
                 })
                 .collect();
-            assert!(titles.contains(&"Focus: vim".to_owned()));
+            assert_eq!(titles.iter().filter(|t| t.starts_with("Focus:")).count(), n_surfaces);
 
             // Activating a regular command emits trigger.
             let triggered = Rc::new(RefCell::new(None));
             let t = triggered.clone();
             palette.connect_trigger(move |_, a| *t.borrow_mut() = Some(a.clone()));
-            let pos = titles.iter().position(|t| t != "Focus: vim").unwrap();
+            let pos = titles.iter().position(|t| !t.starts_with("Focus:")).unwrap();
             palette.activated(pos as u32);
             assert!(triggered.borrow().is_some());
 

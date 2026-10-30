@@ -347,6 +347,12 @@ pub fn tmp_dir_path() -> String {
     with_state(|s| s.tmp_dir_path.clone().expect("tmp dir path not set"))
 }
 
+/// Like [`tmp_dir_path`] but returns `None` instead of asserting when the
+/// global state (or its temporary directory) is not initialized.
+pub fn try_tmp_dir_path() -> Option<String> {
+    STATE.read().ok()?.as_ref()?.tmp_dir_path.clone()
+}
+
 /// Returns the global state resources_dir, or an empty one when testing.
 ///
 /// Asserts that the global state is initialized when not running as a test.
@@ -374,6 +380,14 @@ pub fn rlimits() -> ResourceLimits {
 /// Asserts that the global state is initialized.
 pub fn logging() -> Logging {
     with_state(|s| s.logging)
+}
+
+/// The global state logging configuration, or `None` if the global state
+/// is not initialized or is being written (the logger reads this while
+/// `init` may hold the state lock, so it must never block).
+pub fn try_logging() -> Option<Logging> {
+    let guard = STATE.try_read().ok()?;
+    guard.as_ref().map(|s| s.logging)
 }
 
 /// Returns the global state action.

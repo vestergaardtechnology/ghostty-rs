@@ -1,9 +1,7 @@
 //! Port of `src/renderer/Metal.zig`.
 //!
 //! STATUS: ported (macOS only; type-checked with
-//! `cargo check --target x86_64-apple-darwin`, not run). The generic
-//! renderer it plugs into is a stand-in, see
-//! [`crate::renderer::standin`] (TODO(port-dedupe)).
+//! `cargo check --target x86_64-apple-darwin`, not run).
 //!
 //! Graphics API wrapper for Metal.
 //!
@@ -57,7 +55,7 @@ use crate::config::config::AlphaBlending;
 use crate::font;
 use crate::pkg::macos::graphics;
 use crate::renderer::shadertoy;
-use crate::renderer::standin::{self as rstandin, GraphicsApi};
+use crate::renderer::generic::{self, GraphicsApi};
 use crate::renderer::Options;
 
 use self::api as mtl;
@@ -72,8 +70,11 @@ pub use self::sampler::Sampler;
 pub use self::target::Target;
 pub use self::texture::Texture;
 
+/// The primitive types for draw steps (Zig: `mtl.MTLPrimitiveType`).
+pub use self::api::MTLPrimitiveType as Primitive;
+
 /// Zig: `const Renderer = rendererpkg.GenericRenderer(Metal)`.
-pub type Renderer = rstandin::GenericRenderer<Metal>;
+pub type Renderer = generic::Renderer<Metal>;
 
 /// Zig: `pub const GraphicsAPI = Metal`.
 pub type GraphicsAPI = Metal;
@@ -471,13 +472,84 @@ fn display_callback(renderer: *mut c_void) {
 impl GraphicsApi for Metal {
     type ExportedFrame = ();
     const EXPORTS_FRAMES: bool = false;
+    const CUSTOM_SHADER_TARGET: shadertoy::Target = CUSTOM_SHADER_TARGET;
+    const CUSTOM_SHADER_Y_IS_DOWN: bool = CUSTOM_SHADER_Y_IS_DOWN;
+    const SWAP_CHAIN_COUNT: usize = SWAP_CHAIN_COUNT;
+
+    fn init(device: *const Device, options: &Options) -> Result<Self, generic::Error> {
+        Ok(Metal::init(device, options)?)
+    }
 
     fn deinit(&mut self) {
         Metal::deinit(self)
     }
 
-    fn loop_enter(&mut self, renderer: *mut rstandin::GenericRenderer<Self>) {
+    fn loop_enter(&mut self, renderer: *mut Renderer) {
         Metal::loop_enter(self, renderer)
+    }
+
+    fn set_blending(&mut self, blending: AlphaBlending) {
+        self.blending = blending;
+    }
+
+    fn surface_size(&self) -> Result<SurfaceSize, generic::Error> {
+        Ok(Metal::surface_size(self)?)
+    }
+
+    fn draw_frame_start(&mut self) {
+        Metal::draw_frame_start(self)
+    }
+
+    fn draw_frame_end(&mut self) {
+        Metal::draw_frame_end(self)
+    }
+
+    fn init_shaders(&self, custom_shaders: &[&CStr]) -> Result<shaders::Shaders, generic::Error> {
+        Ok(Metal::init_shaders(self, custom_shaders)?)
+    }
+
+    fn init_target(&self, width: usize, height: usize) -> Result<Target, generic::Error> {
+        Ok(Metal::init_target(self, width, height)?)
+    }
+
+    fn uniform_buffer_options(&self) -> buffer::Options {
+        Metal::uniform_buffer_options(self)
+    }
+
+    fn fg_buffer_options(&self) -> buffer::Options {
+        Metal::fg_buffer_options(self)
+    }
+
+    fn bg_buffer_options(&self) -> buffer::Options {
+        Metal::bg_buffer_options(self)
+    }
+
+    fn image_buffer_options(&self) -> buffer::Options {
+        Metal::image_buffer_options(self)
+    }
+
+    fn bg_image_buffer_options(&self) -> buffer::Options {
+        Metal::bg_image_buffer_options(self)
+    }
+
+    fn texture_options(&self) -> texture::Options {
+        Metal::texture_options(self)
+    }
+
+    fn sampler_options(&self) -> sampler::Options {
+        Metal::sampler_options(self)
+    }
+
+    fn image_texture_options(&self, format: ImageTextureFormat, srgb: bool) -> texture::Options {
+        Metal::image_texture_options(self, format, srgb)
+    }
+
+    fn init_atlas_texture(&self, atlas: &font::Atlas) -> Result<Texture, generic::Error> {
+        Ok(Metal::init_atlas_texture(self, atlas)?)
+    }
+
+    fn begin_frame(&self, renderer: *mut Renderer, target: *mut Target) -> Result<Frame, generic::Error> {
+        Ok(Metal::begin_frame(self, renderer, target)?)
     }
 }
 

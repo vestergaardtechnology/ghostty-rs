@@ -1,9 +1,8 @@
 //! Port of `src/apprt/gtk/class/inspector_widget.zig`.
 //!
 //! STATUS: partial — `src/inspector` is not ported, so the inspector UI
-//! itself (`Inspector.setup`/`render`) is a no-op stand-in; the widget runs
-//! against the `Surface`/core `Surface` stand-ins in `class::port_stubs`
-//! (TODO(port-dedupe)). Only built with the `inspector` Cargo feature.
+//! itself (`Inspector.setup`/`render`) is a no-op stand-in. Only built with
+//! the `inspector` Cargo feature.
 //!
 //! Zig keeps an unreferenced surface pointer plus a weak notify and reads
 //! the core surface from the dying surface in the notify. The port keeps a
@@ -25,9 +24,8 @@ use libadwaita::subclass::prelude::*;
 use crate::apprt::gtk::class::imgui_widget::{ImguiWidget, ImguiWidgetImpl};
 use crate::apprt::gtk::class::{self, Blueprint};
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
-// and crate::surface::Surface (core).
-use crate::apprt::gtk::class::port_stubs::{CoreSurface, Surface};
+use crate::apprt::gtk::class::surface::Surface;
+use crate::surface::Surface as CoreSurface;
 
 const LOG: &str = "gtk_ghostty_inspector_widget";
 
@@ -65,7 +63,7 @@ mod imp {
         pub surface_ptr: Cell<usize>,
 
         /// The core surface the inspector was activated on.
-        pub core_surface: RefCell<Option<Rc<CoreSurface>>>,
+        pub core_surface: Cell<Option<*mut CoreSurface>>,
 
         /// The weak notify on `surface`.
         pub weak_notify: RefCell<Option<glib::object::WeakRefNotify<Surface>>>,
@@ -135,10 +133,12 @@ mod imp {
             let Some(core_surface) = self.obj().get_surface().and_then(|s| s.core()) else {
                 return;
             };
-            if !core_surface.inspector_active() {
+            // SAFETY: the core surface is live while its GTK surface is.
+            let core_surface = unsafe { &*core_surface };
+            if core_surface.inspector.is_none() {
                 return;
             }
-            Inspector::render(&core_surface);
+            Inspector::render(core_surface);
         }
     }
 }
@@ -202,14 +202,17 @@ impl InspectorWidget {
 
             // Deactivate the inspector
             if let Some(core_surface) = priv_.core_surface.take() {
-                core_surface.deactivate_inspector();
+                // SAFETY: the core surface outlives the weak notify (it is
+                // freed in the surface's finalize).
+                unsafe { (*core_surface).deactivate_inspector() };
             }
         }
 
         // Activate the inspector on the new surface.
         let Some(surface) = surface else { return };
         let Some(core_surface) = surface.core() else { return };
-        if let Err(err) = core_surface.activate_inspector() {
+        // SAFETY: the core surface is live while its GTK surface is.
+        if let Err(err) = unsafe { (*core_surface).activate_inspector() } {
             log::warn!(target: LOG, "failed to activate inspector err={err:?}");
             return;
         }
@@ -250,7 +253,9 @@ impl InspectorWidget {
         let _ = priv_.weak_notify.take();
 
         let Some(core_surface) = priv_.core_surface.take() else { return };
-        core_surface.deactivate_inspector();
+        // SAFETY: Zig's weak notify runs before the surface is finalized,
+        // which is where the core surface is freed.
+        unsafe { (*core_surface).deactivate_inspector() };
         priv_.surface_ptr.set(0);
         priv_.surface.set(None);
         self.notify(properties::SURFACE);
@@ -284,27 +289,19 @@ mod tests {
             w.upcast_ref::<ImguiWidget>().setup();
             w.upcast_ref::<ImguiWidget>().render();
 
-            let core = CoreSurface::new(1);
-            let surface = Surface::default();
-            surface.set_core(Some(core.clone()));
-
-            w.set_property(properties::SURFACE, &surface);
-            assert_eq!(w.get_surface().as_ref(), Some(&surface));
-            assert!(core.inspector_active());
-
-            w.set_surface(None);
-            assert!(!core.inspector_active());
-            assert!(w.get_surface().is_none());
-
-            // The surface going away deactivates the inspector.
-            w.set_surface(Some(&surface));
-            assert!(core.inspector_active());
+            // A surface without a core surface (not yet realized) can't
+            // host the inspector, so it isn't stored. (A live core surface
+            // needs a running terminal; see the GTK app smoke test.)
+            let surface = Surface::new(&crate::apprt::gtk::class::overrides::Overrides::NONE);
             let notified = std::rc::Rc::new(Cell::new(false));
             let n = notified.clone();
             w.connect_notify_local(Some(properties::SURFACE), move |_, _| n.set(true));
-            drop(surface);
-            assert!(!core.inspector_active());
+            w.set_property(properties::SURFACE, &surface);
             assert!(notified.get());
+            assert!(w.get_surface().is_none());
+            assert!(w.imp().core_surface.get().is_none());
+
+            w.set_surface(None);
             assert!(w.get_surface().is_none());
         });
     }

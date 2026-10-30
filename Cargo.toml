@@ -17,8 +17,19 @@ path = "src/root.rs"
 name = "ghostty"
 path = "src/main.rs"
 
+[[bin]]
+name = "ghostty-bench"
+path = "src/bin/ghostty-bench.rs"
+
+[[bin]]
+name = "ghostty-gen"
+path = "src/bin/ghostty-gen.rs"
+
 [features]
-default = []
+# The GTK application runtime is the default on Linux; build the
+# runtime-less helper CLI (and the stand-in apprt) with
+# `--no-default-features`.
+default = ["gtk"]
 inspector = []
 # Crash reporting via the Sentry native SDK (links the system `sentry` C library).
 sentry = []
@@ -51,7 +62,7 @@ gdk4-wayland = { version = "0.10", optional = true, features = ["v4_12", "waylan
 gdk4-x11 = { version = "0.10", optional = true, features = ["v4_4", "xlib"] }
 getrandom = "0.3"
 gio = { version = "0.21", optional = true }
-glib = { version = "0.21", optional = true }
+glib = { version = "0.21", optional = true, features = ["v2_74"] }
 gtk4 = { version = "0.10", optional = true, features = ["v4_14"] }
 gtk4-layer-shell = { version = "0.7", optional = true }
 half = "2"

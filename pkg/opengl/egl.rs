@@ -167,6 +167,14 @@ pub enum StringQuery {
 }
 
 impl Display {
+    /// Wraps a raw `EGLDisplay` obtained elsewhere (e.g. from GDK).
+    ///
+    /// # Safety
+    /// `ptr` must be a valid, initialized `EGLDisplay`.
+    pub unsafe fn from_raw(ptr: NonNull<c_void>) -> Display {
+        Display(ptr)
+    }
+
     /// `attribs`, if given, must end with `EGL_NONE`.
     pub fn init_platform(
         platform: c::EGLenum,

@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/global_shortcuts.zig`.
 //!
-//! STATUS: ported (against the `Application` stand-in in
-//! `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Deviations:
 //! * The per-refresh arena is gone; `arena` only records whether a
@@ -32,9 +31,7 @@ use crate::apprt::gtk::winproto;
 use crate::config::config::Config as CoreConfig;
 use crate::input::binding::{self, Action, Trigger};
 
-// TODO(port-dedupe): replace with
-// crate::apprt::gtk::class::application::Application
-use crate::apprt::gtk::class::port_stubs::Application;
+use crate::apprt::gtk::class::application::Application;
 
 const LOG: &str = "gtk_ghostty_global_shortcuts";
 
@@ -304,8 +301,11 @@ impl GlobalShortcuts {
         let priv_ = self.imp();
 
         // This is safe to call even if the winproto was already
-        // deinitialized, which happens during application teardown.
-        Application::default().with_winproto(|wp| wp.clear_global_shortcuts());
+        // deinitialized, which happens during application teardown. (The
+        // object may also outlive the application, e.g. in tests.)
+        if let Some(app) = Application::try_default() {
+            app.with_winproto(|wp| wp.clear_global_shortcuts());
+        }
 
         if let Some(dbus) = priv_.dbus_connection.borrow().as_ref() {
             if let Some(id) = priv_.response_subscription.take() {
@@ -351,8 +351,8 @@ impl GlobalShortcuts {
         // Prefer a windowing protocol native mechanism over the
         // XDG desktop portal when available.
         let shortcuts: Rc<dyn winproto::GlobalShortcuts> = Rc::new(self.clone());
-        let bound = Application::default()
-            .with_winproto(|wp| wp.bind_global_shortcuts(shortcuts, &config.get()))
+        let bound = Application::try_default()
+            .and_then(|app| app.with_winproto(|wp| wp.bind_global_shortcuts(shortcuts, &config.get())))
             .unwrap_or(false);
         if bound {
             log::debug!(target: LOG, "global shortcuts bound via winproto");
