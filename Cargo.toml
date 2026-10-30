@@ -18,7 +18,10 @@ name = "ghostty"
 path = "src/main.rs"
 
 [features]
-default = []
+# The GTK application runtime is the default on Linux; build the
+# runtime-less helper CLI (and the stand-in apprt) with
+# `--no-default-features`.
+default = ["gtk"]
 inspector = []
 # Crash reporting via the Sentry native SDK (links the system `sentry` C library).
 sentry = []

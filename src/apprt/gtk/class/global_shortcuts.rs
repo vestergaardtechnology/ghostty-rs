@@ -304,8 +304,11 @@ impl GlobalShortcuts {
         let priv_ = self.imp();
 
         // This is safe to call even if the winproto was already
-        // deinitialized, which happens during application teardown.
-        Application::default().with_winproto(|wp| wp.clear_global_shortcuts());
+        // deinitialized, which happens during application teardown. (The
+        // object may also outlive the application, e.g. in tests.)
+        if let Some(app) = Application::try_default() {
+            app.with_winproto(|wp| wp.clear_global_shortcuts());
+        }
 
         if let Some(dbus) = priv_.dbus_connection.borrow().as_ref() {
             if let Some(id) = priv_.response_subscription.take() {
@@ -351,8 +354,8 @@ impl GlobalShortcuts {
         // Prefer a windowing protocol native mechanism over the
         // XDG desktop portal when available.
         let shortcuts: Rc<dyn winproto::GlobalShortcuts> = Rc::new(self.clone());
-        let bound = Application::default()
-            .with_winproto(|wp| wp.bind_global_shortcuts(shortcuts, &config.get()))
+        let bound = Application::try_default()
+            .and_then(|app| app.with_winproto(|wp| wp.bind_global_shortcuts(shortcuts, &config.get())))
             .unwrap_or(false);
         if bound {
             log::debug!(target: LOG, "global shortcuts bound via winproto");

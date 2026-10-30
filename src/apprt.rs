@@ -125,7 +125,7 @@ pub mod standin {
     #[derive(Debug, Default)]
     pub struct App {
         /// The real GTK runtime app this stand-in forwards to, if any.
-        #[cfg(feature = "gtk")]
+        #[cfg(all(feature = "gtk", test))]
         pub rt: Option<crate::apprt::gtk::App>,
 
         /// The app configuration (Zig: `App.config`).
@@ -153,7 +153,7 @@ pub mod standin {
         /// Wake up the app event loop so it processes its mailbox.
         pub fn wakeup(&self) {
             self.wakeup_count.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 rt.wakeup();
             }
@@ -171,7 +171,7 @@ pub mod standin {
                 lock(&self.titles).push(v.title.to_owned());
             }
             lock(&self.actions).push((target, action.key()));
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.perform_action(target, action);
             }
@@ -191,7 +191,7 @@ pub mod standin {
     #[derive(Debug)]
     pub struct Surface {
         /// The real GTK runtime surface this stand-in forwards to, if any.
-        #[cfg(feature = "gtk")]
+        #[cfg(all(feature = "gtk", test))]
         pub rt: Option<crate::apprt::gtk::Surface>,
 
         /// The core surface (Zig: `core_surface`).
@@ -232,7 +232,7 @@ pub mod standin {
     impl Default for Surface {
         fn default() -> Self {
             Surface {
-                #[cfg(feature = "gtk")]
+                #[cfg(all(feature = "gtk", test))]
                 rt: None,
                 core_surface: std::ptr::null_mut(),
                 app: std::ptr::null_mut(),
@@ -255,7 +255,7 @@ pub mod standin {
     impl Surface {
         /// The core surface.
         pub fn core(&self) -> *mut crate::surface::Surface {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.core();
             }
@@ -264,7 +264,7 @@ pub mod standin {
 
         /// The runtime app (Zig: `rtApp`).
         pub fn rt_app(&self) -> *mut App {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.rt_app();
             }
@@ -280,7 +280,7 @@ pub mod standin {
         }
 
         pub fn get_content_scale(&self) -> Result<ContentScale, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.get_content_scale();
             }
@@ -288,7 +288,7 @@ pub mod standin {
         }
 
         pub fn get_size(&self) -> Result<SurfaceSize, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.get_size();
             }
@@ -296,7 +296,7 @@ pub mod standin {
         }
 
         pub fn get_cursor_pos(&self) -> Result<CursorPos, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.get_cursor_pos();
             }
@@ -304,7 +304,7 @@ pub mod standin {
         }
 
         pub fn get_title(&self) -> Option<&CStr> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.get_title();
             }
@@ -312,7 +312,7 @@ pub mod standin {
         }
 
         pub fn close(&self, process_active: bool) {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 rt.close(process_active);
             }
@@ -332,7 +332,7 @@ pub mod standin {
             contents: &[ClipboardContent<'_>],
             _confirm: bool,
         ) -> Result<(), Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.set_clipboard(clipboard, contents, _confirm);
             }
@@ -362,7 +362,7 @@ pub mod standin {
             clipboard: Clipboard,
             req: &ClipboardRequest,
         ) -> Result<ClipboardReadResult, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.clipboard_request(clipboard, req);
             }
@@ -374,7 +374,7 @@ pub mod standin {
         }
 
         pub fn default_termio_env(&self) -> Result<EnvMap, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.default_termio_env();
             }
@@ -385,7 +385,7 @@ pub mod standin {
         }
 
         pub fn render_device_options(&self) -> Result<renderer::DeviceOptions, Error> {
-            #[cfg(feature = "gtk")]
+            #[cfg(all(feature = "gtk", test))]
             if let Some(rt) = &self.rt {
                 return rt.render_device_options();
             }
