@@ -1,9 +1,6 @@
 //! Port of `src/cli/new_tab.zig`.
 //!
 //! STATUS: ported
-//!
-//! The apprt IPC is the stand-in [`new_window::apprt_ipc`]
-//! (TODO(port-dedupe)).
 
 use std::ffi::CStr;
 use std::io::{self, BufWriter, Write};
@@ -11,7 +8,8 @@ use std::io::{self, BufWriter, Write};
 use super::args::{self, cli_struct, ArgIterator, Error, Fields, ParseHooks, ParseNumberError, StringZ};
 use super::diagnostics::DiagnosticList;
 use super::ghostty::{global_args, Action, RunResult};
-use super::new_window::{self, apprt_ipc, ASCII_WHITESPACE};
+use super::new_window::{self, ASCII_WHITESPACE};
+use crate::apprt;
 use crate::global;
 
 cli_struct! {
@@ -176,20 +174,20 @@ fn run_args<I: ArgIterator + ?Sized, W: Write + ?Sized>(args_iter: &mut I, stder
 
     let arguments: Vec<&CStr> = opts._arguments.iter().map(StringZ::as_c_str).collect();
     let target = match opts.class.as_ref() {
-        Some(class) => apprt_ipc::Target::Class(class.as_c_str()),
-        None => apprt_ipc::Target::Detect,
+        Some(class) => apprt::ipc::Target::Class(class.as_c_str()),
+        None => apprt::ipc::Target::Detect,
     };
 
-    match apprt_ipc::App::perform_ipc(
+    match apprt::App::perform_ipc(
         &target,
-        &apprt_ipc::Action::NewTab(apprt_ipc::NewTab {
+        &apprt::ipc::Action::NewTab(apprt::ipc::NewTab {
             surface_id,
             arguments: if arguments.is_empty() { None } else { Some(&arguments) },
         }),
     ) {
         Ok(true) => return Ok(0),
         Ok(false) => {}
-        Err(apprt_ipc::Errors::IpcFailed) => {
+        Err(apprt::ipc::Errors::IpcFailed) => {
             // The apprt should have printed a more specific error message
             // already.
             return Ok(1);

@@ -181,6 +181,25 @@ pub mod standin {
             Ok(self.handled)
         }
 
+        /// Send the given IPC to a running Ghostty. Returns `true` if the
+        /// action was able to be performed, `false` otherwise.
+        ///
+        /// IPC is static (it is called from CLI actions, not from a running
+        /// app), so this forwards to the static `performIpc` of the
+        /// platform's runtime: GTK with the `gtk` feature, embedded on
+        /// macOS, and the `none` runtime otherwise.
+        pub fn perform_ipc(
+            target: &crate::apprt::ipc::Target<'_>,
+            action: &crate::apprt::ipc::Action<'_>,
+        ) -> Result<bool, crate::apprt::ipc::Errors> {
+            #[cfg(all(feature = "gtk", not(target_os = "macos")))]
+            return crate::apprt::gtk::App::perform_ipc(target, action);
+            #[cfg(target_os = "macos")]
+            return crate::apprt::embedded::App::perform_ipc(target, action);
+            #[cfg(all(not(feature = "gtk"), not(target_os = "macos")))]
+            return crate::apprt::none::App::perform_ipc(target, action);
+        }
+
         /// Take the recorded action keys (stand-in bookkeeping).
         pub fn take_actions(&self) -> Vec<ActionKey> {
             std::mem::take(&mut *lock(&self.actions))

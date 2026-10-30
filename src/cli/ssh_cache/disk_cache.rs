@@ -446,24 +446,65 @@ fn is_valid_user(user: &str) -> bool {
         .all(|c| matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.'))
 }
 
-// TODO(port-dedupe): stand-in for `std.Io.net.HostName.validate`.
-/// Validate a DNS host name: at most 255 bytes, dot-separated labels of
-/// 1-63 bytes made of letters, digits and hyphens (non-ASCII UTF-8 is
-/// allowed for IDNs), with no label starting or ending in a hyphen.
+/// Port of `std.Io.net.HostName.validate` (Zig 0.17): validates a hostname
+/// according to RFC 1123.
+///
+/// NOTE(port): Zig standard library function with no Rust std counterpart.
 fn host_name_validate(host: &str) -> bool {
-    const MAX_LEN: usize = 255;
-    if host.is_empty() || host.len() > MAX_LEN {
+    /// `HostName.max_len - 1`
+    const MAX_LEN_WITHOUT_ROOT: usize = 254 - 1;
+
+    let bytes = host.as_bytes();
+    if bytes.is_empty() {
         return false;
     }
-    host.split('.').all(|label| {
-        let b = label.as_bytes();
-        !b.is_empty()
-            && b.len() <= 63
-            && b[0] != b'-'
-            && b[b.len() - 1] != b'-'
-            && b.iter()
-                .all(|&c| !c.is_ascii() || c == b'-' || c.is_ascii_alphanumeric())
-    })
+
+    // Ignore trailing dot (FQDN).
+    let end = if bytes[bytes.len() - 1] == b'.' { bytes.len() - 1 } else { bytes.len() };
+
+    // The accepted maximum length of a hostname, including labels and dots.
+    if end > MAX_LEN_WITHOUT_ROOT {
+        return false;
+    }
+
+    // Hostnames are divided into dot-separated "labels", which:
+    //
+    // - Start with a letter or digit
+    // - Can contain letters, digits, or hyphens
+    // - Must end with a letter or digit
+    // - Have a minimum of 1 character and a maximum of 63
+    let mut label_len: usize = 0;
+    for (i, &c) in bytes[..end].iter().enumerate() {
+        match c {
+            b'.' => {
+                if label_len == 0 || label_len > 63 {
+                    return false;
+                }
+                if !bytes[i - 1].is_ascii_alphanumeric() {
+                    return false;
+                }
+                label_len = 0;
+            }
+            b'-' => {
+                if label_len == 0 {
+                    return false;
+                }
+                label_len += 1;
+            }
+            _ => {
+                if !c.is_ascii_alphanumeric() {
+                    return false;
+                }
+                label_len += 1;
+            }
+        }
+    }
+
+    // Validate the final label
+    if label_len == 0 || label_len > 63 {
+        return false;
+    }
+    bytes[end - 1].is_ascii_alphanumeric()
 }
 
 /// `std.fs.path.dirname`: `None` for a path without a directory component.

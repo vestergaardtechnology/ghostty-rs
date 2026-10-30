@@ -6,8 +6,10 @@
 //!
 //! Zig's timeout callbacks get a `*DesktopNotifications` as user data. The
 //! port keeps the tracked list in an `Rc<RefCell<..>>` that the timeout
-//! closures reference weakly. `Application.default()` is the process's
-//! default `GApplication` (`gio::Application::default()`). Allocator
+//! closures reference weakly. `Application.default()` is
+//! [`Application::try_default`]: without a default Ghostty application
+//! (e.g. in unit tests) sending and withdrawing are skipped instead of
+//! asserting like Zig. Allocator
 //! parameters are dropped; tracking cannot fail, so the Zig test
 //! "desktop notifications allocation failure preserves entries"
 //! (`checkAllAllocationFailures`) has no counterpart.
@@ -18,6 +20,7 @@ use std::rc::{Rc, Weak};
 
 use gio::prelude::*;
 
+use crate::apprt::gtk::class::application::Application;
 use crate::apprt::gtk::ext::source_remove;
 use crate::terminal::hash_map::Wyhash;
 
@@ -63,9 +66,7 @@ impl Default for DesktopNotifications {
 }
 
 fn application() -> Option<gio::Application> {
-    // TODO(port-dedupe): `Application.default()` from
-    // crate::apprt::gtk::class::application once ported.
-    gio::Application::default()
+    Application::try_default().map(|app| app.upcast::<gio::Application>())
 }
 
 impl DesktopNotifications {

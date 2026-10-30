@@ -35,13 +35,8 @@ pub enum Backend {
     WebCanvas,
 }
 
-/// The wasm target kind (port of `os/wasm/target.zig`'s `Target`), used
-/// by [`Backend::default`].
-// TODO(port-dedupe): replace with crate::os::wasm::target::Target
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WasmTarget {
-    Browser,
-}
+/// The wasm target kind, used by [`Backend::default`].
+pub use crate::os::wasm::target::Target as WasmTarget;
 
 /// The parts of a build target (Zig `std.Target`) that [`Backend::default`]
 /// looks at.

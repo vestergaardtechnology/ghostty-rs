@@ -6,15 +6,22 @@
 //! this thread to be released, so that their release callback logic
 //! doesn't block the execution of a high throughput thread like the
 //! renderer thread.
+//!
+//! Port notes:
+//! * Like Zig's `*Thread`, the thread is shared with its spawned OS thread
+//!   through a raw pointer ([`Thread::thread_main`]); other threads only
+//!   touch `mailbox`, `wakeup` and `stop`, which are thread-safe.
+//! * The `Release` message owns its list (Zig: slice + allocator).
 
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
-use std::sync::{Arc, Condvar, Mutex};
 
-use crate::datastruct::BlockingQueue;
-
+use crate::datastruct::blocking_queue::BlockingQueue;
+use crate::global::xev;
 use crate::pkg::macos::foundation;
+
+const LOG: &str = "cf_release_thread";
 
 /// A CFTypeRef that may be sent to the release thread.
 #[derive(Debug, Clone, Copy)]
@@ -34,17 +41,7 @@ pub enum Message {
 /// the future if we want it configurable.
 pub type Mailbox = BlockingQueue<Message, 64>;
 
-/// Stand-in for the xev loop + async handles (wakeup/stop).
-///
-/// TODO(port-dedupe): replace with libxev `Loop`/`Async` once ported.
-#[derive(Default)]
-struct Signals {
-    wakeup: bool,
-    stop: bool,
-    stopped: bool,
-}
-
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy)]
 struct Flags {
     /// This is set to true only when an abnormal exit is detected. It
     /// tells our mailbox system to drain and ignore all messages.
@@ -52,120 +49,143 @@ struct Flags {
 }
 
 pub struct Thread {
-    /// The mailbox that can be used to send this thread messages. Note
-    /// this is a blocking queue so if it is full you will get errors.
-    pub mailbox: Arc<Mailbox>,
+    pub r#loop: xev::Loop,
 
-    signals: Arc<(Mutex<Signals>, Condvar)>,
-
-    flags: Mutex<Flags>,
-}
-
-/// A handle to wake up or stop the thread from another thread.
-#[derive(Clone)]
-pub struct Handle {
-    signals: Arc<(Mutex<Signals>, Condvar)>,
-}
-
-impl Handle {
     /// This can be used to wake up the thread.
-    pub fn notify_wakeup(&self) {
-        let (m, c) = &*self.signals;
-        m.lock().unwrap().wakeup = true;
-        c.notify_all();
-    }
+    pub wakeup: xev::Async,
+    pub wakeup_c: xev::Completion,
 
     /// This can be used to stop the thread on the next loop iteration.
-    pub fn notify_stop(&self) {
-        let (m, c) = &*self.signals;
-        m.lock().unwrap().stop = true;
-        c.notify_all();
-    }
+    pub stop: xev::Async,
+    pub stop_c: xev::Completion,
+
+    /// The mailbox that can be used to send this thread messages. Note
+    /// this is a blocking queue so if it is full you will get errors.
+    pub mailbox: Box<Mailbox>,
+
+    flags: Flags,
 }
+
+// SAFETY: like Zig, the loop and completions are only used by the release
+// thread; other threads only use the thread-safe mailbox and asyncs.
+unsafe impl Send for Thread {}
+unsafe impl Sync for Thread {}
 
 impl Thread {
     /// Initialize the thread. This does not START the thread. This only
     /// sets up all the internal state necessary prior to starting the
     /// thread. It is up to the caller to start the thread with the
     /// thread_main entrypoint.
-    pub fn init() -> Thread {
-        Thread {
-            mailbox: Arc::new(Mailbox::new()),
-            signals: Arc::new((Mutex::new(Signals::default()), Condvar::new())),
-            flags: Mutex::new(Flags::default()),
-        }
+    pub fn init() -> Result<Thread, xev::Error> {
+        let mut r#loop = xev::Loop::init(xev::Options::default())?;
+
+        let mut wakeup_h = match xev::Async::init() {
+            Ok(v) => v,
+            Err(err) => {
+                r#loop.deinit();
+                return Err(err);
+            }
+        };
+
+        let stop_h = match xev::Async::init() {
+            Ok(v) => v,
+            Err(err) => {
+                wakeup_h.deinit();
+                r#loop.deinit();
+                return Err(err);
+            }
+        };
+
+        Ok(Thread {
+            r#loop,
+            wakeup: wakeup_h,
+            wakeup_c: xev::Completion::default(),
+            stop: stop_h,
+            stop_c: xev::Completion::default(),
+            mailbox: Box::new(Mailbox::new()),
+            flags: Flags::default(),
+        })
     }
 
-    pub fn handle(&self) -> Handle {
-        Handle {
-            signals: self.signals.clone(),
-        }
+    pub fn deinit(&mut self) {
+        self.stop.deinit();
+        self.wakeup.deinit();
+        self.r#loop.deinit();
     }
 
     /// The main entrypoint for the thread.
-    pub fn thread_main(&self) {
-        // Call child function so we can use errors...
-        self.thread_main_();
+    ///
+    /// # Safety
+    ///
+    /// `this` must point to a thread that stays valid (and does not move)
+    /// until this returns.
+    pub unsafe fn thread_main(this: *mut Thread) {
+        // SAFETY: caller guarantee.
+        if let Err(err) = unsafe { Self::thread_main_(this) } {
+            log::warn!(target: LOG, "error in cf release thread err={err}");
+        }
 
         // If our loop is not stopped, then we need to keep running so that
         // messages are drained and we can wait for the surface to send a
         // stop message.
-        if !self.signals.0.lock().unwrap().stopped {
+        // SAFETY: caller guarantee.
+        if !unsafe { (*this).r#loop.stopped() } {
             log::warn!(
-                target: "cf_release_thread",
+                target: LOG,
                 "abrupt cf release thread exit detected, starting xev to drain mailbox"
             );
-            self.flags.lock().unwrap().drain = true;
-            self.run_loop();
-            log::debug!(target: "cf_release_thread", "cf release thread fully exiting after abnormal failure");
+            // SAFETY: caller guarantee.
+            unsafe { (*this).flags.drain = true };
+            // SAFETY: caller guarantee.
+            if let Err(err) = unsafe { (*this).r#loop.run(xev::RunMode::UntilDone) } {
+                log::error!(target: LOG, "failed to start xev loop for draining err={err}");
+            }
+            log::debug!(target: LOG, "cf release thread fully exiting after abnormal failure");
         }
     }
 
-    fn thread_main_(&self) {
+    unsafe fn thread_main_(this: *mut Thread) -> Result<(), xev::Error> {
         // Right now, on Darwin, we can only name the current thread, so
         // we use this code to name the thread instead.
         // SAFETY: valid NUL-terminated name.
         unsafe { super::macos::pthread_setname_np(c"cf_release".as_ptr()) };
 
-        // Run
-        log::debug!(target: "cf_release_thread", "starting cf release thread");
-        self.run_loop();
-        log::debug!(target: "cf_release_thread", "starting cf release thread shutdown");
-        log::debug!(target: "cf_release_thread", "cf release thread exited");
-    }
-
-    /// Run until stopped: the wakeup callback drains the mailbox and the
-    /// stop callback stops the loop.
-    fn run_loop(&self) {
-        let (m, c) = &*self.signals;
-        let mut s = m.lock().unwrap();
-        loop {
-            if s.wakeup {
-                s.wakeup = false;
-                drop(s);
-                // When we wake up, we check the mailbox. Mailbox producers
-                // should wake up our thread after publishing.
-                self.drain_mailbox();
-                s = m.lock().unwrap();
-                continue;
-            }
-            if s.stop {
-                s.stopped = true;
-                return;
-            }
-            s = c.wait(s).unwrap();
+        // Start the async handlers. We start these first so that they're
+        // registered even if anything below fails so we can drain the mailbox.
+        // SAFETY: the completions live in the thread, which outlives the
+        // loop run (caller guarantee).
+        unsafe {
+            let t = &mut *this;
+            t.wakeup
+                .wait(&mut t.r#loop, &mut t.wakeup_c, this, wakeup_callback);
+            t.stop.wait(&mut t.r#loop, &mut t.stop_c, this, stop_callback);
         }
+
+        // Run
+        log::debug!(target: LOG, "starting cf release thread");
+        // SAFETY: caller guarantee.
+        let res = unsafe { (*this).r#loop.run(xev::RunMode::UntilDone) };
+        log::debug!(target: LOG, "starting cf release thread shutdown");
+        log::debug!(target: LOG, "cf release thread exited");
+        res
     }
 
     /// Drain the mailbox, handling all the messages.
-    fn drain_mailbox(&self) {
+    ///
+    /// # Safety
+    ///
+    /// `this` must be valid.
+    unsafe fn drain_mailbox(this: *mut Thread) {
+        // SAFETY: caller guarantee.
+        let (drain, mailbox) = unsafe { ((*this).flags.drain, &*(*this).mailbox) };
+
         // If we're draining, we just drain the mailbox and return.
-        if self.flags.lock().unwrap().drain {
-            while self.mailbox.pop().is_some() {}
+        if drain {
+            while mailbox.pop().is_some() {}
             return;
         }
 
-        while let Some(message) = self.mailbox.pop() {
+        while let Some(message) = mailbox.pop() {
             match message {
                 Message::Release { refs } => {
                     for r in refs {
@@ -177,4 +197,34 @@ impl Thread {
             }
         }
     }
+}
+
+fn wakeup_callback(
+    self_: *mut Thread,
+    _: &mut xev::Loop,
+    _: &mut xev::Completion,
+    r: Result<(), xev::r#async::WaitError>,
+) -> xev::CallbackAction {
+    if let Err(err) = r {
+        log::error!(target: LOG, "error in wakeup err={err}");
+        return xev::CallbackAction::Rearm;
+    }
+
+    debug_assert!(!self_.is_null());
+
+    // SAFETY: the thread outlives the loop run.
+    unsafe { Thread::drain_mailbox(self_) };
+
+    xev::CallbackAction::Rearm
+}
+
+fn stop_callback(
+    _self: *mut Thread,
+    l: &mut xev::Loop,
+    _: &mut xev::Completion,
+    r: Result<(), xev::r#async::WaitError>,
+) -> xev::CallbackAction {
+    r.unwrap_or_else(|_| unreachable!());
+    l.stop();
+    xev::CallbackAction::Disarm
 }

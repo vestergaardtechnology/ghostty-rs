@@ -19,8 +19,9 @@
 //!   `self.kitty_clipboard_write.?`).
 //! * The OSC 7 host is validated by [`host_name_from_uri`], a port of
 //!   `std.Io.net.HostName.fromUri`.
-//! * The tmux control mode viewer is a stand-in ([`tmux_standin`],
-//!   TODO(port-dedupe)) until `terminal/tmux/viewer.zig` is ported.
+//! * The tmux viewer is taken out of `tmux_viewer` while its actions are
+//!   handled (the actions borrow it and `messageWriter` borrows the
+//!   handler); the boxed viewer itself does not move.
 //! * `surfaceMessageWriter` retries a full app queue with the message handed
 //!   back by `push_or_return` (Zig copies the message).
 
@@ -70,7 +71,7 @@ use crate::terminfo;
 use crate::termio::message::WriteReqSmall;
 use crate::termio::{Mailbox, Message};
 
-use self::tmux_standin::{Viewer, ViewerAction, ViewerInput};
+use crate::terminal::tmux::viewer::{Action as ViewerAction, Input as ViewerInput, Viewer};
 
 const LOG: &str = "io_handler";
 
@@ -262,9 +263,7 @@ impl StreamHandler {
         self.kitty_clipboard_write_abort();
         self.kitty_clipboard_grants = kitty_clipboard::Grants::default();
         if TMUX_ENABLED {
-            if let Some(mut viewer) = self.tmux_viewer.take() {
-                viewer.deinit();
-            }
+            self.tmux_viewer = None;
         }
     }
 
@@ -310,8 +309,8 @@ impl StreamHandler {
     /// Push a surface message with an instant timeout, handing it back if
     /// the queue is full.
     ///
-    /// TODO(port-dedupe): mirrors `apprt.surface.Mailbox.push` (which moves
-    /// the message) until the apprt mailbox grows a `push_or_return`.
+    /// NOTE(port): mirrors `apprt.surface.Mailbox.push`; Rust moves the
+    /// message into the queue, so the retry needs it handed back (Zig copies).
     fn surface_push_instant(&self, msg: SurfaceMessage) -> Result<(), SurfaceMessage> {
         let mb = self.surface_mailbox;
         // SAFETY: the app mailbox outlives every surface mailbox copy.
@@ -652,9 +651,7 @@ impl StreamHandler {
 
                     ControlNotification::Exit => {
                         // Free our viewer state if we have one
-                        if let Some(mut viewer) = self.tmux_viewer.take() {
-                            viewer.deinit();
-                        }
+                        self.tmux_viewer = None;
 
                         // And always break since we assert below
                         // that we're not handling an exit command.
@@ -664,7 +661,10 @@ impl StreamHandler {
                     _ => {}
                 }
 
-                let Some(viewer) = self.tmux_viewer.as_mut() else {
+                debug_assert!(!matches!(tmux, ControlNotification::Enter));
+                debug_assert!(!matches!(tmux, ControlNotification::Exit));
+
+                let Some(mut viewer) = self.tmux_viewer.take() else {
                     // This can only really happen if we failed to
                     // initialize the viewer on enter.
                     log::info!(
@@ -674,10 +674,9 @@ impl StreamHandler {
                     break 'tmux;
                 };
 
-                let actions: Vec<ViewerAction> = viewer.next(ViewerInput::Tmux(tmux)).to_vec();
-                for action in actions {
-                    log::info!(target: LOG, "tmux viewer action={action:?}");
-                    match action {
+                for action in viewer.next(ViewerInput::Tmux(*tmux)).iter() {
+                    log::info!(target: LOG, "tmux viewer action={action}");
+                    match *action {
                         ViewerAction::Exit => {
                             // We ignore this because we will fully exit when
                             // our DCS connection ends. We may want to handle
@@ -688,14 +687,15 @@ impl StreamHandler {
                         ViewerAction::Command(command) => {
                             debug_assert!(!command.is_empty());
                             debug_assert!(command[command.len() - 1] == b'\n');
-                            self.message_writer(Message::write_req(&command));
+                            self.message_writer(Message::write_req(command));
                         }
 
-                        ViewerAction::Windows => {
+                        ViewerAction::Windows(_) => {
                             // TODO
                         }
                     }
                 }
+                self.tmux_viewer = Some(viewer);
             }
 
             dcs::Command::Xtgettcap(gettcap) => {
@@ -2081,55 +2081,6 @@ fn host_name_from_uri<'a: 'b, 'b>(
     }
 
     Ok(bytes)
-}
-
-/// Stand-in for the tmux control mode viewer.
-///
-/// TODO(port-dedupe): replace with `crate::terminal::tmux::Viewer` once
-/// `terminal/tmux/viewer.zig` is ported. The stand-in never asks tmux for
-/// anything (it produces no actions).
-pub mod tmux_standin {
-    use crate::terminal::tmux::ControlNotification;
-
-    /// Zig: `Viewer.Action`.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum ViewerAction {
-        /// Tmux has closed the control mode connection, we should end
-        /// our viewer session in some way.
-        Exit,
-
-        /// Send a command to tmux, e.g. `list-windows`. The command
-        /// always ends in a newline.
-        Command(Vec<u8>),
-
-        /// Windows changed.
-        Windows,
-    }
-
-    /// Zig: `Viewer.Input`.
-    #[derive(Debug)]
-    pub enum ViewerInput<'n, 'a> {
-        /// Data from tmux was received that needs to be processed.
-        Tmux(&'n ControlNotification<'a>),
-    }
-
-    /// Zig: `Viewer`.
-    #[derive(Debug, Default)]
-    pub struct Viewer {}
-
-    impl Viewer {
-        pub fn init() -> Viewer {
-            Viewer {}
-        }
-
-        pub fn deinit(&mut self) {}
-
-        /// Process an input and return the actions to perform.
-        pub fn next(&mut self, input: ViewerInput<'_, '_>) -> &[ViewerAction] {
-            let _ = input;
-            &[]
-        }
-    }
 }
 
 #[cfg(test)]

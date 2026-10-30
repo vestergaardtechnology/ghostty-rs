@@ -26,14 +26,6 @@ cli_struct! {
 pub const HELP: &str = "The `version` command is used to display information about Ghostty. Recognized as
 either `+version` or `--version`.";
 
-// TODO(port-dedupe): replace with the Ghostty build options (`build_options.x11`
-// and `build_options.wayland`) once they exist. These are the defaults of
-// the Ghostty application build on Linux.
-mod build_options {
-    pub const X11: bool = true;
-    pub const WAYLAND: bool = true;
-}
-
 /// The `version` command is used to display information about Ghostty. Recognized as
 /// either `+version` or `--version`.
 pub fn run() -> RunResult {
@@ -104,7 +96,7 @@ pub fn run() -> RunResult {
         writeln!(stdout, "  - libadwaita    : enabled")?;
         writeln!(stdout, "    build         : {}", adw_version::COMPTIME_VERSION)?;
         writeln!(stdout, "    runtime       : {}", adw_version::get_runtime_version())?;
-        if build_options::X11 {
+        if build_config::X11 {
             writeln!(stdout, "  - libX11        : enabled")?;
         } else {
             writeln!(stdout, "  - libX11        : disabled")?;
@@ -112,7 +104,7 @@ pub fn run() -> RunResult {
 
         // We say `libwayland` since it is possible to build Ghostty without
         // Wayland integration but with Wayland-enabled GTK
-        if build_options::WAYLAND {
+        if build_config::WAYLAND {
             writeln!(stdout, "  - libwayland    : enabled")?;
         } else {
             writeln!(stdout, "  - libwayland    : disabled")?;

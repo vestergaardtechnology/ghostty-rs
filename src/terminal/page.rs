@@ -168,24 +168,18 @@ impl AllocPosix {
 struct AllocWindows;
 
 #[cfg(windows)]
-mod windows_stand_in {
-    // TODO(port-dedupe): replace with crate::os::windows (exp.kernel32).
-    pub const MEM_COMMIT: u32 = 0x0000_1000;
-    pub const MEM_RESERVE: u32 = 0x0000_2000;
-    pub const MEM_RELEASE: u32 = 0x0000_8000;
-    pub const PAGE_READWRITE: u32 = 0x04;
-    extern "system" {
-        pub fn VirtualAlloc(addr: *mut core::ffi::c_void, size: usize, ty: u32, protect: u32) -> *mut core::ffi::c_void;
-        pub fn VirtualFree(addr: *mut core::ffi::c_void, size: usize, ty: u32) -> i32;
-    }
-}
-
-#[cfg(windows)]
 impl AllocWindows {
     fn alloc(n: usize) -> Result<PageMemory, AllocError> {
-        use windows_stand_in::*;
+        use crate::os::windows;
         // SAFETY: plain reserve+commit of fresh memory.
-        let addr = unsafe { VirtualAlloc(core::ptr::null_mut(), n, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        let addr = unsafe {
+            windows::exp::kernel32::VirtualAlloc(
+                core::ptr::null_mut(),
+                n,
+                windows::MEM_COMMIT | windows::MEM_RESERVE,
+                windows::PAGE_READWRITE,
+            )
+        };
         if addr.is_null() {
             return Err(AllocError::OutOfMemory);
         }
@@ -194,9 +188,9 @@ impl AllocWindows {
     }
 
     fn free(mem: PageMemory) {
-        use windows_stand_in::*;
+        use crate::os::windows;
         // SAFETY: `mem` was returned by `alloc`.
-        unsafe { VirtualFree(mem.ptr().cast(), 0, MEM_RELEASE) };
+        unsafe { windows::exp::kernel32::VirtualFree(mem.ptr().cast(), 0, windows::MEM_RELEASE) };
     }
 }
 

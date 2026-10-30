@@ -1,15 +1,12 @@
 //! Port of `src/cli/toggle_quick_terminal.zig`.
 //!
 //! STATUS: ported
-//!
-//! The apprt IPC is the stand-in [`new_window::apprt_ipc`]
-//! (TODO(port-dedupe)).
 
 use std::io::{self, Write};
 
 use super::args::{cli_struct, Error, ParseHooks, StringZ};
 use super::ghostty::{Action, RunResult};
-use super::new_window::apprt_ipc;
+use crate::apprt;
 
 cli_struct! {
     #[derive(Debug, Clone)]
@@ -38,10 +35,10 @@ pub fn run() -> RunResult {
 
     // Note: like the Zig version, the options (and so `--class`) are not
     // parsed; the default instance is always targeted.
-    match apprt_ipc::App::perform_ipc(&apprt_ipc::Target::Detect, &apprt_ipc::Action::ToggleQuickTerminal) {
+    match apprt::App::perform_ipc(&apprt::ipc::Target::Detect, &apprt::ipc::Action::ToggleQuickTerminal) {
         Ok(true) => return Ok(0),
         Ok(false) => {}
-        Err(apprt_ipc::Errors::IpcFailed) => return Ok(1),
+        Err(apprt::ipc::Errors::IpcFailed) => return Ok(1),
     }
 
     write!(stderr, "+toggle-quick-terminal is not supported on this platform.\n")?;

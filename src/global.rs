@@ -222,9 +222,7 @@ fn init_inner(opts: &InitOpts) -> Result<(), InitError> {
             crate::pkg::fontconfig::version()
         );
     }
-    // TODO(port-dedupe): log `crate::renderer::Renderer` once the renderer
-    // is ported (Zig prints the renderer type name).
-    log::info!("renderer={}", build_config::RENDERER);
+    log::info!("renderer={}", std::any::type_name::<crate::renderer::Renderer>());
     log::info!("libxev default backend={}", xev::backend());
 
     // As early as possible, initialize our resource limits.

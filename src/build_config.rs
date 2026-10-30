@@ -141,6 +141,13 @@ pub const FLATPAK: bool = false;
 /// Whether this is a Snap build (Zig build option `-Dsnap`, default false).
 pub const SNAP: bool = false;
 pub const APP_RUNTIME: Runtime = Runtime::default();
+/// Whether the GTK apprt is built with X11 support (Zig build option
+/// `build_options.x11`, `-Dgtk-x11`, on by default for GTK builds on Linux).
+pub const X11: bool = matches!(APP_RUNTIME, Runtime::Gtk);
+/// Whether the GTK apprt is built with Wayland support (Zig build option
+/// `build_options.wayland`, `-Dgtk-wayland`, on by default for GTK builds
+/// on Linux).
+pub const WAYLAND: bool = matches!(APP_RUNTIME, Runtime::Gtk);
 pub const FONT_BACKEND: FontBackend = FontBackend::default(
     crate::font::backend::Target::current(),
     crate::font::backend::WasmTarget::Browser,

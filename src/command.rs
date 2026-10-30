@@ -214,7 +214,7 @@ pub fn rt_post_fork_info_unset() -> RtPostForkInfo {
 pub const RT_PRE_EXEC: Option<PreExecFn> = {
     #[cfg(all(feature = "gtk", not(target_os = "macos")))]
     {
-        Some(|cmd: &mut Command| crate::apprt::gtk::pre_exec::pre_exec(&cmd.rt_pre_exec_info))
+        Some(crate::apprt::gtk::pre_exec::pre_exec)
     }
     #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
     {
@@ -227,9 +227,7 @@ pub const RT_PRE_EXEC: Option<PreExecFn> = {
 pub const RT_POST_FORK: Option<PostForkFn> = {
     #[cfg(all(feature = "gtk", not(target_os = "macos")))]
     {
-        Some(|cmd: &mut Command| {
-            crate::apprt::gtk::post_fork::post_fork(cmd.pid, &cmd.rt_post_fork_info)
-        })
+        Some(crate::apprt::gtk::post_fork::post_fork)
     }
     #[cfg(not(all(feature = "gtk", not(target_os = "macos"))))]
     {

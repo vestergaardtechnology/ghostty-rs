@@ -10,7 +10,9 @@
 
 use crate::config::Config;
 use crate::renderer::generic::{DerivedConfig as RendererDerivedConfig, InitError};
-use crate::renderer::standin::{SharedGrid, SharedGridSet, SharedGridSetKey, ThreadDerivedConfig};
+use crate::font::shared_grid_set::Key as SharedGridSetKey;
+use crate::font::{SharedGrid, SharedGridSet};
+use crate::renderer::thread::DerivedConfig as ThreadDerivedConfig;
 use crate::renderer::{Health, Size};
 
 pub use crate::terminal::highlight::Flattened;

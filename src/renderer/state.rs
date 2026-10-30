@@ -24,25 +24,6 @@ use crate::terminal::size::CellCountInt;
 use crate::inspector::Inspector;
 use crate::terminal::terminal::Terminal;
 
-/// Stand-ins for types whose Zig files are not ported yet.
-pub mod standin {
-    /// The terminal the state points at. This used to be a stand-in and
-    /// is kept as an alias for modules that still name it.
-    pub type Terminal = crate::terminal::terminal::Terminal;
-
-    /// A default terminal for modules that construct the former
-    /// stand-in with `Terminal::default()` (an 80x24 terminal).
-    ///
-    /// TODO(port-dedupe): remove once those callers construct the
-    /// terminal with `Terminal::init`.
-    impl Default for crate::terminal::terminal::Terminal {
-        fn default() -> Self {
-            crate::terminal::terminal::Terminal::init(crate::terminal::terminal::Options::new(80, 24))
-                .expect("default terminal")
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct State {
     /// The mutex that must be held while reading any of the data in the
@@ -318,7 +299,7 @@ mod tests {
     #[test]
     fn lock_demand_handoff() {
         let mut mutex = Mutex::new();
-        let mut terminal = Terminal::default();
+        let mut terminal = Terminal::init(crate::terminal::terminal::Options::new(80, 24)).unwrap();
         let state = State::new(NonNull::from(&mut mutex), NonNull::from(&mut terminal));
         let io = TinyIo;
 

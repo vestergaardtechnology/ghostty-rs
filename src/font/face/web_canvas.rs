@@ -614,15 +614,17 @@ pub mod wasm {
     ) -> Result<*mut Glyph, Error> {
         let metrics = face.metrics;
         let glyph = face.render_glyph(atlas, codepoint, RenderOptions::new(metrics))?;
-        // TODO(port-dedupe): Zig hands the result to the host with
-        // `wasm.toHostOwned`; here it is leaked with Box::into_raw.
+        // NOTE(port): Zig hands the result to the host with
+        // `wasm.toHostOwned`, which no longer exists in `os/wasm.zig` (this
+        // Zig file predates that refactor); here it is leaked with
+        // Box::into_raw.
         Ok(Box::into_raw(Box::new(glyph)))
     }
 }
 
 /// Minimal stand-in for the `zig-js` package (JS object handles imported
 /// from the host).
-// TODO(port-dedupe): replace with a Rust port of zig-js once one exists.
+// NOTE(port): zig-js is a third-party Zig package with no Rust port.
 pub mod js {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Error;

@@ -59,7 +59,8 @@
 //!   shaper) can be held while glyphs are added. Shaped cells are copied
 //!   into a reusable buffer instead of being borrowed from the shaper.
 //! * `std.Io.Semaphore` is a small mutex/condvar [`Semaphore`]
-//!   (TODO(port-dedupe): `std.Io` port); timestamps are `Instant`s.
+//!   (NOTE(port): Zig std library type with no Rust counterpart);
+//!   timestamps are `Instant`s.
 //! * The allocator field and parameters are dropped; arenas are plain
 //!   owned values. `DerivedConfig` owns its data (no arena).
 //! * `updateFrame`/`drawFrame` return `Result<(), Error>` with a boxed
@@ -261,7 +262,8 @@ mod compat {
 
 /// A counting semaphore (Zig: `std.Io.Semaphore`).
 ///
-/// TODO(port-dedupe): replace with the `std.Io` port's semaphore.
+/// NOTE(port): `std.Io.Semaphore` is Zig standard library; Rust's std has
+/// no semaphore and `lib::tinyio` does not provide one, so it stays here.
 #[derive(Debug)]
 pub struct Semaphore {
     permits: StdMutex<usize>,
