@@ -275,9 +275,16 @@ mod tests {
     fn surface_lifecycle() {
         test_gtk::run(|| {
             let w = InspectorWidget::default();
-            // The subclass overrides the virtual methods.
+            // The subclass overrides the virtual methods. They need a
+            // current ImGui context (the widget creates one on realize).
+            // SAFETY: plain ImGui context lifecycle.
+            let ctx = unsafe { crate::pkg::dcimgui::c::ImGui_CreateContext(std::ptr::null_mut()) };
             w.upcast_ref::<ImguiWidget>().setup();
+            // SAFETY: the context is current.
+            assert_ne!(unsafe { (*crate::pkg::dcimgui::c::ImGui_GetIO()).ConfigFlags }, 0);
             w.upcast_ref::<ImguiWidget>().render();
+            // SAFETY: created above.
+            unsafe { crate::pkg::dcimgui::c::ImGui_DestroyContext(ctx) };
 
             // A surface without a core surface (not yet realized) can't
             // host the inspector, so it isn't stored. (A live core surface
