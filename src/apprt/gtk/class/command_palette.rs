@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/command_palette.zig`.
 //!
-//! STATUS: ported (against the `Application`, `Surface` and `Window`
-//! stand-ins in `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Zig's `new` sinks the palette and keeps a reference that is dropped
 //! when the dialog closes; the port keeps that reference in a private
@@ -25,8 +24,6 @@ use crate::apprt::gtk::weak_ref::WeakRef;
 use crate::input::binding::Action;
 use crate::input::command::Command as InputCommand;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::{
-// application::Application, surface::Surface, window::Window}.
 use crate::apprt::gtk::class::application::Application;
 use crate::apprt::gtk::class::surface::Surface;
 use crate::apprt::gtk::class::window::Window;

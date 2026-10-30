@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/surface_scrolled_window.zig`.
 //!
-//! STATUS: ported (against the `Surface` stand-in in
-//! `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Zig stores the surface pointer without a reference (the scrolled
 //! window, our child, keeps it alive); the port holds a strong reference,
@@ -20,7 +19,6 @@ use crate::apprt::gtk::class::{self, accessor, Blueprint, Config};
 use crate::apprt::gtk::gtk_version;
 use crate::config::config::Scrollbar;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
 use crate::apprt::gtk::class::surface::Surface;
 
 /// The template of this class (Zig: `gresource.blueprint(...)`).

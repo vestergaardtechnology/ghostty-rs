@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/global_shortcuts.zig`.
 //!
-//! STATUS: ported (against the `Application` stand-in in
-//! `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported.
 //!
 //! Deviations:
 //! * The per-refresh arena is gone; `arena` only records whether a
@@ -32,8 +31,6 @@ use crate::apprt::gtk::winproto;
 use crate::config::config::Config as CoreConfig;
 use crate::input::binding::{self, Action, Trigger};
 
-// TODO(port-dedupe): replace with
-// crate::apprt::gtk::class::application::Application
 use crate::apprt::gtk::class::application::Application;
 
 const LOG: &str = "gtk_ghostty_global_shortcuts";

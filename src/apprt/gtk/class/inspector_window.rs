@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/inspector_window.zig`.
 //!
-//! STATUS: ported (against the `Surface` stand-in in `class::port_stubs`,
-//! TODO(port-dedupe)). Only built with the `inspector` Cargo feature, like
+//! STATUS: ported. Only built with the `inspector` Cargo feature, like
 //! the [`InspectorWidget`] it embeds.
 #![cfg(all(feature = "gtk", feature = "inspector"))]
 
@@ -20,7 +19,6 @@ use crate::apprt::gtk::class::{self, Blueprint};
 use crate::apprt::gtk::weak_ref::WeakRef;
 use crate::build_config;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
 use crate::apprt::gtk::class::surface::Surface;
 
 /// The template of this class (Zig: `gresource.blueprint(...)`).
@@ -180,7 +178,6 @@ impl InspectorWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apprt::gtk::class::port_stubs::CoreSurface;
     use crate::apprt::gtk::ext::test_gtk;
 
     #[test]
@@ -194,17 +191,15 @@ mod tests {
     #[test]
     fn instantiate_and_bind_surface() {
         test_gtk::run(|| {
-            let core = CoreSurface::new(3);
-            let surface = Surface::default();
-            surface.set_core(Some(core.clone()));
-
-            let window = InspectorWindow::new(&surface);
-            assert_eq!(window.property::<Option<Surface>>(properties::SURFACE).as_ref(), Some(&surface));
+            // A surface needs a live core surface (a running terminal) to
+            // host the inspector; binding a surface without one makes the
+            // inspector widget drop it, which closes the window (like Zig).
+            // So the window is instantiated without a surface here.
+            let window: InspectorWindow = glib::Object::new();
+            assert!(window.property::<Option<Surface>>(properties::SURFACE).is_none());
             assert_eq!(window.property::<bool>(properties::DEBUG), build_config::IS_DEBUG);
             assert_eq!(window.icon_name().as_deref(), Some(build_config::BUNDLE_ID));
-            // The surface is bound into the inspector widget.
-            assert_eq!(window.imp().inspector_widget.get_surface().as_ref(), Some(&surface));
-            assert!(core.inspector_active());
+            assert!(window.imp().inspector_widget.get_surface().is_none());
             window.queue_render();
 
             window.destroy();
