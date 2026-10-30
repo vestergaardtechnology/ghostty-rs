@@ -777,26 +777,85 @@ fn classify_word(cell: &TerminalCell) -> u64 {
 /// Every admitted cell round-trips exactly because the row's width
 /// selection proved every cell word survives `truncate` then `extend`.
 fn encode_narrow_cells(width: EncodedWidth, cells: &[TerminalCell], writer: &mut dyn io::Writer) -> io::Result<()> {
-    let size = width.size();
+    match width {
+        EncodedWidth::One => encode_narrow_cells_n::<1>(cells, writer),
+        EncodedWidth::Two => encode_narrow_cells_n::<2>(cells, writer),
+        EncodedWidth::Four => encode_narrow_cells_n::<4>(cells, writer),
+        // Full-width rows are copied as raw words by `encode`.
+        EncodedWidth::Eight => unreachable!("full-width rows are not truncated"),
+    }
+}
+
+fn encode_narrow_cells_n<const SIZE: usize>(cells: &[TerminalCell], writer: &mut dyn io::Writer) -> io::Result<()> {
     let mut chunk = [0u8; 1024];
     let mut i = 0;
     while i < cells.len() {
-        let n = (cells.len() - i).min(chunk.len() / size);
+        let n = (cells.len() - i).min(chunk.len() / SIZE);
         for (j, cell) in cells[i..i + n].iter().enumerate() {
-            width.write_value(&mut chunk[j * size..], width.truncate(classify_word(cell)));
+            store_le::<SIZE>(&mut chunk[j * SIZE..], narrow_truncated::<SIZE>(classify_word(cell)));
         }
-        writer.write_all(&chunk[..n * size])?;
+        writer.write_all(&chunk[..n * SIZE])?;
         i += n;
     }
     Ok(())
 }
 
 /// Truncate one row's cell words into `out` at the given encoded width.
+///
+/// `width` is monomorphized, matching Zig's `encodeNarrowInto` where the
+/// width is `comptime`. A runtime byte count makes every cell a
+/// variable-length `memcpy`; a fixed width is a plain store.
 fn encode_narrow_into(width: EncodedWidth, words: &[u64], count: usize, out: &mut [u8]) {
     debug_assert!(bulk_codec());
-    let size = width.size();
+    match width {
+        EncodedWidth::One => encode_narrow_words::<1>(words, count, out),
+        EncodedWidth::Two => encode_narrow_words::<2>(words, count, out),
+        EncodedWidth::Four => encode_narrow_words::<4>(words, count, out),
+        EncodedWidth::Eight => unreachable!("full-width rows are copied, not truncated"),
+    }
+}
+
+#[inline(always)]
+fn encode_narrow_words<const SIZE: usize>(words: &[u64], count: usize, out: &mut [u8]) {
     for (j, &word) in words[..count].iter().enumerate() {
-        width.write_value(&mut out[j * size..], width.truncate(word));
+        store_le::<SIZE>(&mut out[j * SIZE..], narrow_truncated::<SIZE>(word));
+    }
+}
+
+/// The transported value of one cell word at a fixed encoded width.
+/// Widths 1 and 2 carry the low bytes of the content field; width 4
+/// carries the low 32 bits of the word (Zig: `EncodedWidth.truncate`).
+#[inline(always)]
+fn narrow_truncated<const SIZE: usize>(word: u64) -> u64 {
+    match SIZE {
+        1 => (word >> cell_bits::CONTENT) & 0xFF,
+        2 => (word >> cell_bits::CONTENT) & 0xFFFF,
+        4 => word & 0xFFFF_FFFF,
+        _ => unreachable!("encoded width is 1, 2, or 4 bytes"),
+    }
+}
+
+/// Store the low `SIZE` bytes of `value` little-endian. `SIZE` is a
+/// constant so this lowers to a fixed-width store.
+#[inline(always)]
+fn store_le<const SIZE: usize>(out: &mut [u8], value: u64) {
+    match SIZE {
+        1 => out[0] = value as u8,
+        2 => out[..2].copy_from_slice(&(value as u16).to_le_bytes()),
+        4 => out[..4].copy_from_slice(&(value as u32).to_le_bytes()),
+        _ => unreachable!("encoded width is 1, 2, or 4 bytes"),
+    }
+}
+
+/// Load `SIZE` little-endian bytes. `SIZE` is a constant so this lowers
+/// to a fixed-width load.
+#[inline(always)]
+fn load_le<const SIZE: usize>(bytes: &[u8]) -> u64 {
+    match SIZE {
+        1 => bytes[0] as u64,
+        2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+        4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+        _ => unreachable!("encoded width is 1, 2, or 4 bytes"),
     }
 }
 
@@ -1054,19 +1113,45 @@ fn decode_narrow_cells(width: EncodedWidth, reader: &mut dyn io::Reader, cells: 
 
 /// Store codepoint-valued encoded cells of the given width.
 fn widen_cells(width: EncodedWidth, bytes: &[u8], cells: &mut [TerminalCell]) {
-    let size = width.size();
-
     // When the native cell matches the wire word, this is a pure widening
-    // loop over integers.
+    // loop over integers. The width is monomorphized, matching Zig's
+    // `widenCells`: a runtime byte count makes every cell a
+    // variable-length `memcpy` plus a widen.
     if native_matches_wire() {
-        for (i, cell) in cells.iter_mut().enumerate() {
-            *cell = TerminalCell::from_bits(width.extend(widen_value(width, &bytes[i * size..])));
+        match width {
+            EncodedWidth::One => widen_codepoint_words::<1>(bytes, cells),
+            EncodedWidth::Two => widen_codepoint_words::<2>(bytes, cells),
+            // Widths four and eight are decoded by `decode_word_cells`.
+            // This loop keeps a direct call correct if one shows up here.
+            EncodedWidth::Four | EncodedWidth::Eight => {
+                let size = width.size();
+                for (i, cell) in cells.iter_mut().enumerate() {
+                    *cell = TerminalCell::from_bits(width.extend(widen_value(width, &bytes[i * size..])));
+                }
+            }
         }
         return;
     }
 
+    let size = width.size();
     for (i, cell) in cells.iter_mut().enumerate() {
         store_cell(cell, width.extend(widen_value(width, &bytes[i * size..])));
+    }
+}
+
+/// Widen bare codepoints into native cells. `SIZE` is 1 or 2.
+#[inline(always)]
+fn widen_codepoint_words<const SIZE: usize>(bytes: &[u8], cells: &mut [TerminalCell]) {
+    for (i, cell) in cells.iter_mut().enumerate() {
+        let mut value = load_le::<SIZE>(&bytes[i * SIZE..]);
+        // Width two admits surrogates, which degrade to U+FFFD exactly
+        // like `widen_value`. Width one cannot encode an invalid scalar.
+        if SIZE != 1 && !valid_scalar(value as u32) {
+            value = 0xFFFD;
+        }
+        // The content field sits at `cell_bits::CONTENT`; every other
+        // field of a narrow cell is zero, which is `EncodedWidth::extend`.
+        *cell = TerminalCell::from_bits(value << cell_bits::CONTENT);
     }
 }
 
@@ -1586,6 +1671,77 @@ mod tests {
 
     fn remaps() -> (StyleRemap, HyperlinkRemap) {
         (StyleRemap::init().unwrap(), HyperlinkRemap::init().unwrap())
+    }
+
+    /// The fixed-width narrow codec must agree with the per-cell
+    /// `truncate` / `extend` rules for every row length, including empty
+    /// and short rows, and it must not write past the row.
+    #[test]
+    fn narrow_codec_matches_per_cell_truncate_and_extend() {
+        let patterns = [
+            0u64,
+            0x41 << cell_bits::CONTENT,
+            0xFF << cell_bits::CONTENT,
+            0x100 << cell_bits::CONTENT,
+            0xD7FF << cell_bits::CONTENT,
+            0xD800 << cell_bits::CONTENT,
+            0xDFFF << cell_bits::CONTENT,
+            0xE000 << cell_bits::CONTENT,
+            0xFFFF << cell_bits::CONTENT,
+            0x1F_FFFF << cell_bits::CONTENT,
+            u64::MAX,
+            0x3,
+            (0xBEEFu64 << cell_bits::STYLE_ID) | (0x41 << cell_bits::CONTENT),
+        ];
+        for width in [EncodedWidth::One, EncodedWidth::Two, EncodedWidth::Four] {
+            for count in [0usize, 1, 3, 4, 5, 7, 8, 17] {
+                let words: Vec<u64> = (0..count)
+                    .map(|i| patterns[i % patterns.len()].wrapping_mul(i as u64 + 1))
+                    .collect();
+                let size = width.size();
+                let mut fast = vec![0u8; count * size + 8];
+                encode_narrow_into(width, &words, count, &mut fast);
+                assert_eq!(&fast[count * size..], &[0u8; 8], "{width:?} count={count} wrote past the row");
+
+                let mut slow = vec![0u8; count * size];
+                for (j, &word) in words.iter().enumerate() {
+                    width.write_value(&mut slow[j * size..], width.truncate(word));
+                }
+                assert_eq!(&fast[..count * size], slow.as_slice(), "{width:?} count={count}");
+
+                if native_matches_wire() && matches!(width, EncodedWidth::One | EncodedWidth::Two) {
+                    let mut cells = vec![TerminalCell::init(0); count];
+                    widen_cells(width, &fast[..count * size], &mut cells);
+                    for (j, cell) in cells.iter().enumerate() {
+                        let value = width.read_value(&slow[j * size..]);
+                        let value = if width != EncodedWidth::One && !valid_scalar(value as u32) {
+                            0xFFFD
+                        } else {
+                            value
+                        };
+                        assert_eq!(
+                            cell.to_bits(),
+                            width.extend(value),
+                            "{width:?} count={count} cell={j}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The streaming fallback truncates through `classify_word`, which is
+        // the identity when the native cell matches the wire word.
+        let cells: Vec<TerminalCell> = (0..17u32).map(TerminalCell::init).collect();
+        for width in [EncodedWidth::One, EncodedWidth::Two, EncodedWidth::Four] {
+            let mut got = Vec::new();
+            encode_narrow_cells(width, &cells, &mut got).unwrap();
+            let size = width.size();
+            let mut expect = vec![0u8; cells.len() * size];
+            for (j, cell) in cells.iter().enumerate() {
+                width.write_value(&mut expect[j * size..], width.truncate(classify_word(cell)));
+            }
+            assert_eq!(got, expect, "{width:?}");
+        }
     }
 
     #[test]
