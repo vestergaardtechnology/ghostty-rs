@@ -382,6 +382,14 @@ pub fn logging() -> Logging {
     with_state(|s| s.logging)
 }
 
+/// The global state logging configuration, or `None` if the global state
+/// is not initialized or is being written (the logger reads this while
+/// `init` may hold the state lock, so it must never block).
+pub fn try_logging() -> Option<Logging> {
+    let guard = STATE.try_read().ok()?;
+    guard.as_ref().map(|s| s.logging)
+}
+
 /// Returns the global state action.
 ///
 /// Asserts that the global state is initialized.

@@ -93,6 +93,18 @@ pub fn wrap_surface(surface: Surface) -> crate::apprt::Surface {
     }
 }
 
+/// The GTK runtime app of a [`crate::apprt::App`].
+#[cfg(all(feature = "gtk", not(test)))]
+pub fn rt_app(app: &crate::apprt::App) -> &App {
+    app
+}
+
+/// See the non-test variant.
+#[cfg(all(feature = "gtk", test))]
+pub fn rt_app(app: &crate::apprt::App) -> &App {
+    app.rt.as_ref().expect("app has a GTK runtime app")
+}
+
 /// The GTK runtime surface of a [`crate::apprt::Surface`] (Zig:
 /// `core.rt_surface`).
 #[cfg(all(feature = "gtk", not(test)))]
