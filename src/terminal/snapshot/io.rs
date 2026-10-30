@@ -116,6 +116,17 @@ pub enum Error {
     ScrollbackLimitOverflow,
     InvalidTabStops,
     InvalidPalette,
+
+    // kitty
+    UnexpectedKittyKey,
+
+    // snapshot
+    DuplicateScreen,
+    DecoderNotReady,
+    DecoderFailed,
+    UnexpectedHistoryKey,
+    DuplicateHistory,
+    TrailingData,
 }
 
 impl fmt::Display for Error {

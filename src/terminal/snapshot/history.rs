@@ -59,12 +59,9 @@
 //!
 //! A decoder uses `page_count`, rather than another record tag, to find the end
 //! of the page sequence.
-//!
-//! Notes on the port:
-//! - `encode` takes the Kitty graphics plan through the [`KittyPlan`] trait
-//!   because `snapshot/kitty.zig` is not ported yet.
 
 use super::io::{self, Error};
+use super::kitty;
 use super::page;
 use super::record;
 use crate::terminal::build_options;
@@ -112,17 +109,6 @@ impl Header {
     }
 }
 
-/// The Kitty graphics placements plan of one screen
-/// (Zig: `kitty.Plan.encodePagePlacements`).
-///
-/// TODO(port-dedupe): replace with crate::terminal::snapshot::kitty::Plan
-/// once `snapshot/kitty.zig` is ported.
-pub trait KittyPlan {
-    /// Encode the KITTY_IMAGE_PAGE_PLACEMENTS record for the placements
-    /// pinned to `node`, if any.
-    fn encode_page_placements(&mut self, node: NodePtr, destination: &mut record::Writer<'_>) -> Result<(), Error>;
-}
-
 /// Errors possible while encoding one HISTORY and its complete PAGE sequence,
 /// including `PageCountOverflow` when the complete historical prefix has more
 /// pages than the header fits.
@@ -147,7 +133,7 @@ pub fn encode(
     terminal_screen: &TerminalScreen,
     key: TerminalScreenKey,
     destination: &mut record::Writer<'_>,
-    mut kitty_plan: Option<&mut dyn KittyPlan>,
+    mut kitty_plan: Option<&mut kitty::Plan<'_>>,
 ) -> Result<(), EncodeError> {
     // SCREEN begins at the page containing the active area's first row. Its
     // leading rows are already resident; every previous complete page belongs
