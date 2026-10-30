@@ -428,7 +428,7 @@ fn is_valid_port(port: &str) -> bool {
 fn is_valid_host(host: &str) -> bool {
     // First check for valid hostnames because this is assumed to be the more
     // likely ssh host format.
-    if host_name_validate(host) {
+    if host_name_validate(host.as_bytes()).is_ok() {
         return true;
     }
 
@@ -446,17 +446,26 @@ fn is_valid_user(user: &str) -> bool {
         .all(|c| matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.'))
 }
 
+/// The errors of [`host_name_validate`] (Zig: `HostName.ValidateError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostNameValidateError {
+    NameTooLong,
+    InvalidHostName,
+}
+
 /// Port of `std.Io.net.HostName.validate` (Zig 0.17): validates a hostname
 /// according to RFC 1123.
 ///
 /// NOTE(port): Zig standard library function with no Rust std counterpart.
-fn host_name_validate(host: &str) -> bool {
+/// Also used by `termio::stream_handler` (`HostName.fromUri`).
+pub(crate) fn host_name_validate(bytes: &[u8]) -> Result<(), HostNameValidateError> {
+    use HostNameValidateError::*;
+
     /// `HostName.max_len - 1`
     const MAX_LEN_WITHOUT_ROOT: usize = 254 - 1;
 
-    let bytes = host.as_bytes();
     if bytes.is_empty() {
-        return false;
+        return Err(InvalidHostName);
     }
 
     // Ignore trailing dot (FQDN).
@@ -464,7 +473,7 @@ fn host_name_validate(host: &str) -> bool {
 
     // The accepted maximum length of a hostname, including labels and dots.
     if end > MAX_LEN_WITHOUT_ROOT {
-        return false;
+        return Err(NameTooLong);
     }
 
     // Hostnames are divided into dot-separated "labels", which:
@@ -478,22 +487,22 @@ fn host_name_validate(host: &str) -> bool {
         match c {
             b'.' => {
                 if label_len == 0 || label_len > 63 {
-                    return false;
+                    return Err(InvalidHostName);
                 }
                 if !bytes[i - 1].is_ascii_alphanumeric() {
-                    return false;
+                    return Err(InvalidHostName);
                 }
                 label_len = 0;
             }
             b'-' => {
                 if label_len == 0 {
-                    return false;
+                    return Err(InvalidHostName);
                 }
                 label_len += 1;
             }
             _ => {
                 if !c.is_ascii_alphanumeric() {
-                    return false;
+                    return Err(InvalidHostName);
                 }
                 label_len += 1;
             }
@@ -502,9 +511,12 @@ fn host_name_validate(host: &str) -> bool {
 
     // Validate the final label
     if label_len == 0 || label_len > 63 {
-        return false;
+        return Err(InvalidHostName);
     }
-    bytes[end - 1].is_ascii_alphanumeric()
+    if !bytes[end - 1].is_ascii_alphanumeric() {
+        return Err(InvalidHostName);
+    }
+    Ok(())
 }
 
 /// `std.fs.path.dirname`: `None` for a path without a directory component.

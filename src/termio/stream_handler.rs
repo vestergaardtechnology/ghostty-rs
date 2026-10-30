@@ -2045,7 +2045,9 @@ impl StreamHandler {
 }
 
 /// `std.Io.net.HostName.max_len`.
-const HOST_NAME_MAX_LEN: usize = 255;
+const HOST_NAME_MAX_LEN: usize = 254;
+
+use crate::cli::ssh_cache::disk_cache::{host_name_validate, HostNameValidateError};
 
 /// The errors of [`host_name_from_uri`] (Zig: `HostName.fromUri`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,19 +2068,10 @@ fn host_name_from_uri<'a: 'b, 'b>(
         .to_raw(&mut buffer[..])
         .map_err(|_| HostNameError::NameTooLong)?;
 
-    // `HostName.validate`
-    if bytes.len() > HOST_NAME_MAX_LEN {
-        return Err(HostNameError::NameTooLong);
-    }
-    if std::str::from_utf8(bytes).is_err() {
-        return Err(HostNameError::InvalidHostName);
-    }
-    for &byte in bytes {
-        if !byte.is_ascii() || byte == b'.' || byte == b'-' || byte.is_ascii_alphanumeric() {
-            continue;
-        }
-        return Err(HostNameError::InvalidHostName);
-    }
+    host_name_validate(bytes).map_err(|err| match err {
+        HostNameValidateError::NameTooLong => HostNameError::NameTooLong,
+        HostNameValidateError::InvalidHostName => HostNameError::InvalidHostName,
+    })?;
 
     Ok(bytes)
 }
