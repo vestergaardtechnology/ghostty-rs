@@ -49,7 +49,7 @@ pub struct PlacementIteratorWrapper {
     alloc: HandleAllocator,
     /// (Zig: `undefined` until the iterator is reset with `get`.)
     inner: Option<hash_map::Iter<'static, PlacementKey, Placement>>,
-    entry: Option<(&'static PlacementKey, &'static Placement)>,
+    pub(crate) entry: Option<(&'static PlacementKey, &'static Placement)>,
     layer_filter: PlacementLayer,
 }
 
