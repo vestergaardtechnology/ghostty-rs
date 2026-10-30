@@ -151,6 +151,42 @@ impl From<crate::terminal::size::AllocError> for Error {
     }
 }
 
+impl From<crate::terminal::page_list::FinishError> for Error {
+    fn from(e: crate::terminal::page_list::FinishError) -> Self {
+        use crate::terminal::page_list::FinishError as E;
+        match e {
+            E::OutOfMemory => Error::OutOfMemory,
+            E::InvalidDimensions => Error::InvalidDimensions,
+            E::InvalidPageDimensions => Error::InvalidPageDimensions,
+            E::NoPages => Error::NoPages,
+            E::InsufficientRows => Error::InsufficientRows,
+        }
+    }
+}
+
+impl From<crate::terminal::page_list::IncreaseCapacityError> for Error {
+    fn from(e: crate::terminal::page_list::IncreaseCapacityError) -> Self {
+        use crate::terminal::page_list::IncreaseCapacityError as E;
+        match e {
+            E::OutOfMemory => Error::OutOfMemory,
+            E::OutOfSpace => Error::OutOfSpace,
+        }
+    }
+}
+
+impl From<crate::terminal::page_list::FinalizeError> for Error {
+    fn from(e: crate::terminal::page_list::FinalizeError) -> Self {
+        use crate::terminal::page_list::FinalizeError as E;
+        match e {
+            E::InvalidPageDimensions => Error::InvalidPageDimensions,
+            E::RowCountOverflow => Error::RowCountOverflow,
+            E::PageSizeOverflow => Error::PageSizeOverflow,
+            E::MaxSizeExceeded => Error::MaxSizeExceeded,
+            E::MaxLinesExceeded => Error::MaxLinesExceeded,
+        }
+    }
+}
+
 /// `std.Io.Reader.Error || std.Io.Writer.Error`; kept as an alias so
 /// signatures read like the Zig ones.
 pub type IoError = Error;
