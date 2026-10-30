@@ -590,7 +590,6 @@ impl Overlay {
 mod tests {
     use super::*;
     use crate::renderer::size::{GridSize, Padding, ScreenSize};
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
     /// A render state of a 10x2 terminal (the grid of [`size`]) after

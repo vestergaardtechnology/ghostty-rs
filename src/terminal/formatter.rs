@@ -14,9 +14,6 @@
 //!   `PageFormatter.TrailingState` is [`TrailingState`].
 //! - `CodepointMap` lists are a `Vec` (Zig: `std.MultiArrayList`).
 //! - `TerminalFormatter.Extra` is [`TerminalFormatterExtra`].
-//! - The tests feed VT input through a private test-only stream handler
-//!   (stand-in for `Terminal.vtStream`, see `TODO(port-dedupe)` in the
-//!   tests).
 
 use std::io::{self, Write};
 
@@ -2428,170 +2425,11 @@ mod tests {
 
     // ----- test helpers (Rust-only) -----
 
-    // TODO(port-dedupe): replace with crate::terminal::stream_terminal::Handler
-    // (`Terminal::vtStream`) once stream_terminal.zig is ported. This is a
-    // minimal subset of that handler: it forwards the actions the formatter
-    // tests (and the formatter's VT output) use to the terminal, with the
-    // same semantics as the Zig handler.
-    struct TestHandler<'a> {
-        terminal: &'a mut Terminal,
-    }
-
-    impl TestHandler<'_> {
-        fn set_mode(&mut self, mode: modes::Mode, enabled: bool) {
-            let t = &mut *self.terminal;
-            // Set the mode on the terminal
-            t.modes.set(mode, enabled);
-
-            // Some modes require additional processing
-            match mode {
-                modes::Mode::Origin => t.set_cursor_pos(1, 1),
-                modes::Mode::EnableLeftAndRightMargin => {
-                    if !enabled {
-                        t.scrolling_region.left = 0;
-                        t.scrolling_region.right = t.cols - 1;
-                    }
-                }
-                modes::Mode::AltScreenLegacy => t.switch_screen_mode(SwitchScreenMode::Mode47, enabled).unwrap(),
-                modes::Mode::AltScreen => t.switch_screen_mode(SwitchScreenMode::Mode1047, enabled).unwrap(),
-                modes::Mode::AltScreenSaveCursorClearEnter => {
-                    t.switch_screen_mode(SwitchScreenMode::Mode1049, enabled).unwrap()
-                }
-                modes::Mode::SaveCursor => {
-                    if enabled {
-                        t.save_cursor();
-                    } else {
-                        t.restore_cursor();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    impl Handler for TestHandler<'_> {
-        fn vt(&mut self, action: Action<'_>) {
-            let t = &mut *self.terminal;
-            match action {
-                Action::Print(p) => t.print(p.cp).unwrap(),
-                Action::PrintSlice(p) => t.print_slice(p.cps).unwrap(),
-                Action::PrintRepeat(n) => t.print_repeat(n).unwrap(),
-                Action::Backspace => t.backspace(),
-                Action::CarriageReturn => t.carriage_return(),
-                Action::Linefeed => t.linefeed().unwrap(),
-                Action::Index => t.index().unwrap(),
-                Action::NextLine => {
-                    t.index().unwrap();
-                    t.carriage_return();
-                }
-                Action::ReverseIndex => t.reverse_index(),
-                Action::CursorUp(v) => t.cursor_up(v.value as usize),
-                Action::CursorDown(v) => t.cursor_down(v.value as usize),
-                Action::CursorLeft(v) => t.cursor_left(v.value as usize),
-                Action::CursorRight(v) => t.cursor_right(v.value as usize),
-                Action::CursorPos(v) => t.set_cursor_pos(v.row as usize, v.col as usize),
-                Action::CursorCol(v) => t.set_cursor_col(v.value as usize),
-                Action::CursorRow(v) => t.set_cursor_row(v.value as usize),
-                Action::CursorColRelative(v) => t.cursor_col_relative(v.value as usize),
-                Action::CursorRowRelative(v) => t.cursor_row_relative(v.value as usize),
-                Action::EraseDisplayBelow(p) => t.erase_display(csi::EraseDisplay::Below, p),
-                Action::EraseDisplayAbove(p) => t.erase_display(csi::EraseDisplay::Above, p),
-                Action::EraseDisplayComplete(p) => t.erase_display(csi::EraseDisplay::Complete, p),
-                Action::EraseLineRight(p) => t.erase_line(csi::EraseLine::RIGHT, p),
-                Action::EraseLineLeft(p) => t.erase_line(csi::EraseLine::LEFT, p),
-                Action::EraseLineComplete(p) => t.erase_line(csi::EraseLine::COMPLETE, p),
-                Action::DeleteChars(n) => t.delete_chars(n),
-                Action::EraseChars(n) => t.erase_chars(n),
-                Action::InsertLines(n) => t.insert_lines(n),
-                Action::InsertBlanks(n) => t.insert_blanks(n),
-                Action::DeleteLines(n) => t.delete_lines(n),
-                Action::ScrollUp(n) => t.scroll_up(n).unwrap(),
-                Action::ScrollDown(n) => t.scroll_down(n),
-                Action::HorizontalTab(count) => {
-                    for _ in 0..count {
-                        let x = t.screens.active.cursor.x;
-                        t.horizontal_tab();
-                        if x == t.screens.active.cursor.x {
-                            break;
-                        }
-                    }
-                }
-                Action::TabClearCurrent => t.tab_clear(csi::TabClear::CURRENT),
-                Action::TabClearAll => t.tab_clear(csi::TabClear::ALL),
-                Action::TabSet => t.tab_set(),
-                Action::TabReset => t.tab_reset(),
-                Action::SetMode(m) => self.set_mode(m.mode, true),
-                Action::ResetMode(m) => self.set_mode(m.mode, false),
-                Action::TopAndBottomMargin(m) => {
-                    t.set_top_and_bottom_margin(m.top_left as usize, m.bottom_right as usize)
-                }
-                Action::LeftAndRightMargin(m) => {
-                    t.set_left_and_right_margin(m.top_left as usize, m.bottom_right as usize)
-                }
-                Action::LeftAndRightMarginAmbiguous => {
-                    if t.modes.get(modes::Mode::EnableLeftAndRightMargin) {
-                        t.set_left_and_right_margin(0, 0);
-                    } else {
-                        t.save_cursor();
-                    }
-                }
-                Action::SaveCursor => t.save_cursor(),
-                Action::RestoreCursor => t.restore_cursor(),
-                Action::InvokeCharset(v) => t.invoke_charset(v.bank, v.charset, v.locking),
-                Action::ConfigureCharset(v) => t.configure_charset(v.slot, v.charset),
-                Action::SetAttribute(attr) => match attr {
-                    crate::terminal::sgr::Attribute::Unknown(_) => {}
-                    attr => t.set_attribute(attr).unwrap(),
-                },
-                Action::ProtectedModeOff => t.set_protected_mode(ansi::ProtectedMode::Off),
-                Action::ProtectedModeIso => t.set_protected_mode(ansi::ProtectedMode::Iso),
-                Action::ProtectedModeDec => t.set_protected_mode(ansi::ProtectedMode::Dec),
-                Action::KittyKeyboardPush(v) => t.screens.active.kitty_keyboard.push(v.flags),
-                Action::KittyKeyboardPop(n) => t.screens.active.kitty_keyboard.pop(n as usize),
-                Action::KittyKeyboardSet(v) => t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Set, v.flags),
-                Action::KittyKeyboardSetOr(v) => t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Or, v.flags),
-                Action::KittyKeyboardSetNot(v) => {
-                    t.screens.active.kitty_keyboard.set(kitty::key::SetMode::Not, v.flags)
-                }
-                Action::ModifyKeyFormat(v) => {
-                    t.flags.modify_other_keys_2 = false;
-                    if v == ansi::ModifyKeyFormat::OtherKeysNumeric {
-                        t.flags.modify_other_keys_2 = true;
-                    }
-                }
-                Action::StartHyperlink(v) => t.screens.active.start_hyperlink(v.uri, v.id).unwrap(),
-                Action::EndHyperlink => t.screens.active.end_hyperlink(),
-                Action::ColorOperation(op) => {
-                    for req in op.requests.iter() {
-                        match req {
-                            osc::color::Request::Set(set) => {
-                                if let osc::color::Target::Palette(i) = set.target {
-                                    t.flags.dirty.palette = true;
-                                    t.colors.palette.set(i, set.color);
-                                }
-                            }
-                            osc::color::Request::Reset(osc::color::Target::Palette(i)) => {
-                                t.flags.dirty.palette = true;
-                                t.colors.palette.reset(*i);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Action::ReportPwd(v) => t.set_pwd(v.url).unwrap(),
-                Action::WindowTitle(v) => t.set_title(v.title).unwrap(),
-                _ => {}
-            }
-        }
-    }
-
     /// Feed bytes to the terminal (Zig: `t.vtStream().nextSlice(bytes)`).
     fn feed(t: &mut Terminal, bytes: impl AsRef<[u8]>) {
-        let mut s = Stream::init(crate::terminal::stream::Options {
-            allocator: Some(osc::Allocator::GLOBAL),
-            ..crate::terminal::stream::Options::new(TestHandler { terminal: t })
-        });
+        let mut s = t.vt_stream();
         s.next_slice(bytes.as_ref());
+        s.deinit();
     }
 
     fn term(cols: CellCountInt, rows: CellCountInt) -> Terminal {

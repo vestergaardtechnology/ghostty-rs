@@ -1,10 +1,6 @@
 //! Port of `src/benchmark/TerminalSnapshot.zig`.
 //!
-//! STATUS: partial — runs against a private stand-in for the top-level
-//! snapshot codec (`terminal/snapshot/snapshot.zig`: `encode`, `decode`,
-//! `Decoder.ready`), which is not ported yet. The stand-in composes the
-//! ported record codecs but writes and reads no Kitty graphics records.
-//! TODO(port-dedupe): replace `snapshot` below with `crate::terminal::snapshot`.
+//! STATUS: ported
 //!
 //! Benchmarks the terminal binary snapshot codecs (`terminal/snapshot`).
 //!
@@ -84,6 +80,7 @@ use super::options;
 use crate::cli::args::{cli_enum, cli_struct};
 use crate::lib::compat::file as compat_file;
 use crate::synthetic::DefaultPrng;
+use crate::terminal::snapshot;
 use crate::terminal::snapshot::io::FixedReader;
 use crate::terminal::terminal::{InitError, Options as TerminalOptions, Terminal};
 
@@ -182,7 +179,7 @@ enum SetupError {
     Init(InitError),
     Io(std_io::Error),
     FileTooBig,
-    Snapshot(snapshot::Error),
+    Snapshot(snapshot::io::Error),
     KittyImagesDropped,
 }
 
@@ -210,8 +207,8 @@ impl From<std_io::Error> for SetupError {
     }
 }
 
-impl From<snapshot::Error> for SetupError {
-    fn from(e: snapshot::Error) -> Self {
+impl From<snapshot::io::Error> for SetupError {
+    fn from(e: snapshot::io::Error) -> Self {
         SetupError::Snapshot(e)
     }
 }
@@ -482,7 +479,7 @@ fn step_decode(ptr: &mut dyn Any) -> Result<(), benchmark::Error> {
         let mut reader = FixedReader::new(bytes);
         let decoded = snapshot::decode(
             &mut reader,
-            snapshot::DecodeOptions {
+            &snapshot::DecodeOptions {
                 max_continuation_bytes: 1024 * 1024,
                 ..snapshot::DecodeOptions::default()
             },
@@ -507,7 +504,7 @@ fn step_decode_ready(ptr: &mut dyn Any) -> Result<(), benchmark::Error> {
         let mut reader = FixedReader::new(bytes);
         let mut decoder = snapshot::Decoder::init(&mut reader);
         let decoded = decoder
-            .ready(snapshot::DecodeOptions {
+            .ready(&snapshot::DecodeOptions {
                 max_continuation_bytes: 1024 * 1024,
                 ..snapshot::DecodeOptions::default()
             })
@@ -609,246 +606,6 @@ fn step_report(ptr: &mut dyn Any) -> Result<(), benchmark::Error> {
         })?;
     }
     Ok(())
-}
-
-/// TODO(port-dedupe): replace with `crate::terminal::snapshot` (the port of
-/// `terminal/snapshot/snapshot.zig`) once it lands.
-///
-/// A minimal stand-in for the top-level snapshot codec, built from the
-/// ported record codecs. It follows the Zig record order (envelope,
-/// TERMINAL, SCREEN/PAGE per screen, CONTINUATION, READY, HISTORY/PAGE per
-/// screen, FINISH) but plans no Kitty graphics records (`snapshot/kitty`
-/// is not ported either); Kitty records found while decoding are skipped.
-/// `Decoder::next` is folded into `decode`.
-mod snapshot {
-    use std::fmt;
-
-    use crate::terminal::page_list::Allocator;
-    use crate::terminal::screen::Options as ScreenOptions;
-    use crate::terminal::screen_set::Key as TerminalScreenKey;
-    use crate::terminal::snapshot::io::{self, Reader};
-    pub use crate::terminal::snapshot::{checkpoint, continuation, envelope, history, record, screen, terminal};
-    use crate::terminal::terminal::Terminal;
-
-    /// Re-export continuation to make it a bit more ergonomic to reference.
-    pub type Continuation<'a> = continuation::Value<'a>;
-
-    /// Errors from the stand-in codec.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum Error {
-        Io(io::Error),
-        UnexpectedScreenKey,
-        DuplicateScreen,
-        UnexpectedHistoryKey,
-    }
-
-    impl fmt::Display for Error {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Error::Io(e) => write!(f, "{e}"),
-                other => fmt::Debug::fmt(other, f),
-            }
-        }
-    }
-
-    impl std::error::Error for Error {}
-
-    impl From<io::Error> for Error {
-        fn from(e: io::Error) -> Self {
-            Error::Io(e)
-        }
-    }
-
-    pub struct EncodeOptions<'a> {
-        pub continuation: Continuation<'a>,
-    }
-
-    /// Encode one complete terminal snapshot (without Kitty graphics).
-    pub fn encode(destination: &mut dyn io::Writer, t: &Terminal, options: EncodeOptions<'_>) -> Result<(), Error> {
-        // Continuation errors must not emit even the snapshot envelope.
-        continuation::validate(options.continuation)?;
-
-        let mut stream = record::Writer::init(destination);
-
-        // 1. Envelope
-        envelope::encode(stream.writer())?;
-
-        // 2. Terminal
-        terminal::encode(t, &mut stream)?;
-
-        // 3. Each screen.
-        for key in TerminalScreenKey::ALL {
-            let Some(s) = t.screens.get(key) else { continue };
-            screen::encode(&s, key, &mut stream)?;
-        }
-
-        // 4. Standard Stream continuation.
-        continuation::encode(options.continuation, &mut stream)?;
-
-        // 5. Ready marker.
-        checkpoint::encode(checkpoint::Kind::Ready, &mut stream)?;
-
-        // 7. Each screen's history.
-        for key in TerminalScreenKey::ALL {
-            let Some(s) = t.screens.get(key) else { continue };
-            history::encode(&s, key, &mut stream, None)?;
-        }
-
-        // 9. Finish
-        checkpoint::encode(checkpoint::Kind::Finish, &mut stream)?;
-        Ok(())
-    }
-
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct DecodeOptions {
-        /// Largest non-ground continuation the decoder may allocate and return.
-        pub max_continuation_bytes: usize,
-
-        /// Compress each history page as soon as it is restored.
-        pub compress_history: bool,
-
-        /// The Kitty graphics image storage limit for each restored screen,
-        /// or None for the default limit of a new screen.
-        pub kitty_image_storage_limit: Option<usize>,
-    }
-
-    /// One decoded Terminal and the bytes needed to resume its Stream.
-    pub struct Decoded {
-        pub terminal: Option<Terminal>,
-        pub continuation: continuation::OwnedValue,
-        pub history_rows: [Option<u64>; TerminalScreenKey::COUNT],
-    }
-
-    /// Incrementally restore one snapshot: renderable state first, then
-    /// history.
-    pub struct Decoder<'a> {
-        source: &'a mut dyn Reader,
-        compress_history: bool,
-    }
-
-    impl<'a> Decoder<'a> {
-        pub fn init(source: &'a mut dyn Reader) -> Decoder<'a> {
-            Decoder {
-                source,
-                compress_history: false,
-            }
-        }
-
-        /// Decode everything through READY.
-        pub fn ready(&mut self, options: DecodeOptions) -> Result<Decoded, Error> {
-            let reader = &mut *self.source;
-            self.compress_history = options.compress_history;
-
-            // Read the envelope, which is currently just a verification step.
-            envelope::decode(reader)?;
-
-            // TERMINAL establishes terminal-wide state and allocates empty
-            // screen slots with their final routing.
-            let header = record::next_header(reader)?;
-            let result = terminal::decode(reader, header)?;
-
-            let screen_count = result.screens.all.iter().filter(|s| s.is_some()).count();
-            let mut screen_options = {
-                let primary = result.screens.get(TerminalScreenKey::Primary).unwrap();
-                let explicit_bytes = primary.pages.limits.bytes.explicit;
-                let explicit_lines = primary.pages.limits.lines.explicit;
-                ScreenOptions {
-                    cols: result.cols,
-                    rows: result.rows,
-                    max_scrollback_bytes: if explicit_bytes == usize::MAX { None } else { Some(explicit_bytes) },
-                    max_scrollback_lines: if explicit_lines == usize::MAX { None } else { Some(explicit_lines) },
-                    ..ScreenOptions::default()
-                }
-            };
-            if let Some(limit) = options.kitty_image_storage_limit {
-                screen_options.kitty_image_storage_limit = limit;
-            }
-
-            let mut routed = [false; TerminalScreenKey::COUNT];
-            let mut history_rows = [None; TerminalScreenKey::COUNT];
-            let mut header = record::next_header(reader)?;
-            for _ in 0..screen_count {
-                let decoded = screen::decode(reader, header, Allocator::GLOBAL, &screen_options)?;
-                let mut slot = result.screens.get(decoded.key).ok_or(Error::UnexpectedScreenKey)?;
-                if routed[decoded.key as usize] {
-                    return Err(Error::DuplicateScreen);
-                }
-                routed[decoded.key as usize] = true;
-                history_rows[decoded.key as usize] = Some(decoded.history_rows);
-                *slot = decoded.screen;
-
-                header = record::next_header(reader)?;
-                while is_kitty(header.tag) {
-                    skip_record(reader, header)?;
-                    header = record::next_header(reader)?;
-                }
-            }
-
-            let decoded_continuation = continuation::decode(reader, header, options.max_continuation_bytes)?;
-
-            // READY marks the exact envelope-through-CONTINUATION boundary.
-            let header = record::next_header(reader)?;
-            checkpoint::decode(checkpoint::Kind::Ready, reader, header)?;
-
-            Ok(Decoded {
-                terminal: Some(result),
-                continuation: decoded_continuation,
-                history_rows,
-            })
-        }
-
-        /// Apply every remaining HISTORY sequence and validate FINISH.
-        pub fn finish(&mut self, t: &mut Terminal) -> Result<(), Error> {
-            let reader = &mut *self.source;
-            loop {
-                let header = record::next_header(reader)?;
-                if header.tag == record::Tag::HISTORY {
-                    let mut decoder = history::Decoder::init(&mut *reader, header)?;
-                    let mut s = t.screens.get(decoder.header.key).ok_or(Error::UnexpectedHistoryKey)?;
-                    decoder.decode(
-                        &mut s,
-                        history::DecodeOptions {
-                            compress: self.compress_history,
-                        },
-                    )?;
-                } else if is_kitty(header.tag) {
-                    skip_record(reader, header)?;
-                } else {
-                    checkpoint::decode(checkpoint::Kind::Finish, reader, header)?;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    fn is_kitty(tag: record::Tag) -> bool {
-        matches!(
-            tag,
-            record::Tag::KITTY_IMAGE_STORAGE | record::Tag::KITTY_IMAGE_PAYLOAD | record::Tag::KITTY_IMAGE_PAGE_PLACEMENTS
-        )
-    }
-
-    /// Consume and validate one record without interpreting it.
-    fn skip_record(reader: &mut dyn Reader, header: record::Header) -> Result<(), Error> {
-        let mut record_reader = record::Reader::init_header(reader, header);
-        let mut remaining = header.payload_len as usize;
-        let mut buf = [0u8; 4096];
-        while remaining > 0 {
-            let n = remaining.min(buf.len());
-            record_reader.payload_reader().read_slice_all(&mut buf[..n])?;
-            remaining -= n;
-        }
-        record_reader.finish()?;
-        Ok(())
-    }
-
-    /// Decode one complete snapshot.
-    pub fn decode(source: &mut dyn Reader, options: DecodeOptions) -> Result<Decoded, Error> {
-        let mut decoder = Decoder::init(source);
-        let mut decoded = decoder.ready(options)?;
-        decoder.finish(decoded.terminal.as_mut().unwrap())?;
-        Ok(decoded)
-    }
 }
 
 #[cfg(test)]

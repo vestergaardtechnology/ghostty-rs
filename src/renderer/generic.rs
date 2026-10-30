@@ -4020,7 +4020,6 @@ mod tests {
     use crate::app::MailboxQueue as AppQueue;
     use crate::renderer::opengl::test_util::test_options_with_mailbox;
     use crate::renderer::opengl::{ExportedFrame, Memory, OpenGL};
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
     fn save_png(path: &str, width: u32, height: u32, rgba: &[u8]) {

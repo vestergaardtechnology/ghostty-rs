@@ -55,7 +55,6 @@ pub type Viewport = ViewportSearch;
 #[cfg(test)]
 pub(crate) mod testing {
     use crate::terminal::point::{Coordinate, Point};
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::terminal::{Options, Terminal};
 
     /// Create a terminal with the given size and scrollback limit.
@@ -88,10 +87,6 @@ pub(crate) mod testing {
     }
 
     /// Zig `t.vtStream().nextSlice(..)` in one call.
-    ///
-    /// TODO(port-dedupe): use `Terminal::vt_stream` directly once the
-    /// `stream_terminal` port lands; this goes through the shared test
-    /// handler in `terminal::render::test_vt` meanwhile.
     pub fn next_slice(t: &mut Terminal, input: &[u8]) {
         let mut s = t.vt_stream();
         s.next_slice(input);

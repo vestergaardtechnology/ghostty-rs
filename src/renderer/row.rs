@@ -74,7 +74,6 @@ pub fn never_extend_bg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::render::RenderState;
     use crate::terminal::terminal::{Options, Terminal};
 
