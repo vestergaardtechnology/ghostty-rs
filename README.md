@@ -26,7 +26,29 @@ cargo test --lib                 # the ported test suite
 
 `cargo build --no-default-features` builds without the GTK runtime.
 `--features inspector` enables the Dear ImGui terminal inspector.
-`ghostty-bench` and `ghostty-gen` are the benchmark and synthetic-data tools.
+`ghostty-bench` and `ghostty-gen` are the benchmark and synthetic-data tools;
+`ghostty-build-data` generates the terminfo, completion and syntax files.
+
+`tools/install_resources.sh [prefix]` installs the runtime resources (terminfo,
+shell integration, themes, completions, vim/bat syntax, translations) into
+`<prefix>/share` (default `target/dist/share`), like the Zig build's
+`zig-out/share`.
+
+## The macOS app
+
+`macos/` is Ghostty's Swift/AppKit app, unchanged except that it bundles
+resources from `target/dist/share`. It links `GhosttyKit.xcframework`, the
+libghostty C API (`include/ghostty.h`), which the Rust port provides through
+`src/apprt/embedded.rs` and `src/main_c.rs`. On macOS with Xcode:
+
+```sh
+brew install pkg-config freetype harfbuzz fontconfig oniguruma
+tools/install_resources.sh               # target/dist/share
+tools/build_xcframework.sh native        # or: universal (arm64 + x86_64)
+macos/build.nu --configuration Debug     # -> macos/build/Debug/Ghostty.app
+```
+
+`tools/build_xcframework.sh` replaces `zig build -Demit-macos-app=false`.
 
 ## Progress
 
@@ -36,9 +58,10 @@ python3 tools/status.py -v   # per file
 ```
 
 Each Rust file's header says `STATUS: ported`, `partial — ...`, or
-`not yet ported`. macOS code (Metal, CoreText, the embedded apprt) is ported
-and type-checks with `cargo check --target x86_64-apple-darwin`, but has not
-been run.
+`not yet ported`; every Zig file is now ported. macOS code (Metal, CoreText,
+the embedded apprt) is ported and type-checks with
+`cargo check --target x86_64-apple-darwin`, but has not been run, and the
+Swift app has not been built against the Rust library yet.
 
 ## Working with the reference source
 

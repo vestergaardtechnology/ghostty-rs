@@ -22,6 +22,10 @@ name = "ghostty-bench"
 path = "src/bin/ghostty-bench.rs"
 
 [[bin]]
+name = "ghostty-build-data"
+path = "src/bin/ghostty-build-data.rs"
+
+[[bin]]
 name = "ghostty-gen"
 path = "src/bin/ghostty-gen.rs"
 
