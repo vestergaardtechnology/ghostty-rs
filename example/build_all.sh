@@ -145,6 +145,7 @@ if [ "$cmake_examples" = 1 ]; then
         name="$(basename "$dir")"
         selected "$name" || continue
         build="$out/cmake/$name"
+        mkdir -p "$out/cmake"
         cmake -S "$dir" -B "$build" -DCMAKE_BUILD_TYPE=Release \
             -DFETCHCONTENT_SOURCE_DIR_GHOSTTY="$ROOT" >"$build.configure.log" 2>&1 ||
             {
