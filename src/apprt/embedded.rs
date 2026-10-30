@@ -273,7 +273,6 @@ impl fmt::Debug for AppConfig {
     }
 }
 
-#[derive(Debug)]
 pub struct App {
     pub core_app: *mut CoreApp,
     pub opts: Options,
@@ -287,6 +286,15 @@ pub struct App {
 
     /// The configuration for the app. This is owned by this structure.
     pub config: AppConfig,
+}
+
+impl fmt::Debug for App {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("App")
+            .field("core_app", &self.core_app)
+            .field("opts", &self.opts)
+            .finish_non_exhaustive()
+    }
 }
 
 // SAFETY: like the Zig runtime, the app is used on the main thread; other
