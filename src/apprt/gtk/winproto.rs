@@ -2,15 +2,15 @@
 //!
 //! STATUS: ported
 //!
-//! `build_options.wayland`/`build_options.x11` are true for the GTK build
-//! (gtk4 is built with both backends on the supported Linux targets), so
-//! both protocol implementations are always compiled in.
+//! `build_options.wayland`/`build_options.x11` ([`crate::build_config::X11`],
+//! [`crate::build_config::WAYLAND`]) are true for the GTK build (gtk4 is
+//! built with both backends on the supported Linux targets), so both
+//! protocol implementations are always compiled in.
 //!
-//! The winproto implementations need a few things from GTK classes that are
-//! not ported yet (`class/window.zig`'s `Window` and
-//! `class/global_shortcuts.zig`'s `GlobalShortcuts`); they are described by
-//! the [`ApprtWindow`] and [`GlobalShortcuts`] traits below, which the
-//! ported classes are expected to implement.
+//! The parts of `class/window.zig`'s `Window` and
+//! `class/global_shortcuts.zig`'s `GlobalShortcuts` that the winproto
+//! implementations use are described by the [`ApprtWindow`] and
+//! [`GlobalShortcuts`] traits below, which those classes implement.
 #![cfg(feature = "gtk")]
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
@@ -36,7 +36,9 @@ use crate::input::key_mods::Mods;
 
 /// The parts of `class/window.zig`'s `Window` that the winproto
 /// implementations use.
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::window::Window
+// NOTE(port): implemented by `class::window::Window` (through a weak
+// reference, since the Wayland backend keeps it past the window's lifetime);
+// a trait so the winproto tests can use a plain `gtk.Window`.
 pub trait ApprtWindow {
     /// The window as a `gtk.Window` (Zig: `as(gtk.Window)`, `as(gtk.Native)`,
     /// `as(gtk.Widget)`).
@@ -57,8 +59,8 @@ pub use super::class::global_shortcuts::BindFailed;
 
 /// The parts of `class/global_shortcuts.zig`'s `GlobalShortcuts` that the
 /// winproto shortcut backends use.
-// TODO(port-dedupe): replace with
-// crate::apprt::gtk::class::global_shortcuts::GlobalShortcuts
+// NOTE(port): implemented by `class::global_shortcuts::GlobalShortcuts`; a
+// trait so the Wayland hotkey backend tests can record the signals.
 pub trait GlobalShortcuts {
     /// Emit the trigger signal.
     fn emit_trigger(&self, action: &binding::Action);

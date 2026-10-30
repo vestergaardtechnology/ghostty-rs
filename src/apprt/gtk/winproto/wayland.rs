@@ -4,11 +4,14 @@
 //!
 //! Wayland protocol implementation for the Ghostty GTK apprt.
 //!
-//! gtk4-layer-shell is used through the `gtk4-layer-shell` crate when the
-//! `gtk-layer-shell` Cargo feature is enabled (it needs the system
-//! `gtk4-layer-shell-0` library). Without it, [`layer_shell::is_supported`]
-//! reports false, so the quick terminal is disabled exactly as on a
-//! compositor without wlr-layer-shell.
+//! gtk4-layer-shell (`@import("gtk4-layer-shell")`) is
+//! [`crate::pkg::gtk4_layer_shell`], which loads the library at runtime;
+//! when it isn't available, [`layer_shell::is_supported`] reports false, so
+//! the quick terminal is disabled exactly as on a compositor without
+//! wlr-layer-shell. With the `gtk-layer-shell` Cargo feature the
+//! `gtk4-layer-shell` crate links the system library at build time instead
+//! (like Zig's static link, which also keeps it loaded before
+//! libwayland-client).
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "wayland/globals.rs"]
@@ -46,39 +49,16 @@ use crate::input::key_mods::Mods;
 
 const LOG: &str = "winproto_wayland";
 
-/// The parts of `pkg/gtk4-layer-shell` used here.
-// TODO(port-dedupe): replace with the pkg/gtk4_layer_shell wrapper once
-// ported (it is owned by the pkg/ port).
+/// `@import("gtk4-layer-shell")`: [`crate::pkg::gtk4_layer_shell`], with
+/// safe wrappers taking `gtk.Window`/`gdk.Monitor` objects.
 pub mod layer_shell {
     use gtk4::gdk;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ShellLayer {
-        Background,
-        Bottom,
-        Top,
-        Overlay,
-    }
+    pub use crate::pkg::gtk4_layer_shell::{KeyboardMode, ShellEdge, ShellLayer};
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum ShellEdge {
-        Left,
-        Right,
-        Top,
-        Bottom,
-    }
-
-    impl ShellEdge {
-        /// `std.meta.tags(ShellEdge)`
-        pub const TAGS: [ShellEdge; 4] = [ShellEdge::Left, ShellEdge::Right, ShellEdge::Top, ShellEdge::Bottom];
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum KeyboardMode {
-        None,
-        Exclusive,
-        OnDemand,
-    }
+    /// `std.meta.tags(ShellEdge)`
+    pub const SHELL_EDGE_TAGS: [ShellEdge; 4] =
+        [ShellEdge::Left, ShellEdge::Right, ShellEdge::Top, ShellEdge::Bottom];
 
     #[cfg(feature = "gtk-layer-shell")]
     mod imp {
@@ -132,25 +112,53 @@ pub mod layer_shell {
         }
     }
 
-    /// Without the library nothing supports layer shell; the setters are
-    /// never reached because `is_supported` gates the quick terminal.
     #[cfg(not(feature = "gtk-layer-shell"))]
     mod imp {
         use super::*;
+        use crate::pkg::gtk4_layer_shell as ls;
+        use gtk4::glib::translate::ToGlibPtr;
+
+        fn ptr(window: &gtk4::Window) -> *mut ls::GtkWindow {
+            let p: *mut gtk4::ffi::GtkWindow = window.to_glib_none().0;
+            p.cast()
+        }
 
         pub fn is_supported() -> bool {
-            false
+            ls::is_supported()
         }
         pub fn get_protocol_version() -> u32 {
-            0
+            ls::get_protocol_version()
         }
-        pub fn init_for_window(_: &gtk4::Window) {}
-        pub fn set_layer(_: &gtk4::Window, _: ShellLayer) {}
-        pub fn set_anchor(_: &gtk4::Window, _: ShellEdge, _: bool) {}
-        pub fn set_margin(_: &gtk4::Window, _: ShellEdge, _: i32) {}
-        pub fn set_keyboard_mode(_: &gtk4::Window, _: KeyboardMode) {}
-        pub fn set_monitor(_: &gtk4::Window, _: Option<&gdk::Monitor>) {}
-        pub fn set_namespace(_: &gtk4::Window, _: &str) {}
+        pub fn init_for_window(window: &gtk4::Window) {
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::init_for_window(ptr(window)) }
+        }
+        pub fn set_layer(window: &gtk4::Window, layer: ShellLayer) {
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::set_layer(ptr(window), layer) }
+        }
+        pub fn set_anchor(window: &gtk4::Window, e: ShellEdge, anchor_to_edge: bool) {
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::set_anchor(ptr(window), e, anchor_to_edge) }
+        }
+        pub fn set_margin(window: &gtk4::Window, e: ShellEdge, margin_size: i32) {
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::set_margin(ptr(window), e, margin_size) }
+        }
+        pub fn set_keyboard_mode(window: &gtk4::Window, mode: KeyboardMode) {
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::set_keyboard_mode(ptr(window), mode) }
+        }
+        pub fn set_monitor(window: &gtk4::Window, monitor: Option<&gdk::Monitor>) {
+            let m: *mut gdk::ffi::GdkMonitor = monitor.to_glib_none().0;
+            // SAFETY: a live GtkWindow and a null or live GdkMonitor.
+            unsafe { ls::set_monitor(ptr(window), m.cast()) }
+        }
+        pub fn set_namespace(window: &gtk4::Window, name: &str) {
+            let name = std::ffi::CString::new(name.replace('\0', "")).unwrap_or_default();
+            // SAFETY: a live GtkWindow.
+            unsafe { ls::set_namespace(ptr(window), &name) }
+        }
     }
 
     pub use imp::*;
@@ -552,7 +560,7 @@ impl Window {
             QuickTerminalPosition::Center => None,
         };
 
-        for edge in layer_shell::ShellEdge::TAGS {
+        for edge in layer_shell::SHELL_EDGE_TAGS {
             if anchored_edge == Some(edge) {
                 layer_shell::set_margin(&window, edge, 0);
                 layer_shell::set_anchor(&window, edge, true);
@@ -668,6 +676,6 @@ mod tests {
             assert!(!layer_shell::is_supported());
             assert_eq!(layer_shell::get_protocol_version(), 0);
         }
-        assert_eq!(layer_shell::ShellEdge::TAGS.len(), 4);
+        assert_eq!(layer_shell::SHELL_EDGE_TAGS.len(), 4);
     }
 }

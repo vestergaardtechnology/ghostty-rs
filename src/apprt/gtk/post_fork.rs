@@ -2,16 +2,12 @@
 //!
 //! STATUS: ported
 //!
-//! Zig's `postFork(cmd: *Command)` reads `cmd.pid` and
-//! `cmd.rt_post_fork_info`. The ported `crate::command::Command` still
-//! carries an empty placeholder for the latter (`RtPostForkInfo`), so
-//! [`post_fork`] takes the child PID and the [`PostForkInfo`] directly.
+//! [`post_fork`] reads `cmd.pid` and `cmd.rt_post_fork_info` like Zig's
+//! `postFork`; the logic is in [`post_fork_info`] so tests can run it
+//! without a `Command`.
 //! `Application.default()` is the process's default `GApplication`, which is
 //! what `gio::Application::default()` returns.
 #![cfg(feature = "gtk")]
-// TODO(port-dedupe): once `Command.rt_post_fork_info` is this
-// `PostForkInfo`, add `fn(cmd: &mut Command) -> Result<(), PostForkError>`
-// reading it and calling `post_fork`.
 
 use std::time::{Duration, Instant};
 
@@ -19,7 +15,7 @@ use gio::prelude::*;
 
 use super::cgroup;
 use super::pre_exec::in_cgroup;
-use crate::command::{Pid, PostForkError};
+use crate::command::{Command, Pid, PostForkError};
 use crate::config::config::{Config, GtkSingleInstance, LinuxCgroup};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +44,13 @@ impl PostForkInfo {
 ///
 /// If we are configured to hard fail, log an error message and return an error
 /// code if we don't detect the move in time.
-pub fn post_fork(pid: Option<Pid>, info: &PostForkInfo) -> Result<(), PostForkError> {
+pub fn post_fork(cmd: &mut Command) -> Result<(), PostForkError> {
+    post_fork_info(cmd.pid, &cmd.rt_post_fork_info)
+}
+
+/// [`post_fork`] on the given child PID and info (Zig: `cmd.pid` and
+/// `cmd.rt_post_fork_info`).
+pub fn post_fork_info(pid: Option<Pid>, info: &PostForkInfo) -> Result<(), PostForkError> {
     match info.linux_cgroup {
         LinuxCgroup::Always => {}
         LinuxCgroup::Never => return Ok(()),
@@ -162,27 +164,27 @@ mod tests {
 
     #[test]
     fn disabled_or_misconfigured() {
-        assert!(post_fork(None, &info(LinuxCgroup::Never, GtkSingleInstance::True, true)).is_ok());
-        assert!(post_fork(
+        assert!(post_fork_info(None, &info(LinuxCgroup::Never, GtkSingleInstance::True, true)).is_ok());
+        assert!(post_fork_info(
             None,
             &info(LinuxCgroup::SingleInstance, GtkSingleInstance::False, true)
         )
         .is_ok());
-        assert!(post_fork(
+        assert!(post_fork_info(
             Some(1),
             &info(LinuxCgroup::SingleInstance, GtkSingleInstance::Detect, false)
         )
         .is_err());
         // The PID must be known.
-        assert!(post_fork(None, &info(LinuxCgroup::Always, GtkSingleInstance::True, false)).is_err());
+        assert!(post_fork_info(None, &info(LinuxCgroup::Always, GtkSingleInstance::True, false)).is_err());
     }
 
     #[test]
     fn no_application_dbus_connection() {
         // There is no default GApplication in the test process.
         let pid = std::process::id() as Pid;
-        assert!(post_fork(Some(pid), &info(LinuxCgroup::Always, GtkSingleInstance::True, false)).is_ok());
-        assert!(post_fork(Some(pid), &info(LinuxCgroup::Always, GtkSingleInstance::True, true)).is_err());
+        assert!(post_fork_info(Some(pid), &info(LinuxCgroup::Always, GtkSingleInstance::True, false)).is_ok());
+        assert!(post_fork_info(Some(pid), &info(LinuxCgroup::Always, GtkSingleInstance::True, true)).is_err());
     }
 
     #[test]

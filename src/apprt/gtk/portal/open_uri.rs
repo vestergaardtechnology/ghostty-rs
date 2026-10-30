@@ -25,8 +25,9 @@ pub use crate::apprt::action::{OpenUrl, OpenUrlKind};
 
 /// `self.app.app.openUrlFallback(kind, url)`: the GTK `Application`'s
 /// fallback URL opener.
-// TODO(port-dedupe): replace with a reference to the ported
-// crate::apprt::gtk::app::App and call `Application::open_url_fallback`.
+// NOTE(port): Zig keeps `app: *App`; here the `Application` owns this state,
+// so it passes a closure calling `Application::open_url_fallback` instead of
+// a back-reference (tests pass recording closures).
 pub type OpenUrlFallback = Box<dyn Fn(OpenUrlKind, &str)>;
 
 const LOG: &str = "openuri";

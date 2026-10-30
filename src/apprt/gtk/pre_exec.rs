@@ -2,16 +2,14 @@
 //!
 //! STATUS: ported
 //!
-//! Zig's `preExec(cmd: *Command)` reads `cmd.rt_pre_exec_info`. The ported
-//! `crate::command::Command` still carries an empty placeholder there
-//! (`RtPreExecInfo`), so [`pre_exec`] takes the [`PreExecInfo`] directly.
+//! [`pre_exec`] reads `cmd.rt_pre_exec_info` like Zig's `preExec`; the
+//! logic is in [`pre_exec_info`] so tests can run it without a `Command`.
 #![cfg(feature = "gtk")]
-// TODO(port-dedupe): once `Command.rt_pre_exec_info` is this `PreExecInfo`,
-// add `fn(cmd: &mut Command) -> Option<u8>` reading it and calling `pre_exec`.
 
 use std::time::{Duration, Instant};
 
 use super::cgroup;
+use crate::command::Command;
 use crate::config::config::{Config, GtkSingleInstance, LinuxCgroup};
 use crate::os::cgroup as internal_cgroup;
 
@@ -55,7 +53,12 @@ pub(crate) fn in_cgroup(pid: u32, expected: &str) -> bool {
 ///
 /// If we are configured to hard fail, log an error message and return an error
 /// code if we don't detect the move in time.
-pub fn pre_exec(info: &PreExecInfo) -> Option<u8> {
+pub fn pre_exec(cmd: &mut Command) -> Option<u8> {
+    pre_exec_info(&cmd.rt_pre_exec_info)
+}
+
+/// [`pre_exec`] on the given info (Zig: `cmd.rt_pre_exec_info`).
+pub fn pre_exec_info(info: &PreExecInfo) -> Option<u8> {
     match info.linux_cgroup {
         LinuxCgroup::Always => {}
         LinuxCgroup::Never => return None,
@@ -111,13 +114,13 @@ mod tests {
 
     #[test]
     fn disabled_returns_immediately() {
-        assert_eq!(pre_exec(&info(LinuxCgroup::Never, GtkSingleInstance::True, true)), None);
+        assert_eq!(pre_exec_info(&info(LinuxCgroup::Never, GtkSingleInstance::True, true)), None);
         assert_eq!(
-            pre_exec(&info(LinuxCgroup::SingleInstance, GtkSingleInstance::False, true)),
+            pre_exec_info(&info(LinuxCgroup::SingleInstance, GtkSingleInstance::False, true)),
             None
         );
         assert_eq!(
-            pre_exec(&info(LinuxCgroup::SingleInstance, GtkSingleInstance::Detect, false)),
+            pre_exec_info(&info(LinuxCgroup::SingleInstance, GtkSingleInstance::Detect, false)),
             Some(127)
         );
     }
@@ -126,8 +129,8 @@ mod tests {
     fn times_out_when_not_moved() {
         // Nothing moves the test process into the transient scope.
         let start = Instant::now();
-        assert_eq!(pre_exec(&info(LinuxCgroup::Always, GtkSingleInstance::True, false)), None);
-        assert_eq!(pre_exec(&info(LinuxCgroup::Always, GtkSingleInstance::True, true)), Some(127));
+        assert_eq!(pre_exec_info(&info(LinuxCgroup::Always, GtkSingleInstance::True, false)), None);
+        assert_eq!(pre_exec_info(&info(LinuxCgroup::Always, GtkSingleInstance::True, true)), Some(127));
         assert!(start.elapsed() >= Duration::from_millis(500));
     }
 
