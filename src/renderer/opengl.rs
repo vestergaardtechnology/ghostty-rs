@@ -1,7 +1,6 @@
 //! Port of `src/renderer/OpenGL.zig`.
 //!
-//! STATUS: ported (the generic renderer it plugs into is a stand-in,
-//! see [`crate::renderer::standin`]; TODO(port-dedupe))
+//! STATUS: ported
 //!
 //! Graphics API wrapper for OpenGL.
 //!
@@ -44,7 +43,7 @@ use crate::pkg::opengl as gl;
 use crate::pkg::opengl::egl;
 use crate::renderer::dmabuf::Dmabuf;
 use crate::renderer::shadertoy;
-use crate::renderer::standin::{self as rstandin, GraphicsApi};
+use crate::renderer::generic::{self, GraphicsApi};
 use crate::renderer::{Health, Options};
 
 pub use self::buffer::Buffer;
@@ -56,8 +55,11 @@ pub use self::sampler::Sampler;
 pub use self::target::Target;
 pub use self::texture::Texture;
 
+/// The primitive types for draw steps (Zig: `gl.Primitive`).
+pub use crate::pkg::opengl::Primitive;
+
 /// Zig: `const Renderer = rendererpkg.GenericRenderer(OpenGL)`.
-pub type Renderer = rstandin::GenericRenderer<OpenGL>;
+pub type Renderer = generic::Renderer<OpenGL>;
 
 /// Zig: `pub const GraphicsAPI = OpenGL`.
 pub type GraphicsAPI = OpenGL;
@@ -399,17 +401,92 @@ impl OpenGL {
 impl GraphicsApi for OpenGL {
     type ExportedFrame = ExportedFrame;
     const EXPORTS_FRAMES: bool = true;
+    const CUSTOM_SHADER_TARGET: shadertoy::Target = CUSTOM_SHADER_TARGET;
+    const CUSTOM_SHADER_Y_IS_DOWN: bool = CUSTOM_SHADER_Y_IS_DOWN;
+    const SWAP_CHAIN_COUNT: usize = SWAP_CHAIN_COUNT;
+
+    fn init(device: *const Device, options: &Options) -> Result<Self, generic::Error> {
+        Ok(OpenGL::init(device, options)?)
+    }
 
     fn deinit(&mut self) {
         OpenGL::deinit(self)
     }
 
-    fn thread_enter(&mut self, surface: *mut apprt::Surface) -> Result<(), rstandin::Error> {
+    fn thread_enter(&mut self, surface: *mut apprt::Surface) -> Result<(), generic::Error> {
         Ok(OpenGL::thread_enter(self, surface)?)
     }
 
     fn thread_exit(&mut self) {
         OpenGL::thread_exit(self)
+    }
+
+    fn set_viewport(&self, width: u32, height: u32) {
+        OpenGL::set_viewport(self, width, height)
+    }
+
+    fn set_blending(&mut self, blending: AlphaBlending) {
+        self.blending = blending;
+    }
+
+    fn surface_size(&self) -> Result<SurfaceSize, generic::Error> {
+        Ok(OpenGL::surface_size(self)?)
+    }
+
+    fn draw_frame_start(&mut self) {
+        OpenGL::draw_frame_start(self)
+    }
+
+    fn draw_frame_end(&mut self) {
+        OpenGL::draw_frame_end(self)
+    }
+
+    fn init_shaders(&self, custom_shaders: &[&CStr]) -> Result<shaders::Shaders, generic::Error> {
+        Ok(OpenGL::init_shaders(self, custom_shaders)?)
+    }
+
+    fn init_target(&self, width: usize, height: usize) -> Result<Target, generic::Error> {
+        Ok(OpenGL::init_target(self, width, height)?)
+    }
+
+    fn uniform_buffer_options(&self) -> buffer::Options {
+        OpenGL::uniform_buffer_options(self)
+    }
+
+    fn fg_buffer_options(&self) -> buffer::Options {
+        OpenGL::fg_buffer_options(self)
+    }
+
+    fn bg_buffer_options(&self) -> buffer::Options {
+        OpenGL::bg_buffer_options(self)
+    }
+
+    fn image_buffer_options(&self) -> buffer::Options {
+        OpenGL::image_buffer_options(self)
+    }
+
+    fn bg_image_buffer_options(&self) -> buffer::Options {
+        OpenGL::bg_image_buffer_options(self)
+    }
+
+    fn texture_options(&self) -> texture::Options {
+        OpenGL::texture_options(self)
+    }
+
+    fn sampler_options(&self) -> sampler::Options {
+        OpenGL::sampler_options(self)
+    }
+
+    fn image_texture_options(&self, format: ImageTextureFormat, srgb: bool) -> texture::Options {
+        OpenGL::image_texture_options(self, format, srgb)
+    }
+
+    fn init_atlas_texture(&self, atlas: &font::Atlas) -> Result<Texture, generic::Error> {
+        Ok(OpenGL::init_atlas_texture(self, atlas)?)
+    }
+
+    fn begin_frame(&self, renderer: *mut Renderer, target: *mut Target) -> Result<Frame, generic::Error> {
+        Ok(OpenGL::begin_frame(self, renderer, target)?)
     }
 }
 
@@ -580,7 +657,7 @@ impl ImageTextureFormat {
 #[cfg(test)]
 pub(crate) mod test_util {
     use super::*;
-    use crate::apprt::surface::standin::{AppMailbox, AppQueue};
+    use crate::app::{Mailbox as AppMailbox, MailboxQueue as AppQueue};
 
     /// Renderer options for `device` whose surface mailbox points at
     /// `app`/`queue` (or nowhere when they are null).
@@ -591,8 +668,8 @@ pub(crate) mod test_util {
     ) -> Options {
         Options {
             device,
-            config: rstandin::RendererDerivedConfig::default(),
-            font_grid: std::ptr::null_mut(),
+            config: generic::DerivedConfig::default(),
+            font_grid: crate::renderer::generic::test_util::test_grid(),
             size: crate::renderer::Size::default(),
             surface_mailbox: crate::apprt::surface::Mailbox {
                 surface: std::ptr::null_mut(),

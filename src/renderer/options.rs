@@ -8,7 +8,8 @@
 //! renderer thread) stay raw pointers like in Zig.
 
 use crate::apprt;
-use crate::renderer::standin::{RendererDerivedConfig, SharedGrid};
+use crate::font::SharedGrid;
+use crate::renderer::generic::DerivedConfig as RendererDerivedConfig;
 use crate::renderer::{Device, Size, Thread};
 
 #[derive(Debug)]

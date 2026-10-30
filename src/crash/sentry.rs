@@ -86,10 +86,7 @@ pub struct ThreadState {
     pub r#type: ThreadType,
 
     /// The surface that this thread is attached to.
-    ///
-    /// TODO(port-dedupe): this is `*Surface` in Zig; until `Surface` is
-    /// ported, the surface is reached through the [`CrashSurface`] trait.
-    pub surface: *const dyn CrashSurface,
+    pub surface: *const crate::surface::Surface,
 }
 
 impl fmt::Debug for ThreadState {
@@ -120,14 +117,8 @@ impl ThreadType {
     }
 }
 
-// TODO(port-dedupe): replace with direct access to `crate::surface::Surface`
-// (`surface.size`, a `renderer::Size`) once Surface is ported.
-/// The surface data the crash callback reads (`surface.size`).
-pub trait CrashSurface {
-    fn crash_dimensions(&self) -> SurfaceDimensions;
-}
-
-/// The dimensions recorded in a crash's "Dimensions" context.
+/// The dimensions recorded in a crash's "Dimensions" context (read from
+/// `surface.size`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SurfaceDimensions {
     pub screen_width: u32,
@@ -136,6 +127,21 @@ pub struct SurfaceDimensions {
     pub grid_rows: u32,
     pub cell_width: u32,
     pub cell_height: u32,
+}
+
+impl SurfaceDimensions {
+    /// The dimensions of a surface size.
+    pub fn from_size(size: crate::renderer::Size) -> SurfaceDimensions {
+        let grid_size = size.grid();
+        SurfaceDimensions {
+            screen_width: size.screen.width,
+            screen_height: size.screen.height,
+            grid_columns: grid_size.columns as u32,
+            grid_rows: grid_size.rows as u32,
+            cell_width: size.cell.width,
+            cell_height: size.cell.height,
+        }
+    }
 }
 
 thread_local! {
@@ -414,7 +420,12 @@ mod native {
             let obj = Value::init_object();
             // SAFETY: the thread state owner guarantees the surface outlives
             // the time the state is set.
-            let dims = unsafe { (*thr_state.surface).crash_dimensions() };
+            // (A null surface is only possible in tests; report nothing.)
+            let dims = if thr_state.surface.is_null() {
+                SurfaceDimensions::default()
+            } else {
+                SurfaceDimensions::from_size(unsafe { (*thr_state.surface).size })
+            };
             let cast = |v: u32| i32::try_from(v).unwrap_or(-1);
             obj.set("screen-width", Value::init_int32(cast(dims.screen_width)));
             obj.set("screen-height", Value::init_int32(cast(dims.screen_height)));
@@ -550,29 +561,32 @@ mod tests {
 
     #[test]
     fn thread_state_is_thread_local() {
-        struct S;
-        impl CrashSurface for S {
-            fn crash_dimensions(&self) -> SurfaceDimensions {
-                SurfaceDimensions {
-                    screen_width: 800,
-                    ..Default::default()
-                }
-            }
-        }
-        let s = S;
+        // The surface is only an identifier here (the real surface is
+        // exercised by the surface integration test).
+        let s = std::ptr::NonNull::<crate::surface::Surface>::dangling().as_ptr();
         assert!(thread_state().is_none());
         set_thread_state(Some(ThreadState {
             r#type: ThreadType::Renderer,
-            surface: &s as &dyn CrashSurface as *const dyn CrashSurface,
+            surface: s,
         }));
         let st = thread_state().unwrap();
         assert_eq!(ThreadType::Renderer, st.r#type);
         assert_eq!("renderer", st.r#type.as_str());
-        // SAFETY: `s` is alive.
-        assert_eq!(
-            800,
-            unsafe { (*st.surface).crash_dimensions() }.screen_width
-        );
+        assert_eq!(s as *const _, st.surface);
+        let dims = SurfaceDimensions::from_size(crate::renderer::Size {
+            screen: crate::renderer::ScreenSize {
+                width: 800,
+                height: 600,
+            },
+            cell: crate::renderer::CellSize {
+                width: 10,
+                height: 20,
+            },
+            padding: Default::default(),
+        });
+        assert_eq!(800, dims.screen_width);
+        assert_eq!(80, dims.grid_columns);
+        assert_eq!(30, dims.grid_rows);
         std::thread::spawn(|| assert!(thread_state().is_none()))
             .join()
             .unwrap();
