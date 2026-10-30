@@ -12,8 +12,7 @@
 //! * `Preedit.codepoints` is an owned `Vec` (Zig: an allocated slice with
 //!   explicit `deinit`/`clone`).
 //!
-//! Stand-ins for `Terminal` and the inspector live in [`standin`]
-//! (TODO(port-dedupe)).
+//! A stand-in for the inspector lives in [`standin`] (TODO(port-dedupe)).
 
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -24,17 +23,31 @@ use crate::lib::tinyio::{Mutex, Timeout, TinyIo};
 use crate::terminal::point::Coordinate;
 use crate::terminal::size::CellCountInt;
 
-use self::standin::{Inspector, Terminal};
+pub use crate::terminal::Terminal;
+
+use self::standin::Inspector;
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
-    /// TODO(port-dedupe): replace with `crate::terminal::Terminal`.
-    #[derive(Debug, Default)]
-    pub struct Terminal {}
+    /// The real terminal, re-exported at its former stand-in path for the
+    /// users that still import it from here.
+    pub use crate::terminal::Terminal;
 
     /// TODO(port-dedupe): replace with `crate::inspector::Inspector`.
     #[derive(Debug, Default)]
     pub struct Inspector {}
+
+    impl Inspector {
+        /// Record data read from the pty (Zig: `Inspector.recordPtyRead`).
+        /// The stand-in records nothing.
+        pub fn record_pty_read(
+            &mut self,
+            _t: &mut Terminal,
+            _data: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -312,7 +325,7 @@ mod tests {
     #[test]
     fn lock_demand_handoff() {
         let mut mutex = Mutex::new();
-        let mut terminal = Terminal::default();
+        let mut terminal = Terminal::init(crate::terminal::terminal::Options::new(10, 5)).unwrap();
         let state = State::new(NonNull::from(&mut mutex), NonNull::from(&mut terminal));
         let io = TinyIo;
 

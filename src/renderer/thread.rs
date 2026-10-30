@@ -176,28 +176,15 @@ pub trait TerminalCompression {
     fn compress(&mut self, mode: CompressionMode) -> CompressionResult;
 }
 
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::CompressionMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionMode {
-    Incremental,
-    Full,
-}
+pub use crate::terminal::terminal::{CompressionMode, CompressionResult};
 
-/// TODO(port-dedupe): replace with `crate::terminal::terminal::CompressionResult`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionResult {
-    Unsupported,
-    Pending,
-    Complete,
-}
-
-impl TerminalCompression for crate::renderer::state::standin::Terminal {
+impl TerminalCompression for crate::terminal::Terminal {
     fn compression_activity(&self) -> u64 {
-        0
+        crate::terminal::Terminal::compression_activity(self)
     }
 
-    fn compress(&mut self, _mode: CompressionMode) -> CompressionResult {
-        CompressionResult::Unsupported
+    fn compress(&mut self, mode: CompressionMode) -> CompressionResult {
+        crate::terminal::Terminal::compress(self, mode)
     }
 }
 
@@ -1167,7 +1154,7 @@ mod tests {
         let mut renderer = Renderer::init_with_api(api, opts);
 
         let mut mutex = Mutex::new();
-        let mut terminal = Terminal::default();
+        let mut terminal = Terminal::init(crate::terminal::terminal::Options::new(80, 24)).unwrap();
         let mut state = State::new(NonNull::from(&mut mutex), NonNull::from(&mut terminal));
         let mut surface = apprt::Surface::default();
 

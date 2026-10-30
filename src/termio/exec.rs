@@ -26,9 +26,6 @@
 //! * The apprt `pre_exec`/`post_fork` hooks are
 //!   [`command::RT_PRE_EXEC`]/[`command::RT_POST_FORK`] (the GTK runtime's
 //!   hooks with the `gtk` feature, none otherwise).
-//! * The terminal fields Exec reads (`cols`, `rows`, `width_px`,
-//!   `height_px`, `flags.password_input`, `setPwd`) go through
-//!   [`terminal_standin`] until `Terminal` is ported (TODO(port-dedupe)).
 
 use std::cell::UnsafeCell;
 use std::ffi::{c_void, CString};
@@ -50,10 +47,10 @@ use crate::lib::tinyio::TinyIo;
 use crate::os as internal_os;
 use crate::pty::{self as ptypkg, ProcessInfo, ProcessInfoValue, Pty};
 use crate::renderer;
-use crate::renderer::state::standin::Terminal;
+use crate::terminal::Terminal;
 use crate::termio::backend;
 use crate::termio::shell_integration;
-use crate::termio::standin::{crash_surface, Termio, TermioThreadData};
+use crate::termio::termio::{crash_surface, Termio, ThreadData as TermioThreadData};
 
 const LOG: &str = "io_exec";
 
@@ -246,19 +243,23 @@ impl Exec {
         // set that on the terminal now. This allows rapidly initializing
         // new surfaces to use the proper pwd.
         if let Some(cwd) = &self.subprocess.cwd {
-            if let Err(err) = terminal_standin::set_pwd(term, cwd) {
+            if let Err(err) = term.set_pwd(cwd.as_bytes()) {
                 log::warn!(target: LOG, "error setting initial pwd err={err}");
             }
         }
 
         // Setup our initial grid/screen size from the terminal. This
         // can't fail because the pty should not exist at this point.
-        let (columns, rows) = terminal_standin::grid(term);
-        let (width, height) = terminal_standin::size_px(term);
         if self
             .resize(
-                renderer::GridSize { columns, rows },
-                renderer::ScreenSize { width, height },
+                renderer::GridSize {
+                    columns: term.cols,
+                    rows: term.rows,
+                },
+                renderer::ScreenSize {
+                    width: term.width_px,
+                    height: term.height_px,
+                },
             )
             .is_err()
         {
@@ -692,7 +693,6 @@ fn termios_timer_tick(td_: *mut TermioThreadData, l: &mut xev::Loop) -> xev::Cal
     if mode != exec.termios_mode {
         'mode_change: {
             log::debug!(target: LOG, "termios change mode={mode:?}");
-            let prev_mode = exec.termios_mode;
             exec.termios_mode = mode;
 
             // We assume we're in some sort of password input if we're
@@ -708,7 +708,7 @@ fn termios_timer_tick(td_: *mut TermioThreadData, l: &mut xev::Loop) -> xev::Cal
                 let mutex = unsafe { state.mutex.as_ref() };
                 mutex.lock_uncancelable(TinyIo);
                 let t = unsafe { state.terminal.as_ref() };
-                let current = terminal_standin::password_input(t, prev_mode);
+                let current = t.flags.password_input;
                 mutex.unlock(TinyIo);
                 if current == password_input {
                     break 'mode_change;
@@ -2682,40 +2682,10 @@ fn append_env_always(current: &str, value: &str) -> String {
     format!("{current}{PATH_DELIMITER}{value}")
 }
 
-/// TODO(port-dedupe): the `Terminal` fields and methods Exec uses
-/// (`setPwd`, `cols`/`rows`, `width_px`/`height_px`,
-/// `flags.password_input`). The renderer's stand-in `Terminal` has none of
-/// them yet, so these return neutral values.
-pub mod terminal_standin {
-    use super::{ptypkg, Terminal};
-    use crate::renderer::size::GridSizeUnit;
-
-    /// `term.setPwd(pwd)`.
-    pub fn set_pwd(_t: &mut Terminal, _pwd: &str) -> Result<(), super::Error> {
-        Ok(())
-    }
-
-    /// `(term.cols, term.rows)`.
-    pub fn grid(_t: &Terminal) -> (GridSizeUnit, GridSizeUnit) {
-        (80, 24)
-    }
-
-    /// `(term.width_px, term.height_px)`.
-    pub fn size_px(_t: &Terminal) -> (u32, u32) {
-        (0, 0)
-    }
-
-    /// `t.flags.password_input`. The surface sets this flag when it
-    /// handles the `password_input` message, so until the terminal is
-    /// ported the stand-in assumes it mirrors the last reported termios
-    /// state (`prev_mode`).
-    pub fn password_input(_t: &Terminal, prev_mode: ptypkg::Mode) -> bool {
-        prev_mode.canonical && !prev_mode.echo
-    }
-}
-
 /// A test harness that runs an [`Exec`] backend under a real
-/// [`crate::termio::Thread`] with the stand-in `Termio` as a test double.
+/// [`crate::termio::Thread`] and [`Termio`], with stand-ins for the
+/// renderer (a mailbox and wakeup nobody drains) and the surface (an app
+/// queue the harness drains).
 #[cfg(all(test, unix))]
 pub(crate) mod testing {
     use std::ptr::NonNull;
@@ -2729,9 +2699,8 @@ pub(crate) mod testing {
     use crate::global::xev;
     use crate::lib::tinyio::{Mutex, TinyIo};
     use crate::renderer;
-    use crate::renderer::state::standin::Terminal;
-    use crate::termio::standin::{Termio, TermioDerivedConfig};
-    use crate::termio::{Backend, Mailbox, Message, Thread};
+    use crate::terminal::point::{Coordinate, Point};
+    use crate::termio::{Backend, DerivedConfig, Mailbox, Message, Options, Termio, Thread};
 
     struct SendPtr<T>(*mut T);
     // SAFETY: test-only hand-off of pointers whose targets outlive the
@@ -2747,16 +2716,19 @@ pub(crate) mod testing {
     /// the pointers between the pieces stay valid.
     pub struct Harness {
         pub mutex: Box<Mutex>,
-        pub terminal: Box<Terminal>,
         pub state: Box<renderer::State>,
         pub rt_app: Box<apprt::App>,
         pub app_queue: Box<AppQueue>,
+        pub renderer_mailbox: Box<renderer::thread::Mailbox>,
+        pub renderer_wakeup: xev::Async,
         pub io: Box<Termio>,
         pub thread: Box<Thread>,
         pub stop: xev::Async,
         pub handle: Option<std::thread::JoinHandle<()>>,
         /// Surface messages received so far.
         pub messages: Vec<SurfaceMessage>,
+        /// Renderer messages received so far.
+        pub renderer_messages: Vec<renderer::Message>,
     }
 
     /// An exec config running `argv` directly with a minimal environment.
@@ -2774,26 +2746,50 @@ pub(crate) mod testing {
         }
     }
 
+    /// The size of a `cols`x`rows` grid of 10x20 cells.
+    pub fn grid_size(cols: u32, rows: u32) -> renderer::Size {
+        renderer::Size {
+            screen: renderer::ScreenSize {
+                width: cols * 10,
+                height: rows * 20,
+            },
+            cell: renderer::CellSize {
+                width: 10,
+                height: 20,
+            },
+            padding: renderer::Padding::default(),
+        }
+    }
+
     impl Harness {
-        /// Build the termio for `cfg` without starting the thread.
+        /// Build the termio for `cfg` (80x24) without starting the thread.
         pub fn new(cfg: Config) -> Harness {
+            Harness::with_config(cfg, &crate::config::Config::default())
+        }
+
+        /// Build the termio for `cfg` and the app config `full_config`.
+        pub fn with_config(cfg: Config, full_config: &crate::config::Config) -> Harness {
             let mut mutex = Box::new(Mutex::new());
-            let mut terminal = Box::new(Terminal::default());
+            // The terminal is owned by the termio; it is set below.
             let mut state = Box::new(renderer::State::new(
                 NonNull::from(&mut *mutex),
-                NonNull::from(&mut *terminal),
+                NonNull::dangling(),
             ));
             let rt_app = Box::new(apprt::App::default());
             let app_queue = Box::new(AppQueue::new());
+            let renderer_mailbox = renderer::thread::Mailbox::create();
+            let renderer_wakeup = xev::Async::init().unwrap();
 
-            let mut backend = Backend::Exec(Exec::init(cfg).unwrap());
-            backend.init_terminal(&mut terminal);
-
-            let io = Box::new(Termio {
+            let backend = Backend::Exec(Exec::init(cfg).unwrap());
+            let mut io = Termio::init(Options {
+                size: grid_size(80, 24),
+                full_config,
+                config: DerivedConfig::init(full_config),
                 backend,
-                config: TermioDerivedConfig::default(),
+                mailbox: Mailbox::init_spsc().unwrap(),
                 renderer_state: &mut *state,
-                renderer_wakeup: xev::Async::init().unwrap(),
+                renderer_wakeup,
+                renderer_mailbox: &*renderer_mailbox,
                 surface_mailbox: apprt::surface::Mailbox {
                     surface: std::ptr::null_mut(),
                     app: AppMailbox {
@@ -2801,26 +2797,25 @@ pub(crate) mod testing {
                         mailbox: &*app_queue,
                     },
                 },
-                size: renderer::Size::default(),
-                mailbox: Mailbox::init_spsc().unwrap(),
-                processed: Vec::new(),
-                resizes: Vec::new(),
-                synchronized_output_resets: 0,
-            });
+            })
+            .unwrap();
+            state.terminal = NonNull::from(&mut io.terminal);
 
             let thread = Box::new(Thread::init().unwrap());
             let stop = thread.stop;
             Harness {
                 mutex,
-                terminal,
                 state,
                 rt_app,
                 app_queue,
+                renderer_mailbox,
+                renderer_wakeup,
                 io,
                 thread,
                 stop,
                 handle: None,
                 messages: Vec::new(),
+                renderer_messages: Vec::new(),
             }
         }
 
@@ -2855,26 +2850,33 @@ pub(crate) mod testing {
         }
 
         /// Run `f` on the termio while holding the renderer mutex (which
-        /// protects the test-double state).
-        pub fn with_io<R>(&mut self, f: impl FnOnce(&Termio) -> R) -> R {
+        /// protects the terminal).
+        pub fn with_io<R>(&mut self, f: impl FnOnce(&mut Termio) -> R) -> R {
             let io = self.io_ptr();
             self.mutex.lock_uncancelable(TinyIo);
             // SAFETY: the inspected fields are protected by the mutex.
-            let r = f(unsafe { &*io });
+            let r = f(unsafe { &mut *io });
             self.mutex.unlock(TinyIo);
             r
         }
 
-        /// A copy of the output processed so far.
-        pub fn processed(&mut self) -> Vec<u8> {
-            self.with_io(|io| io.processed.clone())
+        /// The whole screen contents (history included, soft wraps joined)
+        /// of the terminal.
+        pub fn screen(&mut self) -> String {
+            self.with_io(|io| {
+                io.terminal
+                    .screens
+                    .active
+                    .dump_string_alloc_unwrapped(Point::Screen(Coordinate::default()))
+                    .unwrap()
+            })
         }
 
-        /// Wait until the processed output contains `needle`.
+        /// Wait until the screen contains `needle`.
         pub fn wait_output(&mut self, needle: &str) -> String {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let out = String::from_utf8_lossy(&self.processed()).into_owned();
+                let out = self.screen();
                 if out.contains(needle) {
                     return out;
                 }
@@ -2883,13 +2885,26 @@ pub(crate) mod testing {
             }
         }
 
-        /// Move the queued surface messages into `messages`.
+        /// Move the queued surface messages into `messages`. Like the
+        /// surface, a password input report updates the terminal flag.
         pub fn collect_messages(&mut self) {
             while let Some(m) = self.app_queue.pop() {
                 match m {
-                    AppMessage::SurfaceMessage { message, .. } => self.messages.push(message),
+                    AppMessage::SurfaceMessage { message, .. } => {
+                        if let SurfaceMessage::PasswordInput(v) = message {
+                            self.with_io(|io| io.terminal.flags.password_input = v);
+                        }
+                        self.messages.push(message)
+                    }
                     other => panic!("unexpected app message {other:?}"),
                 }
+            }
+        }
+
+        /// Move the queued renderer messages into `renderer_messages`.
+        pub fn collect_renderer_messages(&mut self) {
+            while let Some(m) = self.renderer_mailbox.pop() {
+                self.renderer_messages.push(m);
             }
         }
 
@@ -2911,7 +2926,7 @@ pub(crate) mod testing {
         }
 
         /// Wait until `pred` holds on the termio (under the renderer mutex).
-        pub fn wait_io(&mut self, pred: impl Fn(&Termio) -> bool) {
+        pub fn wait_io(&mut self, pred: impl Fn(&mut Termio) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !self.with_io(&pred) {
                 assert!(Instant::now() < deadline, "timed out waiting for termio state");
@@ -2931,8 +2946,8 @@ pub(crate) mod testing {
     impl Drop for Harness {
         fn drop(&mut self) {
             self.stop();
-            self.io.renderer_wakeup.deinit();
             self.io.deinit();
+            self.renderer_wakeup.deinit();
             self.thread.deinit();
         }
     }
@@ -3317,7 +3332,7 @@ mod tests {
         ]));
         h.start();
         let out = h.wait_output("DONE");
-        let lines: Vec<&str> = out.split("\r\n").filter(|l| l.starts_with("line ")).collect();
+        let lines: Vec<&str> = out.split('\n').filter(|l| l.starts_with("line ")).collect();
         assert_eq!(5000, lines.len());
         for (i, l) in lines.iter().enumerate() {
             assert_eq!(format!("line {i}"), *l);

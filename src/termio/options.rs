@@ -11,7 +11,6 @@ use crate::apprt;
 use crate::config::Config;
 use crate::global::xev;
 use crate::renderer;
-use crate::renderer::standin::ThreadMailbox as RendererThreadMailbox;
 use crate::termio;
 
 #[derive(Debug)]
@@ -45,9 +44,7 @@ pub struct Options {
     pub renderer_wakeup: xev::Async,
 
     /// The mailbox for renderer messages.
-    ///
-    /// TODO(port-dedupe): the type becomes `renderer::thread::Mailbox`.
-    pub renderer_mailbox: *const RendererThreadMailbox,
+    pub renderer_mailbox: *const renderer::thread::Mailbox,
 
     /// The mailbox for sending the surface messages.
     pub surface_mailbox: apprt::surface::Mailbox,
