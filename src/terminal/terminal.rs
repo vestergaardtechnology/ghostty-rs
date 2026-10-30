@@ -1,8 +1,6 @@
 //! Port of `src/terminal/Terminal.zig`.
 //!
-//! STATUS: partial — everything (including all tests) is ported except
-//! `vtStream`/`vtHandler` (pending the stream_terminal port, which defines
-//! the Stream/Handler types they return).
+//! STATUS: ported
 //!
 //! The primary terminal emulation structure. This represents a single
 //! "terminal" containing a grid of characters and exposes various operations
@@ -13,8 +11,8 @@
 //!   (global allocator, no `std.Io`). `deinit` is `Drop`.
 //! - Screens are addressed through [`ScreenPtr`] (Zig `*Screen`), see
 //!   `screen_set.rs`.
-//! - `vtStream`/`vtHandler` are provided by the `stream_terminal` port (they
-//!   construct its `Stream`/`Handler` types); `kittyGraphics` is provided by
+//! - `vtStream`/`vtHandler` are provided here and construct the
+//!   `stream_terminal` `Stream`/`Handler` types; `kittyGraphics` is provided by
 //!   the `kitty/graphics_exec` port (`Terminal::kitty_graphics`).
 //! - The batched print fast path (`printSlice`) uses scalar loops where the
 //!   Zig version hand-vectorizes with `@Vector` (identical results).
@@ -24,6 +22,7 @@ use std::fmt;
 use std::io::Write as _;
 
 use crate::terminal::ansi;
+use crate::terminal::stream_terminal;
 use crate::terminal::apc::glyph;
 use crate::terminal::build_options;
 use crate::terminal::charsets;
@@ -931,6 +930,30 @@ impl Terminal {
         result.flags.xt_checksum = opts.default_xt_checksum;
         result.set_cursor_style(ansi::CursorStyle::Default);
         Ok(result)
+    }
+
+    /// Return a terminal Stream that can process VT streams and update this
+    /// terminal state. The streams will only process read-only data that
+    /// modifies terminal state.
+    ///
+    /// Sequences that query or otherwise require output will be ignored.
+    /// If you want to handle side effects, use `vt_handler` and set the
+    /// effects field yourself, then initialize a stream.
+    ///
+    /// Important: this creates a new stream each time with fresh parser state.
+    /// If you need to persist parser state across multiple writes (e.g.
+    /// for handling escape sequences split across write boundaries), you
+    /// must store and reuse the returned stream.
+    pub fn vt_stream(&mut self) -> stream_terminal::Stream<'_> {
+        stream_terminal::Stream::init(crate::terminal::stream::Options {
+            allocator: Some(osc::Allocator::GLOBAL),
+            ..crate::terminal::stream::Options::new(self.vt_handler())
+        })
+    }
+
+    /// This is the handler-side only for vt_stream.
+    pub fn vt_handler(&mut self) -> stream_terminal::Handler<'_> {
+        stream_terminal::Handler::init(self)
     }
 
     /// Returns the current color for an xterm OSC color target.
@@ -8394,20 +8417,14 @@ mod tests {
         //
         // The grid must be wide enough to fill a page from a single REP, so
         // this does not reproduce at 80x24.
-        //
-        // Port note: the Zig test feeds the input above through `vtStream`,
-        // which is provided by the (not yet ported) stream_terminal handler.
-        // The equivalent Terminal operations are performed directly here.
+        let input: &[u8] = b"A\x1b[48111b\x1b]8;;\x93\x1b[11A\x1b[22JB\x1b]8;;\x1b";
+
         let mut t = init(200, 50);
 
         {
-            t.print('A' as u32).unwrap();
-            t.print_repeat(48111).unwrap();
-            t.screens.active.start_hyperlink(b"\xC2\x93", None).unwrap();
-            t.cursor_up(11);
-            t.erase_display(csi::EraseDisplay::ScrollComplete, false);
-            t.print('B' as u32).unwrap();
-            t.screens.active.end_hyperlink();
+            let mut s = t.vt_stream();
+            s.next_slice(input);
+            s.deinit();
         }
 
         // With slow runtime safety on, the page integrity checks during the

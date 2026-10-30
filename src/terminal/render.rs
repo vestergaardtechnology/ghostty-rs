@@ -1,13 +1,6 @@
 //! Port of `src/terminal/render.zig`.
 //!
-//! STATUS: partial — everything is ported except the Kitty image storage
-//! lookups (`Kitty.rebuildRoots`, `Kitty.template` and the image part of
-//! `Kitty.resolvePlaceholder`), which are pending the `graphics_storage` /
-//! `graphics_image` / `graphics_unicode.Placement` ports (the storage never
-//! holds images or placements yet, so those lookups always find nothing,
-//! which is what the Zig code computes for an empty storage). The Kitty
-//! image tests that need a populated storage are ported but gated with
-//! `#[cfg(any())]` (`TODO(port-dedupe)`); every other test runs.
+//! STATUS: ported
 //!
 //! Notes on the port:
 //! - `std.MultiArrayList(Row)` is [`RowData`] and `std.MultiArrayList(Cell)`
@@ -20,6 +13,8 @@
 //!   and each cell stores a range into it; `highlights` and `placeholders`
 //!   are plain `Vec`s. The observable behavior (rebuilds reuse memory,
 //!   nothing is freed until drop) is the same.
+//! - Kitty functions that take a `*Terminal` read its geometry through
+//!   `graphics_storage::TerminalInfo` (as the storage port does).
 //! - Allocation failures abort (Rust global allocator), so the update
 //!   functions don't return `Allocator.Error`.
 //! - `fillStyles` (a hand-vectorized `@memset`) is `<[Style]>::fill`, which
@@ -39,8 +34,10 @@ use crate::terminal::build_options;
 use crate::terminal::color;
 use crate::terminal::cursor;
 use crate::terminal::highlight;
-use crate::terminal::kitty::graphics_storage::ImageStorage;
-use crate::terminal::kitty::graphics_unicode::{self, IncompletePlacement};
+use crate::terminal::kitty::graphics_storage::{
+    ImageStorage, Location as StorageLocation, Placement as StoragePlacement, TerminalInfo,
+};
+use crate::terminal::kitty::graphics_unicode::{self, IncompletePlacement, Placement as UnicodePlacement};
 use crate::terminal::modes::Mode;
 use crate::terminal::page::{self, cell_fields, field_mask, row_fields, ContentTag, Mask, Page, Wide};
 use crate::terminal::page_list::{Direction, Node, NodePtr, Pin, PinOverflow};
@@ -2195,40 +2192,7 @@ fn runs_eql(a: &[StyleRun], b: &[StyleRun]) -> bool {
 
 /// The Kitty image storage key of a placement (Zig:
 /// `kitty_gfx.ImageStorage.PlacementKey`).
-///
-/// TODO(port-dedupe): replace with
-/// `crate::terminal::kitty::graphics_storage::PlacementKey` once the
-/// storage port has the placement maps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlacementKey {
-    pub image_id: u32,
-    pub placement_id: PlacementId,
-}
-
-impl PlacementKey {
-    pub fn eql(self, other: PlacementKey) -> bool {
-        self == other
-    }
-}
-
-/// Internal placement IDs are assigned by us for placements created
-/// without an explicit ID (p=0); external IDs are client-specified.
-/// The two are separate namespaces, hence the tag. (Zig:
-/// `ImageStorage.PlacementId`.)
-///
-/// TODO(port-dedupe): replace with the graphics_storage type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlacementId {
-    pub tag: PlacementIdTag,
-    pub id: u32,
-}
-
-/// (Zig: `ImageStorage.PlacementId.tag`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PlacementIdTag {
-    Internal,
-    External,
-}
+pub use crate::terminal::kitty::graphics_storage::{PlacementId, PlacementKey, PlacementTag};
 
 /// A run of neighboring Kitty graphics placeholder cells in one row
 /// that show one piece of one image. (Zig: `Kitty.Placeholder`, public
@@ -2528,7 +2492,7 @@ mod kitty {
             state.kitty.height_px = t.height_px;
             state.kitty.rows = state.rows;
             state.kitty.cols = state.cols;
-            rebuild_roots(state, t);
+            rebuild_roots(state, storage, &TerminalInfo::from_terminal(t));
         }
 
         // Whether the runs that the iterator returns changed. They did if
@@ -2774,54 +2738,182 @@ mod kitty {
     /// about a root except its position depends only on the storage and
     /// the cell size, so this only runs when one of those changes. It
     /// visits every placement in the storage.
-    ///
-    /// For each placement in the storage (keeping placements with
-    /// garbage pins: a pin can become garbage without a generation
-    /// change, so `place_roots` checks for it every time instead):
-    ///
-    ///   - `pin` locations become a `Pin` anchor with a `fixed` template.
-    ///   - `virtual` locations are skipped (they are drawn by their runs).
-    ///   - `relative` locations follow the chain of parents to the
-    ///     placement at its start (a broken chain is never drawn) and
-    ///     become a `Virtual` or `Pin` anchor with the summed offsets and a
-    ///     `relative` template.
-    ///
-    /// TODO(port-dedupe): the walk of `storage.placements`, `resolveChain`
-    /// and `template` (which reads `imageById`, `renderData().isPending()`
-    /// and the placement's `gridSize`/`pixelSize`/`cellOffset`/
-    /// `sourceRect`) are pending the graphics_storage/graphics_image ports.
-    /// Until then the storage never holds placements, so there are no
-    /// roots, which is what the Zig code builds for an empty storage.
-    fn rebuild_roots(state: &mut RenderState, t: &Terminal) {
-        let _storage: &ImageStorage = &t.screens.active.kitty_images;
+    fn rebuild_roots(state: &mut RenderState, storage: &ImageStorage, t: &TerminalInfo) {
         state.kitty.roots.clear();
         state.kitty.virtual_anchors = 0;
+        for (key, value) in storage.placements.iter() {
+            // Keep placements with garbage pins. A pin can become
+            // garbage without a generation change, so `place_roots`
+            // checks for it every time instead.
+            let root: KittyRoot = match value.location {
+                StorageLocation::Pin(pin) => {
+                    let Some(placement) = template(storage, t, *key, value, KittyPlacementKind::Fixed) else {
+                        continue;
+                    };
+                    KittyRoot {
+                        anchor: KittyAnchor::Pin(pin.as_ptr()),
+                        horizontal_offset: 0,
+                        vertical_offset: 0,
+                        placement,
+                    }
+                }
+
+                StorageLocation::Virtual => continue,
+
+                StorageLocation::Relative(rel) => {
+                    // Follow the chain of parents to the placement at its
+                    // start. A broken chain is never drawn.
+                    let Some(chain) = storage.resolve_chain(rel) else { continue };
+                    let anchor = match chain.root.location {
+                        StorageLocation::Virtual => KittyAnchor::Virtual(chain.root_key),
+                        StorageLocation::Pin(pin) => KittyAnchor::Pin(pin.as_ptr()),
+
+                        // resolveChain roots are never relative.
+                        StorageLocation::Relative(_) => unreachable!(),
+                    };
+                    let Some(placement) = template(storage, t, *key, value, KittyPlacementKind::Relative) else {
+                        continue;
+                    };
+                    KittyRoot {
+                        anchor,
+                        horizontal_offset: chain.horizontal_offset,
+                        vertical_offset: chain.vertical_offset,
+                        placement,
+                    }
+                }
+            };
+
+            if matches!(root.anchor, KittyAnchor::Virtual(_)) {
+                state.kitty.virtual_anchors += 1;
+            }
+            state.kitty.roots.push(root);
+        }
+    }
+
+    /// Returns the `ImagePlacement` for a placement in the image storage,
+    /// with everything except `x` and `y` filled in. Returns None if
+    /// there is nothing to draw, such as when the image is missing, still
+    /// loading, or the terminal has no cell size in pixels.
+    fn template(
+        storage: &ImageStorage,
+        t: &TerminalInfo,
+        key: PlacementKey,
+        p: &StoragePlacement,
+        kind: KittyPlacementKind,
+    ) -> Option<ImagePlacement> {
+        // Nothing to draw until the displayed pixels arrive. For an
+        // animation, those are the current frame's pixels.
+        let image = storage.image_by_id(key.image_id)?;
+        if image.render_data().is_pending() {
+            return None;
+        }
+
+        // The size is zero when the terminal has no cell size in pixels.
+        // Then there is nothing to draw.
+        let grid = p.grid_size(image, t);
+        if grid.cols == 0 || grid.rows == 0 {
+            return None;
+        }
+        let dest = p.pixel_size(image, t);
+        if dest.width == 0 || dest.height == 0 {
+            return None;
+        }
+        let offset = p.cell_offset(t);
+        let source = p.source_rect(image);
+
+        Some(ImagePlacement {
+            protocol: ImagePlacementProtocol::Kitty(KittyPlacement {
+                kind,
+                placement_id: match key.placement_id.tag {
+                    PlacementTag::External => key.placement_id.id,
+                    PlacementTag::Internal => 0,
+                },
+            }),
+            image_id: key.image_id,
+            image_generation: image.generation,
+            layer: image_layer_from_z(p.z),
+            z: p.z,
+            x: 0,
+            y: 0,
+            cols: grid.cols,
+            rows: grid.rows,
+            offset_x: offset.x,
+            offset_y: offset.y,
+            width: dest.width,
+            height: dest.height,
+            source_x: source.x,
+            source_y: source.y,
+            source_width: source.width,
+            source_height: source.height,
+        })
     }
 
     /// Look up what one placeholder run draws and store it in the run.
     /// `row_pin` is the pin of the run's row.
-    ///
-    /// The Zig version looks up the virtual placement the run targets
-    /// (`storage.placeholderTarget`), remembering it in `run.target` even
-    /// if the image can't be drawn (relative placements attached to it
-    /// still need the position of these cells), then the image
-    /// (`imageById`, nothing to draw until the displayed pixels arrive),
-    /// and with a cell size in pixels computes the geometry through
-    /// `unicode.Placement.renderPlacement`.
-    ///
-    /// TODO(port-dedupe): those lookups are pending the graphics_storage/
-    /// graphics_image/graphics_unicode ports. Until then the storage never
-    /// holds images or placements, so every run has no target and is
-    /// hidden, which is what the Zig code computes for an empty storage.
     fn resolve_placeholder(
-        _storage: &ImageStorage,
-        _row_pin: Pin,
+        storage: &ImageStorage,
+        row_pin: Pin,
         run: &mut Placeholder,
-        _cell_width: u32,
-        _cell_height: u32,
+        cell_width: u32,
+        cell_height: u32,
     ) {
         run.state = PlaceholderState::Hidden;
         run.target = None;
+
+        // Remember the virtual placement even if the image can't be
+        // drawn. Relative placements attached to it still need the
+        // position of these cells.
+        let Some(target) = storage.placeholder_target(run.image_id, run.placement_id) else {
+            return;
+        };
+        run.target = Some(target.key);
+
+        // Nothing to draw until the displayed pixels arrive, as in
+        // `template`.
+        let Some(image) = storage.image_by_id(run.image_id) else { return };
+        if image.render_data().is_pending() {
+            return;
+        }
+
+        // Without a cell size in pixels, there is no size to draw at.
+        if cell_width == 0 || cell_height == 0 {
+            return;
+        }
+
+        let mut pin = row_pin;
+        pin.x = run.x;
+        let vp = UnicodePlacement {
+            pin,
+            image_id: run.image_id,
+            placement_id: run.placement_id,
+            col: run.col,
+            row: run.row,
+            width: run.width as u32,
+            height: 1,
+        };
+        let rp = match vp.render_placement(&target.placement, image, cell_width, cell_height) {
+            Ok(rp) => rp,
+            Err(err) => {
+                log::warn!(target: LOG_TARGET, "error resolving virtual placement err={err}");
+                return;
+            }
+        };
+        if rp.dest_width == 0 || rp.dest_height == 0 {
+            return;
+        }
+
+        run.geometry = PlaceholderGeometry {
+            image_generation: image.generation,
+            offset_x: rp.offset_x,
+            offset_y: rp.offset_y,
+            width: rp.dest_width,
+            height: rp.dest_height,
+            source_x: rp.source_x,
+            source_y: rp.source_y,
+            source_width: rp.source_width,
+            source_height: rp.source_height,
+        };
+        run.state = PlaceholderState::Visible;
     }
 
     /// Groups Kitty placeholder cells into runs as the row scan visits
@@ -4797,116 +4889,16 @@ mod tests {
         assert_eq!(ImageLayer::AboveText, image_layer_from_z(0));
         assert_eq!(ImageLayer::BelowBackground, image_layer_from_z(i32::MIN));
     }
-
-    #[test]
-    fn fixed_row_index_of_pin_walks_pages_above_and_below() {
-        if !build_options::KITTY_GRAPHICS {
-            return;
-        }
-
-        let mut t = term_scrollback(10, 5, None);
-        t.width_px = 100;
-        t.height_px = 50;
-        let first = t.screens.active.pages.pages.first.unwrap();
-        // SAFETY: the nodes below are live while `t` is.
-        let page_rows: isize = unsafe { first.as_ref().capacity().rows } as isize;
-
-        // Three pages, with the viewport on the middle one, three rows down.
-        t.set_cursor_pos(5, 1);
-        for _ in 0..(2 * page_rows + 10) {
-            t.index().unwrap();
-        }
-        let middle = unsafe { first.as_ref().next.unwrap() };
-        let last = unsafe { middle.as_ref().next.unwrap() };
-        t.scroll_viewport(ScrollViewport::Top);
-        t.scroll_viewport(ScrollViewport::Delta(page_rows + 3));
-        assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == middle);
-
-        let mut state = RenderState::empty();
-        state.update(&mut t);
-
-        // Deviation: the Zig test gets the chunk table from the update,
-        // where a fixed placement makes `placeRoots` build it. Until the
-        // image storage holds placements, build it from the captured row
-        // pins exactly like `place_roots` does.
-        let range = state.row_data_range();
-        let captured_pins = &state.row_data.pin[range.start..range.end];
-        let mut chunks: Vec<KittyChunk> = Vec::new();
-        for (i, pin) in captured_pins.iter().enumerate() {
-            if i > 0 && captured_pins[i - 1].node == pin.node {
-                continue;
-            }
-            chunks.push(KittyChunk {
-                node: pin.node,
-                start: pin.y,
-                index: i as isize,
-            });
-        }
-        assert_eq!(1, chunks.len());
-        assert_eq!(middle, chunks[0].node);
-        assert_eq!(0, chunks[0].index);
-        assert_eq!(3, chunks[0].start);
-        let captured: isize = 5;
-        let pin = |node: NodePtr, y: isize| Pin {
-            node,
-            y: y as CellCountInt,
-            x: 0,
-            garbage: false,
-        };
-        let row_index = kitty::row_index_of_pin;
-
-        // On a captured page, including its rows outside the captured rows.
-        assert_eq!(Some(0), row_index(&chunks, pin(middle, 3), captured, 1, 0));
-        assert_eq!(Some(-3), row_index(&chunks, pin(middle, 0), captured, 1, 0));
-        assert_eq!(Some(7), row_index(&chunks, pin(middle, 10), captured, 1, 0));
-
-        // Above: the last row of the first page is index -4. It is found when
-        // the placement can reach index 0, through its height or a positive
-        // offset, and not otherwise.
-        let above = pin(first, page_rows - 1);
-        assert_eq!(Some(-4), row_index(&chunks, above, captured, 5, 0));
-        assert_eq!(Some(-4), row_index(&chunks, above, captured, 1, 4));
-        assert_eq!(None, row_index(&chunks, above, captured, 4, 0));
-        assert_eq!(None, row_index(&chunks, above, captured, 4, -2));
-        let first_top = pin(first, 0);
-        assert_eq!(
-            Some(-3 - page_rows),
-            row_index(&chunks, first_top, captured, (page_rows + 4) as u32, 0)
-        );
-
-        // Below: the first row of the last page comes right after the middle
-        // page's rows. Only a negative offset that moves it up into the
-        // captured rows finds it.
-        let below_index: isize = -3 + unsafe { middle.as_ref().rows() } as isize;
-        let below = pin(last, 0);
-        assert_eq!(None, row_index(&chunks, below, captured, 100, 0));
-        assert_eq!(
-            Some(below_index),
-            row_index(&chunks, below, captured, 1, (captured - 1 - below_index) as i32)
-        );
-        assert_eq!(None, row_index(&chunks, below, captured, 1, (captured - below_index) as i32));
-        let below2 = pin(last, 2);
-        assert_eq!(
-            Some(below_index + 2),
-            row_index(&chunks, below2, captured, 1, (-(below_index + 2)) as i32)
-        );
-    }
 }
 
-/// The Kitty image tests that need a populated image storage
-/// (`ImageStorage.addImage`/`addPlacement`/`imageById`/`placements`/
-/// `delete`, `Placement.gridSize`/...). They are ported against the
-/// snake_case transliteration of that API.
-///
-/// TODO(port-dedupe): enable once `kitty::graphics_storage` stores images
-/// and placements (graphics_image/graphics_storage ports), and replace the
-/// render-local `PlacementKey` stand-in with the storage's.
-#[cfg(any())]
+/// The Kitty image tests (Zig: the `placeholders:`, `fixed:` and
+/// `placements_generation:` tests that use the image storage).
+#[cfg(test)]
 mod kitty_image_tests {
     use super::*;
-    use crate::terminal::kitty::graphics_image::{Image, ImageData, Format};
-    use crate::terminal::kitty::graphics_storage::{Location, Placement as StoragePlacement, Relative, DeleteCommand};
-    use crate::terminal::page_list::PageList;
+    use crate::terminal::kitty::graphics_command::{DeleteAction, DeleteId, Format};
+    use crate::terminal::kitty::graphics_image::{Data as ImageData, Image};
+    use crate::terminal::kitty::graphics_storage::{Location, Placement as StoragePlacement, Relative};
     use crate::terminal::screen_set::ScreenPtr;
     use crate::terminal::sgr;
     use crate::terminal::terminal::{Options as TerminalOptions, ScrollViewport, SwitchScreenMode};
@@ -4927,7 +4919,7 @@ mod kitty_image_tests {
         PlacementKey {
             image_id,
             placement_id: PlacementId {
-                tag: PlacementIdTag::External,
+                tag: PlacementTag::External,
                 id,
             },
         }
@@ -4967,7 +4959,7 @@ mod kitty_image_tests {
                 location: Location::Virtual,
                 columns,
                 rows,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
     }
@@ -5007,7 +4999,7 @@ mod kitty_image_tests {
                 location: Location::Pin(pin),
                 columns,
                 rows,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
     }
@@ -5035,7 +5027,7 @@ mod kitty_image_tests {
                 }),
                 columns,
                 rows,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
     }
@@ -5210,7 +5202,7 @@ mod kitty_image_tests {
                 columns: 1,
                 rows: 1,
                 z: 5,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
 
@@ -5278,7 +5270,7 @@ mod kitty_image_tests {
                 x_offset: 4,
                 y_offset: 3,
                 z: -5,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
 
@@ -5289,10 +5281,11 @@ mod kitty_image_tests {
         let storage = &t.screens.active.kitty_images;
         let image = storage.image_by_id(1).unwrap();
         let sp = storage.placements.get(&key(1, 7)).unwrap();
-        let grid = sp.grid_size(&image, &t);
-        let dest = sp.pixel_size(&image, &t);
-        let offset = sp.cell_offset(&t);
-        let source = sp.source_rect(&image);
+        let info = TerminalInfo::from_terminal(&t);
+        let grid = sp.grid_size(image, &info);
+        let dest = sp.pixel_size(image, &info);
+        let offset = sp.cell_offset(&info);
+        let source = sp.source_rect(image);
         assert_eq!(KittyPlacementKind::Fixed, p.protocol.kitty().kind);
         assert_eq!(7, p.protocol.kitty().placement_id);
         assert_eq!(1, p.image_id);
@@ -5412,7 +5405,7 @@ mod kitty_image_tests {
                     location: Location::Pin(p1),
                     columns: 1,
                     rows: (distance + 2) as u32,
-                    ..Default::default()
+                    ..StoragePlacement::new(Location::Virtual)
                 },
             );
             let p2 = s.pages.track_pin(top).unwrap();
@@ -5424,7 +5417,7 @@ mod kitty_image_tests {
                     location: Location::Pin(p2),
                     columns: 1,
                     rows: distance as u32,
-                    ..Default::default()
+                    ..StoragePlacement::new(Location::Virtual)
                 },
             );
         }
@@ -5868,7 +5861,7 @@ mod kitty_image_tests {
                 }),
                 columns: 1,
                 rows: 1,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
 
@@ -5970,7 +5963,7 @@ mod kitty_image_tests {
                 }),
                 columns: 1,
                 rows: 1,
-                ..Default::default()
+                ..StoragePlacement::new(Location::Virtual)
             },
         );
 
@@ -6076,12 +6069,15 @@ mod kitty_image_tests {
         // Delete it again.
         let mut s: ScreenPtr = t.screens.active;
         let s = &mut *s;
+        let info = TerminalInfo::from_terminal(&t);
         s.kitty_images.delete(
             &mut s.pages,
-            DeleteCommand::Id {
+            &info,
+            DeleteAction::Id(DeleteId {
+                delete: false,
                 image_id: 1,
                 placement_id: 4,
-            },
+            }),
         );
         state.update(&mut t);
         assert!(generation != state.image_placements_generation());
@@ -6120,10 +6116,7 @@ mod kitty_image_tests {
     }
 
     #[test]
-    fn fixed_row_index_of_pin_walks_pages_above_and_below_with_placement() {
-        // The full Zig version of `fixed_row_index_of_pin_walks_pages_above_and_below`
-        // (the runnable one builds the chunk table by hand): the chunk table
-        // comes from an update with a pin-anchored placement.
+    fn fixed_row_index_of_pin_walks_pages_above_and_below() {
         let mut t = term_unlimited(10, 5);
         t.width_px = 100;
         t.height_px = 50;
@@ -6139,16 +6132,61 @@ mod kitty_image_tests {
         }
         // SAFETY: the nodes are live.
         let middle = unsafe { first.as_ref().next.unwrap() };
+        let last = unsafe { middle.as_ref().next.unwrap() };
         t.scroll_viewport(ScrollViewport::Top);
         t.scroll_viewport(ScrollViewport::Delta(page_rows + 3));
         assert!(t.screens.active.pages.get_top_left(point::Tag::Viewport).node == middle);
 
         let mut state = RenderState::empty();
         state.update(&mut t);
-        let chunks = &state.kitty.chunks;
+        let chunks: &[KittyChunk] = &state.kitty.chunks;
         assert_eq!(1, chunks.len());
         assert_eq!(middle, chunks[0].node);
         assert_eq!(0, chunks[0].index);
         assert_eq!(3, chunks[0].start);
+        let captured: isize = 5;
+        let pin = |node: NodePtr, y: isize| Pin {
+            node,
+            y: y as CellCountInt,
+            x: 0,
+            garbage: false,
+        };
+        let row_index = kitty::row_index_of_pin;
+
+        // On a captured page, including its rows outside the captured rows.
+        assert_eq!(Some(0), row_index(&chunks, pin(middle, 3), captured, 1, 0));
+        assert_eq!(Some(-3), row_index(&chunks, pin(middle, 0), captured, 1, 0));
+        assert_eq!(Some(7), row_index(&chunks, pin(middle, 10), captured, 1, 0));
+
+        // Above: the last row of the first page is index -4. It is found when
+        // the placement can reach index 0, through its height or a positive
+        // offset, and not otherwise.
+        let above = pin(first, page_rows - 1);
+        assert_eq!(Some(-4), row_index(&chunks, above, captured, 5, 0));
+        assert_eq!(Some(-4), row_index(&chunks, above, captured, 1, 4));
+        assert_eq!(None, row_index(&chunks, above, captured, 4, 0));
+        assert_eq!(None, row_index(&chunks, above, captured, 4, -2));
+        let first_top = pin(first, 0);
+        assert_eq!(
+            Some(-3 - page_rows),
+            row_index(&chunks, first_top, captured, (page_rows + 4) as u32, 0)
+        );
+
+        // Below: the first row of the last page comes right after the middle
+        // page's rows. Only a negative offset that moves it up into the
+        // captured rows finds it.
+        let below_index: isize = -3 + unsafe { middle.as_ref().rows() } as isize;
+        let below = pin(last, 0);
+        assert_eq!(None, row_index(&chunks, below, captured, 100, 0));
+        assert_eq!(
+            Some(below_index),
+            row_index(&chunks, below, captured, 1, (captured - 1 - below_index) as i32)
+        );
+        assert_eq!(None, row_index(&chunks, below, captured, 1, (captured - below_index) as i32));
+        let below2 = pin(last, 2);
+        assert_eq!(
+            Some(below_index + 2),
+            row_index(&chunks, below2, captured, 1, (-(below_index + 2)) as i32)
+        );
     }
 }
