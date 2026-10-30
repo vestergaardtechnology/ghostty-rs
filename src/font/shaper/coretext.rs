@@ -1,9 +1,7 @@
 //! Port of `src/font/shaper/coretext.zig`.
 //!
-//! STATUS: ported (macOS-only; not compiled on Linux. Written against the
-//! snake_case transliteration of the `pkg/macos` Zig API, like
-//! `font/face/coretext.rs`, which is not yet ported to Rust, so this has
-//! never been compiled.)
+//! STATUS: ported (macOS-only; type-checked with
+//! `cargo check --target x86_64-apple-darwin`, tests not run on Linux)
 //!
 //! The Zig tests build `terminal.Terminal` and `terminal.RenderState`
 //! instances and feed them through a VT stream (the test stream handler in
@@ -55,7 +53,7 @@ struct Offset {
 /// Errors from the CoreText shaper (the Zig inferred error sets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    Macos(macos::foundation::Error),
+    Macos(macos::Error),
     GetFace(GetFaceError),
     ThreadSpawnFailed,
 }
@@ -68,8 +66,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<macos::foundation::Error> for Error {
-    fn from(e: macos::foundation::Error) -> Error {
+impl From<macos::Error> for Error {
+    fn from(e: macos::Error) -> Error {
         Error::Macos(e)
     }
 }
@@ -81,8 +79,8 @@ impl From<GetFaceError> for Error {
 }
 
 /// A CoreFoundation object as a raw reference for the release pool.
-fn cf<T: macos::foundation::CFType>(v: &T) -> CFTypeRef {
-    CFTypeRef(v.as_type_ref() as *const c_void)
+fn cf<T: macos::CFType>(v: &T) -> CFTypeRef {
+    CFTypeRef(v.as_ptr() as *const c_void)
 }
 
 /// Shaper that uses CoreText.
@@ -103,9 +101,9 @@ pub struct Shaper {
     pub run_state: RunState,
 
     /// CoreFoundation Dictionary which represents our font feature settings.
-    features: macos::foundation::Dictionary,
+    features: &'static macos::foundation::Dictionary,
     /// A version of the features dictionary with the default features excluded.
-    features_no_default: macos::foundation::Dictionary,
+    features_no_default: &'static macos::foundation::Dictionary,
 
     /// The shared memory used for shaping results.
     cell_buf: Vec<Cell>,
@@ -113,14 +111,14 @@ pub struct Shaper {
     /// Cached attributes dict for creating CTTypesetter objects.
     /// The values in this never change so we can avoid overhead
     /// by just creating it once and saving it for reuse.
-    typesetter_attr_dict: macos::foundation::Dictionary,
+    typesetter_attr_dict: &'static macos::foundation::Dictionary,
 
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
     ///
     /// Fonts are cached as attribute dictionaries to be applied directly to
     /// attributed strings.
-    cached_fonts: Vec<Option<macos::foundation::Dictionary>>,
+    cached_fonts: Vec<Option<&'static macos::foundation::Dictionary>>,
 
     /// The grid that our cached fonts correspond to.
     /// If the grid changes then we need to reset our cache.
@@ -141,13 +139,13 @@ pub struct Shaper {
 impl Shaper {
     /// Create a CoreFoundation Dictionary suitable for
     /// settings the font features of a CoreText font.
-    fn make_features_dict(feats: &[Feature]) -> Result<macos::foundation::Dictionary, Error> {
+    fn make_features_dict(feats: &[Feature]) -> Result<&'static macos::foundation::Dictionary, Error> {
         let list = macos::foundation::MutableArray::create()?;
         // The list will be retained by the dict once we add it to it.
 
-        let result = (|| -> Result<macos::foundation::Dictionary, Error> {
+        let result = (|| -> Result<&'static macos::foundation::Dictionary, Error> {
             for feat in feats {
-                let value_num: i32 = feat.value as i32;
+                let value_num: std::ffi::c_int = feat.value as std::ffi::c_int;
 
                 // Keys can only be ASCII.
                 let key = macos::foundation::String::create_with_bytes(
@@ -164,24 +162,30 @@ impl Shaper {
                     }
                 };
 
-                let dict = macos::foundation::Dictionary::create(
-                    &[
+                // SAFETY: reading framework constants.
+                let keys = unsafe {
+                    [
                         macos::text::c::kCTFontOpenTypeFeatureTag,
                         macos::text::c::kCTFontOpenTypeFeatureValue,
-                    ],
-                    &[key.as_type_ref(), value.as_type_ref()],
+                    ]
+                };
+                let dict = macos::foundation::Dictionary::create(
+                    Some(&keys),
+                    Some(&[key.as_ptr() as *const c_void, value.as_ptr() as *const c_void]),
                 );
                 key.release();
                 value.release();
                 let dict = dict?;
 
-                list.append_value(&dict);
+                list.append_value(dict);
                 dict.release();
             }
 
+            // SAFETY: reading a framework constant.
+            let keys = unsafe { [macos::text::c::kCTFontFeatureSettingsAttribute] };
             let dict = macos::foundation::Dictionary::create(
-                &[macos::text::c::kCTFontFeatureSettingsAttribute],
-                &[list.as_type_ref()],
+                Some(&keys),
+                Some(&[list.as_ptr() as *const c_void]),
             )?;
 
             Ok(dict)
@@ -235,11 +239,13 @@ impl Shaper {
         // using the kCTTypesetterOptionForcedEmbeddingLevel attribute to
         // force CoreText not to try doing any sort of BiDi, instead just
         // treat all text as embedding level 0 (left to right).
-        let typesetter_attr_dict = (|| -> Result<macos::foundation::Dictionary, Error> {
-            let num = macos::foundation::Number::create(macos::foundation::NumberType::Int, &0i32)?;
+        let typesetter_attr_dict = (|| -> Result<&'static macos::foundation::Dictionary, Error> {
+            let num = macos::foundation::Number::create(macos::foundation::NumberType::Int, &(0 as std::ffi::c_int))?;
+            // SAFETY: reading a framework constant.
+            let keys = unsafe { [macos::c::kCTTypesetterOptionForcedEmbeddingLevel] };
             let dict = macos::foundation::Dictionary::create(
-                &[macos::c::kCTTypesetterOptionForcedEmbeddingLevel],
-                &[num.as_type_ref()],
+                Some(&keys),
+                Some(&[num.as_ptr() as *const c_void]),
             );
             num.release();
             Ok(dict?)
@@ -307,7 +313,8 @@ impl Shaper {
         }
 
         for r in items {
-            macos::foundation::cf_release(r.0);
+            // SAFETY: each pooled reference is owned by the pool.
+            unsafe { macos::foundation::cf_release(r.0 as *mut c_void) };
         }
     }
 
@@ -354,27 +361,27 @@ impl Shaper {
             return Ok(&self.cell_buf);
         }
 
-        let attr_dict: macos::foundation::Dictionary = self.get_font(run.grid, run.font_index)?;
+        let attr_dict: &'static macos::foundation::Dictionary = self.get_font(run.grid, run.font_index)?;
 
         // Make room for the attributed string, CTTypesetter, and CTLine.
         self.cf_release_pool.reserve(4);
 
         let str = macos::foundation::String::create_with_characters_no_copy(&self.run_state.unichars)?;
-        self.cf_release_pool.push(cf(&str));
+        self.cf_release_pool.push(cf(str));
 
         // Create an attributed string from our string
-        let attr_str = macos::foundation::AttributedString::create(&str, &attr_dict)?;
-        self.cf_release_pool.push(cf(&attr_str));
+        let attr_str = macos::foundation::AttributedString::create(str, attr_dict)?;
+        self.cf_release_pool.push(cf(attr_str));
 
         // Create a typesetter from the attributed string and the cached
         // attr dict. (See comment in init for more info on the attr dict.)
         let typesetter =
-            macos::text::Typesetter::create_with_attributed_string_and_options(&attr_str, &self.typesetter_attr_dict)?;
-        self.cf_release_pool.push(cf(&typesetter));
+            macos::text::Typesetter::create_with_attributed_string_and_options(attr_str, self.typesetter_attr_dict)?;
+        self.cf_release_pool.push(cf(typesetter));
 
         // Create a line from the typesetter
-        let line = typesetter.create_line(macos::foundation::Range { location: 0, length: 0 })?;
-        self.cf_release_pool.push(cf(&line));
+        let line = typesetter.create_line(macos::foundation::Range { location: 0, length: 0 }.cval())?;
+        self.cf_release_pool.push(cf(line));
 
         // This keeps track of the current x offset (sum of advance.width) and
         // the furthest cluster we've seen so far (max).
@@ -406,7 +413,8 @@ impl Shaper {
         // cell buffer.
         let runs = line.get_glyph_runs();
         for run_i in 0..runs.get_count() {
-            let ctrun: macos::text::Run = runs.get_value_at_index(run_i);
+            // SAFETY: the glyph runs array holds CTRuns.
+            let ctrun: &macos::text::Run = unsafe { runs.get_value_at_index(run_i) };
 
             let status = ctrun.get_status();
             if status.non_monotonic || status.right_to_left {
@@ -414,10 +422,23 @@ impl Shaper {
             }
 
             // Get our glyphs and positions
-            let glyphs = ctrun.get_glyphs();
-            let advances = ctrun.get_advances();
-            let positions = ctrun.get_positions();
-            let indices = ctrun.get_string_indices();
+            use std::borrow::Cow;
+            let glyphs: Cow<'_, [macos::graphics::Glyph]> = match ctrun.get_glyphs_ptr() {
+                Some(v) => Cow::Borrowed(v),
+                None => Cow::Owned(ctrun.get_glyphs()),
+            };
+            let advances: Cow<'_, [macos::graphics::Size]> = match ctrun.get_advances_ptr() {
+                Some(v) => Cow::Borrowed(v),
+                None => Cow::Owned(ctrun.get_advances()),
+            };
+            let positions: Cow<'_, [macos::graphics::Point]> = match ctrun.get_positions_ptr() {
+                Some(v) => Cow::Borrowed(v),
+                None => Cow::Owned(ctrun.get_positions()),
+            };
+            let indices: Cow<'_, [usize]> = match ctrun.get_string_indices_ptr() {
+                Some(v) => Cow::Borrowed(v),
+                None => Cow::Owned(ctrun.get_string_indices()),
+            };
             assert(glyphs.len() == advances.len());
             assert(glyphs.len() == positions.len());
             assert(glyphs.len() == indices.len());
@@ -531,7 +552,7 @@ impl Shaper {
 
     /// Get an attr dict for a font from a specific index.
     /// These items are cached, do not retain or release them.
-    fn get_font(&mut self, grid: &SharedGrid, index: Index) -> Result<macos::foundation::Dictionary, Error> {
+    fn get_font(&mut self, grid: &SharedGrid, index: Index) -> Result<&'static macos::foundation::Dictionary, Error> {
         // If this grid doesn't match the one we've cached fonts for,
         // then we reset the cache list since it's no longer valid.
         // We use an intFromPtr rather than direct pointer comparison
@@ -543,7 +564,7 @@ impl Shaper {
                 // the release pool before clearing the list.
                 self.cf_release_pool.reserve(self.cached_fonts.len());
                 for f in self.cached_fonts.iter().flatten() {
-                    self.cf_release_pool.push(cf(f));
+                    self.cf_release_pool.push(cf(*f));
                 }
                 self.cached_fonts.clear();
             }
@@ -561,8 +582,8 @@ impl Shaper {
         }
 
         // If we have it, return the cached attr dict.
-        if let Some(cached) = &self.cached_fonts[index_int] {
-            return Ok(cached.clone());
+        if let Some(cached) = self.cached_fonts[index_int] {
+            return Ok(cached);
         }
 
         // Font descriptor, font
@@ -587,29 +608,29 @@ impl Shaper {
             let mut state = grid.lock.write().unwrap_or_else(|e| e.into_inner());
 
             let face = state.resolver.collection.get_face(index)?;
-            let original = &face.font;
+            let original = face.font;
 
             let attrs = if face.quirks_disable_default_font_features {
-                &self.features_no_default
+                self.features_no_default
             } else {
-                &self.features
+                self.features
             };
 
             let desc = macos::text::FontDescriptor::create_with_attributes(attrs)?;
-            self.cf_release_pool.push(cf(&desc));
+            self.cf_release_pool.push(cf(desc));
 
-            original.copy_with_attributes(0.0, None, Some(&desc))?
+            original.copy_with_attributes(0.0, None, Some(desc))?
         };
-        self.cf_release_pool.push(cf(&run_font));
+        self.cf_release_pool.push(cf(run_font));
 
         // Get our font and use that get the attributes to set for the
         // attributed string so the whole string uses the same font.
         let attr_dict = macos::foundation::Dictionary::create(
-            &[macos::text::StringAttribute::Font.key()],
-            &[run_font.as_type_ref()],
+            Some(&[macos::text::StringAttribute::Font.key().as_ptr() as *const c_void]),
+            Some(&[run_font.as_ptr() as *const c_void]),
         )?;
 
-        self.cached_fonts[index_int] = Some(attr_dict.clone());
+        self.cached_fonts[index_int] = Some(attr_dict);
         Ok(attr_dict)
     }
 
@@ -789,7 +810,8 @@ impl Drop for Shaper {
 
         if !self.cf_release_pool.is_empty() {
             for r in self.cf_release_pool.drain(..) {
-                macos::foundation::cf_release(r.0);
+                // SAFETY: each pooled reference is owned by the pool.
+                unsafe { macos::foundation::cf_release(r.0 as *mut c_void) };
             }
 
             // For tests this logic is normal because we don't want to

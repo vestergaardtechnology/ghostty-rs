@@ -39,7 +39,8 @@ mod tests {
         let font = macos::text::Font::create_with_font_descriptor(desc, 12.0).unwrap();
 
         let mut hb_font = create_font(font).unwrap();
-        hb_font.destroy();
+        // SAFETY: the font is not used afterwards.
+        unsafe { hb_font.destroy() };
 
         font.release();
         desc.release();

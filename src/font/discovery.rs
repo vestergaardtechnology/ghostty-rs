@@ -210,7 +210,7 @@ impl Descriptor {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn to_core_text_descriptor(
         &self,
-    ) -> Result<crate::pkg::macos::text::FontDescriptor, crate::pkg::macos::foundation::Error> {
+    ) -> Result<&'static crate::pkg::macos::text::FontDescriptor, crate::pkg::macos::Error> {
         use crate::pkg::macos;
 
         let attrs = macos::foundation::MutableDictionary::create(0)?;
@@ -223,7 +223,8 @@ impl Descriptor {
                 macos::foundation::StringEncoding::Utf8,
                 false,
             )?;
-            attrs.set_value(macos::text::FontAttribute::FamilyName.key(), family.as_type());
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { attrs.set_value(macos::text::FontAttribute::FamilyName.key().as_ptr(), family.as_ptr()) };
             family.release();
         }
 
@@ -234,7 +235,8 @@ impl Descriptor {
                 macos::foundation::StringEncoding::Utf8,
                 false,
             )?;
-            attrs.set_value(macos::text::FontAttribute::StyleName.key(), style.as_type());
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { attrs.set_value(macos::text::FontAttribute::StyleName.key().as_ptr(), style.as_ptr()) };
             style.release();
         }
 
@@ -246,18 +248,17 @@ impl Descriptor {
                     length: 1,
                 },
             )?;
-            attrs.set_value(macos::text::FontAttribute::CharacterSet.key(), cs.as_type());
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { attrs.set_value(macos::text::FontAttribute::CharacterSet.key().as_ptr(), cs.as_ptr()) };
             cs.release();
         }
 
         // Set our size attribute if set
         if self.size > 0.0 {
             let size32: i32 = self.size.round() as i32;
-            let size = macos::foundation::Number::create(
-                macos::foundation::NumberType::Sint32,
-                &size32 as *const i32 as *const std::ffi::c_void,
-            )?;
-            attrs.set_value(macos::text::FontAttribute::Size.key(), size.as_type());
+            let size = macos::foundation::Number::create(macos::foundation::NumberType::Sint32, &size32)?;
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { attrs.set_value(macos::text::FontAttribute::Size.key().as_ptr(), size.as_ptr()) };
             size.release();
         }
 
@@ -274,16 +275,15 @@ impl Descriptor {
         if traits_cval > 0 {
             // Setting traits is a pain. We have to create a nested dictionary
             // of the symbolic traits value, and set that in our attributes.
-            let traits_num = macos::foundation::Number::create(
-                macos::foundation::NumberType::Sint32,
-                &traits_cval as *const u32 as *const std::ffi::c_void,
-            )?;
+            let traits_num = macos::foundation::Number::create(macos::foundation::NumberType::Sint32, &traits_cval)?;
 
             let traits_dict = macos::foundation::MutableDictionary::create(0)?;
-            traits_dict.set_value(macos::text::FontTraitKey::Symbolic.key(), traits_num.as_type());
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { traits_dict.set_value(macos::text::FontTraitKey::Symbolic.key().as_ptr(), traits_num.as_ptr()) };
             traits_num.release();
 
-            attrs.set_value(macos::text::FontAttribute::Traits.key(), traits_dict.as_type());
+            // SAFETY: both are live CF objects; the dictionary retains them.
+            unsafe { attrs.set_value(macos::text::FontAttribute::Traits.key().as_ptr(), traits_dict.as_ptr()) };
             traits_dict.release();
         }
 
@@ -499,7 +499,9 @@ pub use self::fontconfig_impl::FontconfigDiscoverError;
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub use self::coretext_impl::{CoreText, CoreTextDiscoverIterator};
+pub use self::coretext_impl::{
+    CoreText, CoreTextDiscoverIterator, DiscoverError as CoreTextDiscoverError,
+};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod coretext_impl {
@@ -509,8 +511,36 @@ mod coretext_impl {
     use crate::pkg::macos;
     use crate::quirks::inline_assert as assert;
 
-    /// Errors from CoreText discovery.
-    pub type Error = macos::foundation::Error;
+    /// Errors from CoreText discovery (the Zig inferred error sets).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DiscoverError {
+        /// A CoreFoundation/CoreText call failed.
+        Macos(macos::Error),
+        /// Loading the original face to search fallbacks for failed.
+        GetFace(crate::font::collection::GetFaceError),
+    }
+
+    impl std::fmt::Display for DiscoverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(self, f)
+        }
+    }
+
+    impl std::error::Error for DiscoverError {}
+
+    impl From<macos::Error> for DiscoverError {
+        fn from(e: macos::Error) -> DiscoverError {
+            DiscoverError::Macos(e)
+        }
+    }
+
+    impl From<crate::font::collection::GetFaceError> for DiscoverError {
+        fn from(e: crate::font::collection::GetFaceError) -> DiscoverError {
+            DiscoverError::GetFace(e)
+        }
+    }
+
+    type Error = DiscoverError;
 
     #[derive(Debug, Clone, Copy, Default)]
     pub struct CoreText {}
@@ -537,7 +567,7 @@ mod coretext_impl {
             ) else {
                 return;
             };
-            if let Ok(ct_font) = macos::text::Font::create_with_name(&name, 12.0) {
+            if let Ok(ct_font) = macos::text::Font::create_with_name(name, 12.0) {
                 ct_font.release();
             }
             name.release();
@@ -556,13 +586,13 @@ mod coretext_impl {
             let _desc_arr_release = scopeguard(|| desc_arr.release());
 
             // Build our collection
-            let set = macos::text::FontCollection::create_with_font_descriptors(&desc_arr)?;
+            let set = macos::text::FontCollection::create_with_font_descriptors(desc_arr)?;
             let _set_release = scopeguard(|| set.release());
             let list = set.create_matching_font_descriptors();
             let _list_release = scopeguard(|| list.release());
 
             // Sort our descriptors
-            let mut zig_list = copy_matching_descriptors(&list);
+            let mut zig_list = copy_matching_descriptors(list);
             sort_matching_descriptors(desc, &mut zig_list);
 
             Ok(DiscoverIterator {
@@ -591,7 +621,7 @@ mod coretext_impl {
 
             // Create our font. We need a size to initialize it so we use size
             // 12 but we will alter the size later (same as DiscoverIterator).
-            let ct_font = macos::text::Font::create_with_name(&family_str, 12.0)?;
+            let ct_font = macos::text::Font::create_with_name(family_str, 12.0)?;
 
             // CTFontCreateWithName never returns null: if the requested font
             // isn't installed it returns a substitute font. Verify we got
@@ -672,7 +702,7 @@ mod coretext_impl {
             &self,
             collection: &mut Collection,
             desc: &Descriptor,
-        ) -> Result<Option<macos::text::FontDescriptor>, Error> {
+        ) -> Result<Option<&'static macos::text::FontDescriptor>, Error> {
             if crate::font::OPTIONS.backend.has_freetype() {
                 // If we have freetype, we can't use CoreText to find a font
                 // that supports a specific codepoint because we need to
@@ -748,7 +778,7 @@ mod coretext_impl {
             // Get our font
             let Some(font) = original
                 .font
-                .create_for_string(&str, macos::foundation::Range::init(0, range_len))
+                .create_for_string(str, macos::foundation::Range::init(0, range_len))
             else {
                 return Ok(None);
             };
@@ -779,10 +809,14 @@ mod coretext_impl {
         }
     }
 
-    fn copy_matching_descriptors(list: &macos::foundation::Array) -> Vec<macos::text::FontDescriptor> {
+    fn copy_matching_descriptors(
+        list: &macos::foundation::Array,
+    ) -> Vec<&'static macos::text::FontDescriptor> {
         let mut result = Vec::with_capacity(list.get_count());
         for i in 0..list.get_count() {
-            let desc: macos::text::FontDescriptor = list.get_value_at_index(i);
+            // SAFETY: the matching descriptors array holds CTFontDescriptors.
+            let desc: &'static macos::text::FontDescriptor =
+                unsafe { list.get_value_at_index(i) };
 
             // We need to retain because once the list is freed it will
             // release all its members.
@@ -792,7 +826,7 @@ mod coretext_impl {
         result
     }
 
-    fn sort_matching_descriptors(desc: &Descriptor, list: &mut [macos::text::FontDescriptor]) {
+    fn sort_matching_descriptors(desc: &Descriptor, list: &mut [&'static macos::text::FontDescriptor]) {
         // Higher score is "less" (earlier)
         list.sort_unstable_by(|lhs, rhs| {
             let lhs_score = Score::score(desc, lhs);
@@ -883,17 +917,20 @@ mod coretext_impl {
             // Get our symbolic traits for the descriptor so we can
             // compare boolean attributes like bold, monospace, etc.
             let symbolic_traits: macos::text::FontSymbolicTraits = 'traits: {
-                let Some(traits) = ct_desc.copy_attribute_traits() else {
+                let Some(traits) = ct_desc.copy_attribute(macos::text::attr::Traits) else {
                     break 'traits Default::default();
                 };
                 let _traits_release = scopeguard(|| traits.release());
 
                 let key = macos::text::FontTraitKey::Symbolic.key();
-                let Some(symbolic) = traits.get_value_number(key) else {
+                // SAFETY: the symbolic trait value is a CFNumber.
+                let Some(symbolic) =
+                    (unsafe { traits.get_value::<macos::foundation::Number>(key.as_ptr()) })
+                else {
                     break 'traits Default::default();
                 };
 
-                macos::text::FontSymbolicTraits::init(&symbolic)
+                macos::text::FontSymbolicTraits::init(symbolic)
             };
 
             this.monospace = symbolic_traits.monospace;
@@ -936,10 +973,10 @@ mod coretext_impl {
 
                 // Check if we have variation axes in our descriptor, if we
                 // do then we can derive weight italic-ness or both from them.
-                if let Some(axes) = font.copy_attribute_variation_axes() {
+                if let Some(axes) = font.copy_attribute(macos::text::attr::VariationAxes) {
                     // Copy the variation values for this instance of the font.
                     // if there are none then we just break out immediately.
-                    if let Some(values) = font.copy_attribute_variation() {
+                    if let Some(values) = font.copy_attribute(macos::text::attr::Variation) {
                         let mut buf = [0u8; 1024];
 
                         // If we see the 'ital' value then we ignore 'slnt'.
@@ -947,11 +984,23 @@ mod coretext_impl {
 
                         let len = axes.get_count();
                         for i in 0..len {
-                            let dict: macos::foundation::Dictionary = axes.get_value_at_index(i);
+                            use macos::foundation::{Dictionary, Number, NumberType};
                             use macos::text::FontVariationAxisKey as Key;
-                            let cf_id = dict.get_value_number(Key::Identifier.key()).unwrap();
-                            let cf_name = dict.get_value_string(Key::Name.key()).unwrap();
-                            let cf_def = dict.get_value_number(Key::DefaultValue.key()).unwrap();
+                            // SAFETY: the variation axes attribute is an array
+                            // of dictionaries keyed by `FontVariationAxisKey`.
+                            let (cf_id, cf_name, cf_def) = unsafe {
+                                let dict: &Dictionary = axes.get_value_at_index(i);
+                                (
+                                    dict.get_value::<Number>(Key::Identifier.key().as_ptr())
+                                        .unwrap(),
+                                    dict.get_value::<macos::foundation::String>(
+                                        Key::Name.key().as_ptr(),
+                                    )
+                                    .unwrap(),
+                                    dict.get_value::<Number>(Key::DefaultValue.key().as_ptr())
+                                        .unwrap(),
+                                )
+                            };
 
                             let name_str: &[u8] = cf_name
                                 .cstring(&mut buf, macos::foundation::StringEncoding::Utf8)
@@ -959,11 +1008,15 @@ mod coretext_impl {
 
                             // Default value
                             let mut def: f64 = 0.0;
-                            let _ = cf_def.get_value_f64(&mut def);
+                            let _ = cf_def.get_value(NumberType::Double, &mut def);
                             // Value in this font
                             let mut val: f64 = def;
-                            if let Some(cf_val) = values.get_value_number_for(&cf_id) {
-                                let _ = cf_val.get_value_f64(&mut val);
+                            // SAFETY: the variation dictionary maps axis ids
+                            // to CFNumbers.
+                            if let Some(cf_val) =
+                                unsafe { values.get_value::<Number>(cf_id.as_ptr()) }
+                            {
+                                let _ = cf_val.get_value(NumberType::Double, &mut val);
                             }
 
                             if name_str == b"wght" {
@@ -997,7 +1050,7 @@ mod coretext_impl {
 
             // Get the style string from the font.
             let mut style_str_buf = [0u8; 128];
-            let style_str: Vec<u8> = match ct_desc.copy_attribute_style_name() {
+            let style_str: Vec<u8> = match ct_desc.copy_attribute(macos::text::attr::StyleName) {
                 None => Vec::new(),
                 Some(style) => {
                     let s = style
@@ -1056,7 +1109,7 @@ mod coretext_impl {
     }
 
     pub struct DiscoverIterator {
-        pub list: Vec<macos::text::FontDescriptor>,
+        pub list: Vec<&'static macos::text::FontDescriptor>,
         pub variations: Vec<Variation>,
         pub i: usize,
     }
@@ -1078,13 +1131,17 @@ mod coretext_impl {
             let desc = {
                 // We create a copy, overwriting the character set attribute.
                 let attrs = macos::foundation::MutableDictionary::create(0)?;
-                attrs.set_value(
-                    macos::text::FontAttribute::CharacterSet.key(),
-                    macos::foundation::null_type(),
-                );
+                // SAFETY: the key is a live CFString and kCFNull is a
+                // framework constant.
+                unsafe {
+                    attrs.set_value(
+                        macos::text::FontAttribute::CharacterSet.key().as_ptr(),
+                        macos::c::kCFNull,
+                    )
+                };
 
                 let desc = macos::text::FontDescriptor::create_copy_with_attributes(
-                    &self.list[self.i],
+                    self.list[self.i],
                     attrs.as_dictionary(),
                 );
                 attrs.release();
@@ -1094,7 +1151,7 @@ mod coretext_impl {
 
             // Create our font. We need a size to initialize it so we use size
             // 12 but we will alter the size later.
-            let font = macos::text::Font::create_with_font_descriptor(&desc, 12.0)?;
+            let font = macos::text::Font::create_with_font_descriptor(desc, 12.0)?;
 
             // Increment after we return
             self.i += 1;
