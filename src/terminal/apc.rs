@@ -46,6 +46,11 @@ impl MaxBytes {
     pub fn put(&mut self, protocol: Protocol, value: usize) {
         self.values[protocol as usize] = Some(value);
     }
+
+    /// Remove the limit for `protocol` (Zig: `std.EnumMap.remove`).
+    pub fn remove(&mut self, protocol: Protocol) {
+        self.values[protocol as usize] = None;
+    }
 }
 
 impl Default for MaxBytes {
