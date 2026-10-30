@@ -373,8 +373,8 @@ impl Stream {
         let contents = self.format_events();
 
         let content = [crate::apprt::ClipboardContent {
-            mime: "text/plain",
-            data: &contents,
+            mime: b"text/plain",
+            data: contents.as_bytes(),
         }];
         if let Err(err) = surface
             .rt_surface()
@@ -1007,36 +1007,42 @@ mod tests {
     fn record_pty_read_events() {
         let mut t = term();
         let mut s = Stream::init();
-        s.record_pty_read(&mut t, b"a\x07\x1b[1;2H\x1b(B\x1b]0;hi\x07").unwrap();
+        s.record_pty_read(&mut t, b"\x1b[1;2H\x1b(B\x1b]0;hi\x07").unwrap();
 
-        // Print is excluded by default but still counts a sequence number.
         assert_eq!(
             descriptions(&s),
             vec![
-                (2, "execute", "BEL (0x7)".to_string()),
-                (3, "csi", "1;2 H".to_string()),
-                (4, "esc", "( B".to_string()),
-                (5, "osc", "change_window_title ".to_string()),
+                (1, "csi", "1;2 H".to_string()),
+                (2, "esc", "( B".to_string()),
+                (3, "osc", "change_window_title ".to_string()),
             ]
         );
 
         let mut it = s.events.iterator(circ_buf::Direction::Reverse);
         let osc = it.next().unwrap().as_ref().unwrap();
         assert_eq!(osc.metadata.get("data").map(String::as_str), Some("hi"));
+        // The cursor is a snapshot of the terminal, which only the termio
+        // stream (not the inspector) updates.
         assert_eq!(osc.cursor.x, 0);
 
         // Without a state nothing is recorded.
-        s.parser_stream.next_slice(b"\x07");
-        assert_eq!(s.events.len(), 4);
+        s.parser_stream.next_slice(b"\x1b[H");
+        assert_eq!(s.events.len(), 3);
     }
 
     #[test]
-    fn record_print_when_not_excluded() {
+    fn ground_text_bypasses_vt_raw() {
+        // Like Zig, printable text and C0 controls in the ground state
+        // are handled by the stream's UTF-8 path, not the parser, so
+        // they never reach the raw hook. C0 controls the parser
+        // executes (e.g. inside an escape sequence) are recorded.
         let mut t = term();
         let mut s = Stream::init();
         s.parser_stream.handler.filter_exclude.clear();
-        s.record_pty_read(&mut t, b"A").unwrap();
-        assert_eq!(descriptions(&s), vec![(1, "print", "'A' (U+41)".to_string())]);
+        s.record_pty_read(&mut t, b"A\x07").unwrap();
+        assert!(s.events.empty());
+        s.record_pty_read(&mut t, b"\x1b\x07").unwrap();
+        assert_eq!(descriptions(&s), vec![(1, "execute", "BEL (0x7)".to_string())]);
     }
 
     #[test]
@@ -1044,11 +1050,20 @@ mod tests {
         let mut t = term();
         let mut s = Stream::init();
         s.parser_stream.handler.paused = true;
-        s.record_pty_read(&mut t, b"\x07\x07").unwrap();
+        s.record_pty_read(&mut t, b"\x1b[H\x1b[H").unwrap();
         assert!(s.events.empty());
         s.parser_stream.handler.paused = false;
-        s.record_pty_read(&mut t, b"\x07").unwrap();
-        assert_eq!(descriptions(&s), vec![(3, "execute", "BEL (0x7)".to_string())]);
+        s.record_pty_read(&mut t, b"\x1b[H").unwrap();
+        assert_eq!(descriptions(&s), vec![(3, "csi", "H".to_string())]);
+    }
+
+    #[test]
+    fn excluded_kind_counts_seq() {
+        let mut t = term();
+        let mut s = Stream::init();
+        s.parser_stream.handler.filter_exclude.insert(ActionTag::CsiDispatch);
+        s.record_pty_read(&mut t, b"\x1b[H\x1b7").unwrap();
+        assert_eq!(descriptions(&s), vec![(2, "esc", "7".to_string())]);
     }
 
     #[test]
@@ -1056,7 +1071,7 @@ mod tests {
         let mut t = term();
         let mut s = Stream::init();
         for _ in 0..150 {
-            s.record_pty_read(&mut t, b"\x07").unwrap();
+            s.record_pty_read(&mut t, b"\x1b[H").unwrap();
         }
         assert_eq!(s.events.capacity(), 100);
         assert_eq!(s.events.len(), 100);
@@ -1068,15 +1083,15 @@ mod tests {
     fn format_events_export() {
         let mut t = term();
         let mut s = Stream::init();
-        s.record_pty_read(&mut t, b"\r\n").unwrap();
-        assert_eq!(s.format_events(), "Seq\tKind\tDescription\n1\texecute\tCR (0xD)\n2\texecute\tLF (0xA)\n");
+        s.record_pty_read(&mut t, b"\x1b[H\x1b7").unwrap();
+        assert_eq!(s.format_events(), "Seq\tKind\tDescription\n1\tcsi\tH\n2\tesc\t7\n");
     }
 
     #[test]
     fn osc_metadata() {
         let mut t = term();
         let mut s = Stream::init();
-        s.record_pty_read(&mut t, b"\x1b]8;id=x;http://a\x1b\\\x1b]8;;\x1b\\").unwrap();
+        s.record_pty_read(&mut t, b"\x1b]8;id=x;http://a\x07\x1b]8;;\x07").unwrap();
         let mut it = s.events.iterator(circ_buf::Direction::Forward);
         let start = it.next().unwrap().as_ref().unwrap();
         assert_eq!(start.raw_description, "hyperlink_start ");
@@ -1085,6 +1100,19 @@ mod tests {
         let end = it.next().unwrap().as_ref().unwrap();
         assert_eq!(end.raw_description, "hyperlink_end ");
         assert!(end.metadata.is_empty());
+    }
+
+    #[test]
+    fn encoders() {
+        let mut s = String::new();
+        encode_print(&mut s, 'A' as u32);
+        assert_eq!(s, "'A' (U+41)");
+        s.clear();
+        encode_execute(&mut s, 0x0A);
+        assert_eq!(s, "LF (0xA)");
+        s.clear();
+        encode_execute(&mut s, 0x1C);
+        assert_eq!(s, "? (0x1C)");
     }
 
     #[test]
