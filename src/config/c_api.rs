@@ -15,36 +15,14 @@ use crate::input::binding::{Action, TriggerC};
 
 const LOG_TARGET: &str = "config";
 
-/// Sync with ghostty_string_s (Zig `main_c.String`).
-///
-/// TODO(port-dedupe): replace with crate::main_c::String
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct String {
-    pub ptr: *const u8,
-    pub len: usize,
-    pub sentinel: bool,
-}
+// Sync with ghostty_string_s (Zig `main_c.String`).
+use crate::main_c::String;
 
-impl String {
-    pub const EMPTY: String = String {
-        ptr: std::ptr::null(),
-        len: 0,
-        sentinel: false,
-    };
-
-    /// Zig `String.fromSlice` for a `[:0]const u8` (ownership passes to
-    /// the caller, who frees it with `ghostty_string_free`).
-    fn from_owned_z(s: crate::cli::args::StringZ) -> String {
-        let bytes: Box<[u8]> = s.as_bytes_with_nul().into();
-        let len = bytes.len() - 1;
-        let ptr = Box::leak(bytes).as_ptr();
-        String {
-            ptr,
-            len,
-            sentinel: true,
-        }
-    }
+/// Zig `String.fromSlice` for a `[:0]const u8` (ownership passes to
+/// the caller, who frees it with `ghostty_string_free`).
+fn string_from_owned_z(s: crate::cli::args::StringZ) -> String {
+    let bytes = s.as_bytes_with_nul();
+    String::from_vec_z(bytes[..bytes.len() - 1].to_vec())
 }
 
 /// Create a new configuration filled with the initial default values.
@@ -238,7 +216,7 @@ pub unsafe extern "C" fn ghostty_config_get_diagnostic(self_: *mut Config, idx: 
 #[no_mangle]
 pub extern "C" fn ghostty_config_open_path() -> String {
     match edit::open_path() {
-        Ok(path) => String::from_owned_z(path),
+        Ok(path) => string_from_owned_z(path),
         Err(err) => {
             log::error!(target: LOG_TARGET, "error opening config in editor err={}", err);
             String::EMPTY

@@ -111,18 +111,33 @@ impl From<crate::pkg::macos::Error> for Error {
     }
 }
 
-/// Stand-in for the parts of the embedded apprt surface Metal reads.
-///
-/// TODO(port-dedupe): replace with `apprt::embedded::Surface`'s
-/// `content_scale.x` and `platform.macos.nsview`.
+/// The parts of the embedded apprt surface Metal reads (Zig reads
+/// `rt_surface.content_scale.x` and `rt_surface.platform` directly). This
+/// is a trait so that test builds, whose `apprt::Surface` is the recording
+/// stand-in, still type-check.
 pub trait EmbeddedSurface {
     fn content_scale_x(&self) -> f64;
     fn nsview(&self) -> objc::Id;
 }
 
+#[cfg(not(test))]
+impl EmbeddedSurface for apprt::embedded::Surface {
+    fn content_scale_x(&self) -> f64 {
+        self.content_scale.x as f64
+    }
+
+    fn nsview(&self) -> objc::Id {
+        match self.platform {
+            apprt::embedded::Platform::Macos(v) => v.nsview.value,
+            apprt::embedded::Platform::Ios(v) => v.uiview.value,
+        }
+    }
+}
+
+#[cfg(test)]
 impl EmbeddedSurface for apprt::Surface {
     fn content_scale_x(&self) -> f64 {
-        1.0
+        self.content_scale.x as f64
     }
 
     fn nsview(&self) -> objc::Id {
