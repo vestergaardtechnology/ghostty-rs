@@ -235,36 +235,6 @@ fn cstring(bytes: &[u8]) -> CString {
     CString::new(&bytes[..end]).expect("no interior NUL")
 }
 
-/// The DECRQSS view of a terminal.
-struct DecrqssTerminal<'a>(&'a mut Terminal);
-
-impl dcs::DecrqssTerminal for DecrqssTerminal<'_> {
-    fn print_attributes(&mut self, buf: &mut [u8]) -> Result<usize, dcs::NoSpaceLeft> {
-        self.0
-            .print_attributes(buf)
-            .map(|s| s.len())
-            .map_err(|_| dcs::NoSpaceLeft)
-    }
-
-    fn modes(&self) -> &modes::ModeState {
-        &self.0.modes
-    }
-
-    fn cursor_style(&self) -> crate::terminal::CursorStyle {
-        self.0.screens.active.cursor.cursor_style
-    }
-
-    fn scrolling_region(&self) -> dcs::ScrollingRegion {
-        let r = self.0.scrolling_region;
-        dcs::ScrollingRegion {
-            top: r.top,
-            bottom: r.bottom,
-            left: r.left,
-            right: r.right,
-        }
-    }
-}
-
 /// The CPR/DECXCPR report position.
 struct ReportPos {
     x: usize,
@@ -741,7 +711,7 @@ impl StreamHandler {
             dcs::Command::Decrqss(decrqss) => {
                 let mut response = [0u8; dcs::Decrqss::MAX_RESPONSE_BYTES];
                 let t = self.terminal();
-                let encoded = decrqss.encode(&mut DecrqssTerminal(t), &mut response)?;
+                let encoded = decrqss.encode(t, &mut response)?;
                 let msg = Message::write_req(encoded);
                 self.message_writer(msg);
             }
