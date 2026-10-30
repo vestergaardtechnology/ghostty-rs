@@ -33,8 +33,6 @@
 //!   cloned before being performed (they borrow the config).
 //! * `std.Io.Timestamp` (awake clock) is [`Instant`]; mutex locking is the
 //!   renderer state's [`Mutex`] with [`TinyIo`].
-//! * The terminal inspector is the stand-in in `renderer::state::standin`
-//!   (TODO(port-dedupe): `crate::inspector`).
 //! * `getProcessInfo` takes the info kind at runtime.
 
 use std::ffi::{c_void, CStr, CString};
@@ -87,8 +85,8 @@ use crate::termio::{self, message::WriteReqSmall, MutexState, Termio};
 
 pub use crate::apprt::surface::{Mailbox, Message};
 
-type InspectorKeyEvent = renderer::state::standin::KeyEvent;
-type Inspector = renderer::state::standin::Inspector;
+type InspectorKeyEvent = crate::inspector::KeyEvent;
+type Inspector = crate::inspector::Inspector;
 
 const LOG: &str = "surface";
 
@@ -1243,12 +1241,12 @@ impl Surface {
     // ---------------------------------------------------------------
     // Small helpers (Zig accesses these through the self pointer).
 
-    fn rt_app(&self) -> &apprt::App {
+    pub(crate) fn rt_app(&self) -> &apprt::App {
         // SAFETY: the runtime app outlives the surface.
         unsafe { &*self.rt_app }
     }
 
-    fn rt_surface(&self) -> &apprt::Surface {
+    pub(crate) fn rt_surface(&self) -> &apprt::Surface {
         // SAFETY: the runtime surface outlives the core surface.
         unsafe { &*self.rt_surface }
     }
@@ -1260,7 +1258,7 @@ impl Surface {
     }
 
     /// This surface as an action target.
-    fn target(&self) -> Target {
+    pub(crate) fn target(&self) -> Target {
         Target::Surface(self as *const Surface as *mut Surface)
     }
 
@@ -2977,16 +2975,7 @@ impl Surface {
 
         // Setup our inspector event if we have an inspector.
         let mut insp_ev: Option<InspectorKeyEvent> = if self.inspector.is_some() {
-            let mut copy: KeyEvent<'static> = KeyEvent {
-                utf8: b"",
-                ..static_key_event(&event)
-            };
-            copy.utf8 = b"";
-            Some(InspectorKeyEvent {
-                event: copy,
-                utf8: event.utf8.to_vec(),
-                ..Default::default()
-            })
+            Some(InspectorKeyEvent::init(&event))
         } else {
             None
         };
