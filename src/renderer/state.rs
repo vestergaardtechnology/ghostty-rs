@@ -12,7 +12,7 @@
 //! * `Preedit.codepoints` is an owned `Vec` (Zig: an allocated slice with
 //!   explicit `deinit`/`clone`).
 //!
-//! Stand-ins for `Terminal` and the inspector live in [`standin`]
+//! A stand-in for the inspector lives in [`standin`]
 //! (TODO(port-dedupe)).
 
 use std::ptr::NonNull;
@@ -24,17 +24,58 @@ use crate::lib::tinyio::{Mutex, Timeout, TinyIo};
 use crate::terminal::point::Coordinate;
 use crate::terminal::size::CellCountInt;
 
-use self::standin::{Inspector, Terminal};
+use self::standin::Inspector;
+use crate::terminal::terminal::Terminal;
 
 /// Stand-ins for types whose Zig files are not ported yet.
 pub mod standin {
-    /// TODO(port-dedupe): replace with `crate::terminal::Terminal`.
-    #[derive(Debug, Default)]
-    pub struct Terminal {}
+    use crate::renderer::overlay::Feature;
+
+    /// The terminal the state points at. This used to be a stand-in and
+    /// is kept as an alias for modules that still name it.
+    pub type Terminal = crate::terminal::terminal::Terminal;
+
+    /// A default terminal for modules that construct the former
+    /// stand-in with `Terminal::default()` (an 80x24 terminal).
+    ///
+    /// TODO(port-dedupe): remove once those callers construct the
+    /// terminal with `Terminal::init`.
+    impl Default for crate::terminal::terminal::Terminal {
+        fn default() -> Self {
+            crate::terminal::terminal::Terminal::init(crate::terminal::terminal::Options::new(80, 24))
+                .expect("default terminal")
+        }
+    }
 
     /// TODO(port-dedupe): replace with `crate::inspector::Inspector`.
     #[derive(Debug, Default)]
-    pub struct Inspector {}
+    pub struct Inspector {
+        pub renderer_info: RendererInfo,
+    }
+
+    impl Inspector {
+        /// Zig: `Inspector.rendererInfo`.
+        pub fn renderer_info(&self) -> &RendererInfo {
+            &self.renderer_info
+        }
+    }
+
+    /// TODO(port-dedupe): replace with
+    /// `crate::inspector::widgets::renderer::Info`.
+    #[derive(Debug, Default)]
+    pub struct RendererInfo {
+        /// The enabled overlay features.
+        pub features: Vec<Feature>,
+    }
+
+    impl RendererInfo {
+        /// Zig: `Info.overlayFeatures`: a copy of the enabled features.
+        pub fn overlay_features(&self) -> Vec<Feature> {
+            // For now we do a dumb copy since the features have no managed
+            // memory.
+            self.features.clone()
+        }
+    }
 }
 
 #[derive(Debug)]
