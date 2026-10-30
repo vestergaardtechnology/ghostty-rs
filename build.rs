@@ -13,11 +13,57 @@ mod gresource;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(ghostty_gresource)");
-    pkg_c_libraries();
-    stb();
+    // `tools/build_lib_vt.sh` builds libghostty-vt (the `ghostty_*` terminal
+    // C API, like `zig build -Demit-lib-vt`) with `GHOSTTY_LIB_VT=1`. Like
+    // the Zig lib-vt, that library uses none of the app's C libraries
+    // (freetype, harfbuzz, fontconfig, oniguruma, EGL, glad, stb), so they
+    // are neither compiled nor required then; the script's link step
+    // garbage-collects everything the C API does not reach, and fails if
+    // the C API ever started to depend on one of them.
+    println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_VT");
+    println!("cargo:rustc-check-cfg=cfg(ghostty_lib_vt)");
+    if std::env::var_os("GHOSTTY_LIB_VT").is_some() {
+        lib_vt_options();
+    } else {
+        pkg_c_libraries();
+        stb();
+    }
     dcimgui();
     if std::env::var_os("CARGO_FEATURE_GTK").is_some() {
         gtk_resources();
+    }
+}
+
+/// The libghostty-vt build options (`GhosttyZig.zig`'s `vt_c` module): the
+/// crate is compiled with `--cfg ghostty_lib_vt`, which selects
+/// `terminal::build_options::Options::lib_vt()`, and the library version
+/// (`build.zig` `lib_version`, or `GHOSTTY_LIB_VT_VERSION` like Zig's
+/// `-Dlib-version-string`) is passed split into its semantic version parts.
+fn lib_vt_options() {
+    println!("cargo:rustc-cfg=ghostty_lib_vt");
+    println!("cargo:rerun-if-env-changed=GHOSTTY_LIB_VT_VERSION");
+    let version = std::env::var("GHOSTTY_LIB_VT_VERSION").unwrap_or_else(|_| "0.1.0-dev".into());
+    let (rest, build) = match version.split_once('+') {
+        Some((rest, build)) => (rest, build),
+        None => (version.as_str(), ""),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, pre),
+        None => (rest, ""),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+        panic!("GHOSTTY_LIB_VT_VERSION must be a semantic version: {version}");
+    }
+    for (name, value) in [
+        ("STRING", version.as_str()),
+        ("MAJOR", parts[0]),
+        ("MINOR", parts[1]),
+        ("PATCH", parts[2]),
+        ("PRE", pre),
+        ("BUILD", build),
+    ] {
+        println!("cargo:rustc-env=GHOSTTY_LIB_VT_VERSION_{name}={value}");
     }
 }
 
