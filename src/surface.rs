@@ -1320,17 +1320,9 @@ impl Surface {
     /// We centralize all our logic into this spot so we can intercept
     /// messages for example in readonly mode.
     fn queue_io(&mut self, msg: termio::Message, mutex: MutexState) {
-        // In readonly mode, we don't allow any writes through to the pty.
-        if self.readonly {
-            match msg {
-                termio::Message::WriteSmall(_) | termio::Message::WriteStable(_) | termio::Message::WriteAlloc(_) => {
-                    msg.deinit();
-                    return;
-                }
-
-                _ => {}
-            }
-        }
+        let Some(msg) = readonly_filter(self.readonly, msg) else {
+            return;
+        };
 
         self.io.queue_message(msg, mutex);
     }
@@ -6685,6 +6677,24 @@ impl Drop for InitGuard<'_> {
     }
 }
 
+/// The readonly interception of `queueIo` (split out so it can be tested
+/// without a live surface): in readonly mode, we don't allow any writes
+/// through to the pty. Dropped writes are freed.
+fn readonly_filter(readonly: bool, msg: termio::Message) -> Option<termio::Message> {
+    if readonly {
+        match msg {
+            termio::Message::WriteSmall(_) | termio::Message::WriteStable(_) | termio::Message::WriteAlloc(_) => {
+                msg.deinit();
+                return None;
+            }
+
+            _ => {}
+        }
+    }
+
+    Some(msg)
+}
+
 /// A copy of a key event without its text (Zig copies the event and sets
 /// `utf8` to an empty slice).
 fn static_key_event(event: &KeyEvent<'_>) -> KeyEvent<'static> {
@@ -6747,6 +6757,24 @@ fn prompt_click_relative_row(pages: &PageList, prompt_pin: Pin, click_pin: Pin) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_io_frees_allocated_writes_in_readonly_mode() {
+        // queueIo must free allocated writes in read-only mode.
+        let data: Box<[u8]> = b"\x1b]lGhostty\x1b\\".to_vec().into_boxed_slice();
+        assert!(readonly_filter(true, termio::Message::WriteAlloc(data.clone())).is_none());
+        assert!(readonly_filter(true, termio::Message::WriteStable(b"x")).is_none());
+        // Non-write messages and non-readonly writes pass through.
+        assert!(readonly_filter(true, termio::Message::Focused(true)).is_some());
+        assert!(readonly_filter(false, termio::Message::WriteAlloc(data)).is_some());
+    }
+
+    #[test]
+    fn path_resolve_normalizes() {
+        assert_eq!("/home/u/x.txt", path_resolve("/home/u", "x.txt"));
+        assert_eq!("/home/x.txt", path_resolve("/home/u/", "../x.txt"));
+        assert_eq!("/home/u/a/b", path_resolve("/home/u", "./a//b"));
+    }
 
     #[test]
     fn mouse_click_state_holds_every_button() {
@@ -6814,5 +6842,148 @@ mod tests {
             );
             assert_eq!(case.expected, prompt_click_relative_row(&pages, prompt, click));
         }
+    }
+}
+
+/// Not a Zig test: an end-to-end run of a core [`App`] and [`Surface`]
+/// with the stand-in apprt surface, the real OpenGL renderer (on a
+/// surfaceless EGL context) and renderer/IO threads, and a real child
+/// process on a pty.
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod integration_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::apprt::action::ActionKey;
+    use crate::config::Command;
+    use crate::renderer::opengl::device::test_context::egl_lock;
+
+    fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !f() {
+            assert!(start.elapsed() < Duration::from_secs(20), "timeout waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn screen_text(surface: &Surface) -> String {
+        let _l = surface.lock();
+        surface.io.terminal.plain_string().unwrap()
+    }
+
+    #[test]
+    fn app_surface_echo_hi() {
+        let _guard = egl_lock();
+
+        let mut app = App::create().unwrap();
+        let mut rt_app = Box::new(apprt::App::default());
+        let mut env = crate::command::EnvMap::new();
+        env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
+        env.insert("GHOSTTY_LOG".into(), "leaked".into());
+        let mut rt_surface = Box::new(apprt::Surface {
+            app: &mut *rt_app,
+            env: Some(env),
+            ..Default::default()
+        });
+
+        let config = Config {
+            command: Some(Command::Direct(
+                ["/bin/sh", "-c", "echo hi; printf \"$GHOSTTY_LOG\""]
+                    .iter()
+                    .map(|a| (*a).into())
+                    .collect(),
+            )),
+            shell_integration: crate::config::config::ShellIntegration::None,
+            term: "xterm-256color".into(),
+            ..Config::default()
+        };
+
+        let mut surface = Surface::init(&config, &mut *app, &mut *rt_app, &mut *rt_surface).unwrap();
+        rt_surface.core_surface = &mut *surface;
+        app.add_surface(&mut *rt_surface);
+        assert!(!app.first);
+        assert_ne!(0, surface.id);
+        assert_eq!(Some(&mut *surface as *mut Surface), app.find_surface_by_id(surface.id));
+
+        // The surface reported its sizes and the command as the title.
+        let actions = rt_app.take_actions();
+        assert!(actions.contains(&ActionKey::CellSize));
+        assert!(actions.contains(&ActionKey::SizeLimit));
+        assert!(actions.contains(&ActionKey::QuitTimer));
+        assert_eq!(Some(c"/bin/sh".to_owned()), rt_app.titles.lock().unwrap().first().cloned());
+
+        // The child output reaches the terminal.
+        wait_until("hi", || screen_text(&surface).starts_with("hi"));
+
+        // Process the app mailbox until the child exit closes the surface.
+        wait_until("close", || {
+            app.tick(&rt_app).unwrap();
+            rt_surface.closed.lock().unwrap().is_some()
+        });
+        assert!(surface.child_exited);
+        // The child has exited, so no confirmation is needed.
+        assert_eq!(Some(false), *rt_surface.closed.lock().unwrap());
+        assert!(!app.needs_confirm_quit());
+        let text = screen_text(&surface);
+        assert!(text.starts_with("hi\n"), "{text:?}");
+        // GHOSTTY_LOG is not leaked to the child.
+        assert!(!text.contains("leaked"), "{text:?}");
+        assert!(text.contains("Process exited. Press any key to close the terminal."), "{text:?}");
+        assert!(rt_app.take_actions().contains(&ActionKey::ShowChildExited));
+
+        // Binding actions: select all and copy to the clipboard.
+        assert!(surface.perform_binding_action(BindingAction::SelectAll).unwrap());
+        assert!(surface.has_selection());
+        assert!(surface
+            .perform_binding_action(BindingAction::CopyToClipboard(input::binding::CopyToClipboard::Plain))
+            .unwrap());
+        let copied = rt_surface.clipboard_data(Clipboard::Standard).unwrap();
+        assert!(copied.starts_with(b"hi\n"), "{:?}", String::from_utf8_lossy(&copied));
+        assert!(rt_app.take_actions().contains(&ActionKey::SelectionChanged));
+
+        // App-scoped actions go through the app.
+        assert!(surface.perform_binding_action(BindingAction::NewWindow).unwrap());
+        assert_eq!(vec![ActionKey::NewWindow], rt_app.take_actions());
+
+        // Font size changes resize the cells.
+        let cell = surface.size.cell;
+        assert!(surface.perform_binding_action(BindingAction::IncreaseFontSize(4.0)).unwrap());
+        assert!(surface.font_size_adjusted);
+        assert!(surface.size.cell.height > cell.height);
+        assert!(surface.perform_binding_action(BindingAction::ResetFontSize).unwrap());
+        assert!(!surface.font_size_adjusted);
+        assert_eq!(cell, surface.size.cell);
+
+        // Focus makes the surface the app's focused surface, which new
+        // surface configs inherit the working directory from.
+        surface.focus_callback(true).unwrap();
+        assert_eq!(Some(&mut *surface as *mut Surface), app.focused_surface());
+        {
+            let _l = surface.lock();
+            surface.io.terminal.set_pwd(b"/tmp").unwrap();
+        }
+        assert_eq!(Some(b"/tmp".to_vec()), surface.pwd());
+        let mut inherit = Config::default();
+        inherit.window_inherit_working_directory = true;
+        let c = apprt::surface::new_config(&app, &inherit, apprt::surface::NewSurfaceContext::Window);
+        assert_eq!(
+            Some(crate::config::config::WorkingDirectory::Path("/tmp".into())),
+            c.working_directory
+        );
+
+        // Preedit and IME position.
+        surface.preedit_callback(Some("é".as_bytes())).unwrap();
+        assert_eq!(1, surface.renderer_state.preedit.as_ref().unwrap().codepoints.len());
+        assert!(surface.ime_point().width > 0.0);
+        surface.preedit_callback(None).unwrap();
+        assert!(surface.renderer_state.preedit.is_none());
+
+        // Tear down.
+        app.delete_surface(&mut *rt_surface);
+        assert!(app.focused_surface().is_none());
+        assert!(rt_app.take_actions().contains(&ActionKey::QuitTimer));
+        surface.deinit();
+        drop(surface);
+        app.destroy();
     }
 }

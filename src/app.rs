@@ -739,6 +739,7 @@ mod tests {
 
     #[test]
     fn key_event_app_scoped_binding() {
+        use crate::cli::args::ParseCli as _;
         let mut rt_app = apprt::App::default();
         rt_app
             .config
@@ -748,6 +749,7 @@ mod tests {
         let mut app = App::create().unwrap();
         let mut ev = input::KeyEvent {
             key: input::Key::KeyQ,
+            unshifted_codepoint: 'q' as u32,
             mods: input::Mods {
                 ctrl: true,
                 shift: true,
