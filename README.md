@@ -94,6 +94,20 @@ macos/build.nu --configuration Debug     # -> macos/build/Debug/Ghostty.app
 
 `tools/build_xcframework.sh` replaces `zig build -Demit-macos-app=false`.
 
+## Testing against Zig Ghostty
+
+- `cargo test --lib`: the ported Zig test suite.
+- `test/esctest/run.sh`: the esctest conformance suite against
+  libghostty-vt. It fails exactly the same tests as Zig Ghostty at the
+  reference revision.
+- `test/fuzz-libghostty`: the libFuzzer ports of Ghostty's fuzz harnesses;
+  `cargo test` in that directory replays the committed corpora.
+- `example/build_all.sh`: builds and runs the libghostty-vt C/C++ examples,
+  whose output matches the Zig-built library's.
+- `tools/bench_compare.sh`: Ghostty's `ghostty-bench` suite on both
+  implementations. Results are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md);
+  the port is about 1.2× slower overall.
+
 ## Progress
 
 ```sh
