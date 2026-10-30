@@ -24,6 +24,9 @@
 //!   functions don't return `Allocator.Error`.
 //! - `fillStyles` (a hand-vectorized `@memset`) is `<[Style]>::fill`, which
 //!   Rust/LLVM vectorizes for `Copy` values.
+//! - Tests drive the terminal through `test_vt`, a test-only stream handler
+//!   standing in for `Terminal.vtStream` (TODO(port-dedupe): the
+//!   stream_terminal port). Other modules' tests use it too.
 //! - Nested Zig types are flattened: `RenderState.Row.Id` is [`RowId`],
 //!   `RenderState.Cursor.Viewport` is [`CursorViewport`], `Kitty.Placeholder`
 //!   is [`Placeholder`], and so on.
@@ -1696,6 +1699,9 @@ impl RenderState {
         if build_options::KITTY_GRAPHICS {
             kitty::update(self, t, redraw, any_dirty);
         }
+
+        // Reborrow the active screen: the Kitty update read it through `t`.
+        let s: &mut Screen = &mut screen_ptr;
 
         // If our screen has a selection, then mark the rows with the
         // selection. We do this outside of the loop above because its unlikely
