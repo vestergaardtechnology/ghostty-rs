@@ -4544,4 +4544,815 @@ mod tests {
         assert_eq!(0, COUNT.with(|c| c.get()));
         assert!(!s.handler.semantic_failure);
     }
+
+    /// Shared capture state for the Kitty clipboard (OSC 5522) tests below:
+    /// records every pty response and the most recent clipboard write.
+    struct KittyClipboardCapture {
+        responses: Vec<u8>,
+
+        // Write capture. A None write_result returns without replying.
+        write_count: usize,
+        write_result: Option<clipboard::WriteResult>,
+        write_reply_twice: bool,
+        last_location: clipboard::Location,
+        last_contents_len: usize,
+        last_mimes: Vec<Vec<u8>>,
+        last_data: Vec<Vec<u8>>,
+        last_write_name: Vec<u8>,
+        last_write_granted: bool,
+        last_write_can_remember: bool,
+
+        // Read capture. A None read_result returns without replying.
+        read_count: usize,
+        read_result: Option<clipboard::ReadResult<'static>>,
+        read_reply_twice: bool,
+        last_read_location: clipboard::Location,
+        last_read_mimes: Vec<Vec<u8>>,
+        last_read_list: bool,
+        last_read_name: Vec<u8>,
+        last_read_granted: bool,
+        last_read_can_remember: bool,
+    }
+
+    impl KittyClipboardCapture {
+        fn new() -> Self {
+            KittyClipboardCapture {
+                responses: Vec::new(),
+                write_count: 0,
+                write_result: Some(clipboard::WriteResult::Success(Default::default())),
+                write_reply_twice: false,
+                last_location: clipboard::Location::STANDARD,
+                last_contents_len: 0,
+                last_mimes: Vec::new(),
+                last_data: Vec::new(),
+                last_write_name: Vec::new(),
+                last_write_granted: false,
+                last_write_can_remember: false,
+                read_count: 0,
+                read_result: None,
+                read_reply_twice: false,
+                last_read_location: clipboard::Location::STANDARD,
+                last_read_mimes: Vec::new(),
+                last_read_list: false,
+                last_read_name: Vec::new(),
+                last_read_granted: false,
+                last_read_can_remember: false,
+            }
+        }
+    }
+
+    thread_local! {
+        static KC: RefCell<KittyClipboardCapture> = RefCell::new(KittyClipboardCapture::new());
+    }
+
+    /// `KittyClipboardCapture.reset`
+    fn kc_reset() {
+        KC.with(|c| *c.borrow_mut() = KittyClipboardCapture::new());
+    }
+
+    /// Access the capture state.
+    fn kc<R>(f: impl FnOnce(&mut KittyClipboardCapture) -> R) -> R {
+        KC.with(|c| f(&mut c.borrow_mut()))
+    }
+
+    fn kc_write_pty(_: &mut Handler<'_>, data: &[u8]) {
+        kc(|c| c.responses.extend_from_slice(data));
+    }
+
+    fn kc_clipboard_write(_: &mut Handler<'_>, write: clipboard::Write<'_>) {
+        let (result, twice) = kc(|c| {
+            c.write_count += 1;
+            c.last_location = write.location;
+            c.last_contents_len = write.contents.len();
+            c.last_mimes = write.contents.iter().take(8).map(|v| v.mime.to_vec()).collect();
+            c.last_data = write.contents.iter().take(8).map(|v| v.data.to_vec()).collect();
+            c.last_write_name = write.name.to_vec();
+            c.last_write_granted = write.granted;
+            c.last_write_can_remember = write.can_remember;
+            (c.write_result, c.write_reply_twice)
+        });
+        if let Some(r) = result {
+            write.reply(r);
+        }
+        if twice {
+            write.reply(clipboard::WriteResult::IoError);
+        }
+    }
+
+    fn kc_clipboard_read(_: &mut Handler<'_>, read: clipboard::Read<'_>) {
+        let (result, twice) = kc(|c| {
+            c.read_count += 1;
+            c.last_read_location = read.location;
+            c.last_read_mimes = read.mimes.iter().take(8).map(|m| m.to_vec()).collect();
+            c.last_read_list = read.list;
+            c.last_read_name = read.name.to_vec();
+            c.last_read_granted = read.granted;
+            c.last_read_can_remember = read.can_remember;
+            (c.read_result, c.read_reply_twice)
+        });
+        if let Some(r) = result {
+            read.reply(r);
+        }
+        if twice {
+            read.reply(clipboard::ReadResult::Denied);
+        }
+    }
+
+    fn kc_responses() -> Vec<u8> {
+        kc(|c| c.responses.clone())
+    }
+
+    fn kc_responses_len() -> usize {
+        kc(|c| c.responses.len())
+    }
+
+    fn kc_clear_responses() {
+        kc(|c| c.responses.clear());
+    }
+
+    fn kc_set_write_result(result: Option<clipboard::WriteResult>) {
+        kc(|c| c.write_result = result);
+    }
+
+    fn kc_set_read_result(result: Option<clipboard::ReadResult<'static>>) {
+        kc(|c| c.read_result = result);
+    }
+
+    fn kc_write_count() -> usize {
+        kc(|c| c.write_count)
+    }
+
+    fn kc_read_count() -> usize {
+        kc(|c| c.read_count)
+    }
+
+    fn kc_mime_at(i: usize) -> Vec<u8> {
+        kc(|c| c.last_mimes[i].clone())
+    }
+
+    fn kc_data_at(i: usize) -> Vec<u8> {
+        kc(|c| c.last_data[i].clone())
+    }
+
+    fn kc_read_mime_at(i: usize) -> Vec<u8> {
+        kc(|c| c.last_read_mimes[i].clone())
+    }
+
+    fn write_success(remember: bool) -> clipboard::WriteResult {
+        clipboard::WriteResult::Success(clipboard::WriteSuccess { remember })
+    }
+
+    fn read_success(remember: bool) -> clipboard::ReadResult<'static> {
+        clipboard::ReadResult::Success(clipboard::ReadSuccess {
+            remember,
+            ..Default::default()
+        })
+    }
+
+    /// A handler wired to the capture: write_pty plus the given effects.
+    fn kc_handler(t: &mut Terminal, write_pty: bool, clipboard_write: bool, clipboard_read: bool) -> Handler<'_> {
+        let mut handler = Handler::init(t);
+        if write_pty {
+            handler.effects.write_pty = Some(kc_write_pty);
+        }
+        if clipboard_write {
+            handler.effects.clipboard_write = Some(kc_clipboard_write);
+        }
+        if clipboard_read {
+            handler.effects.clipboard_read = Some(kc_clipboard_read);
+        }
+        handler
+    }
+
+    #[test]
+    fn kitty_clipboard_write_transaction_round_trip() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // Begin a write, stream two MIME types (one chunked), alias the
+        // plain text, and commit. Only the commit produces a response.
+        s.next_slice(b"\x1B]5522;type=write:id=42\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\"); // "Ghost"
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;dHk=\x1B\\"); // "ty"
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\"); // "<b>hi</b>"
+        // Alias "TEXT UTF8_STRING" -> text/plain.
+        s.next_slice(b"\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;VEVYVCBVVEY4X1NUUklORw==\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_eq!(0, kc_responses_len());
+
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(1, kc_write_count());
+        assert_eq!(clipboard::Location::STANDARD, kc(|c| c.last_location));
+        assert_eq!(4, kc(|c| c.last_contents_len));
+        assert_bytes(b"text/plain", &kc_mime_at(0));
+        assert_bytes(b"Ghostty", &kc_data_at(0));
+        assert_bytes(b"text/html", &kc_mime_at(1));
+        assert_bytes(b"<b>hi</b>", &kc_data_at(1));
+        assert_bytes(b"TEXT", &kc_mime_at(2));
+        assert_bytes(b"Ghostty", &kc_data_at(2));
+        assert_bytes(b"UTF8_STRING", &kc_mime_at(3));
+        assert_bytes(b"Ghostty", &kc_data_at(3));
+        assert_bytes(b"\x1B]5522;type=write:status=DONE:id=42\x1B\\", &kc_responses());
+
+        // A commit with no transaction in flight is silently ignored.
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(1, kc_write_count());
+    }
+
+    #[test]
+    fn kitty_clipboard_write_result_maps_to_response_status() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        let cases: [(Option<clipboard::WriteResult>, &[u8]); 7] = [
+            (Some(write_success(false)), b"\x1B]5522;type=write:status=DONE\x1B\\"),
+            (Some(clipboard::WriteResult::Denied), b"\x1B]5522;type=write:status=EPERM\x1B\\"),
+            (Some(clipboard::WriteResult::Unsupported), b"\x1B]5522;type=write:status=ENOSYS\x1B\\"),
+            (Some(clipboard::WriteResult::Busy), b"\x1B]5522;type=write:status=EBUSY\x1B\\"),
+            (Some(clipboard::WriteResult::InvalidData), b"\x1B]5522;type=write:status=EINVAL\x1B\\"),
+            (Some(clipboard::WriteResult::IoError), b"\x1B]5522;type=write:status=EIO\x1B\\"),
+            // No reply at all is a denial rather than silence.
+            (None, b"\x1B]5522;type=write:status=EPERM\x1B\\"),
+        ];
+
+        for (result, response) in cases {
+            kc_reset();
+            kc_set_write_result(result);
+
+            // An immediately-committed write with no data is a clear.
+            s.next_slice(b"\x1B]5522;type=write\x1B\\");
+            s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+            assert_eq!(1, kc_write_count());
+            assert_eq!(0, kc(|c| c.last_contents_len));
+            assert_bytes(response, &kc_responses());
+        }
+
+        // A second reply is ignored.
+        kc_reset();
+        kc(|c| c.write_reply_twice = true);
+        s.next_slice(b"\x1B]5522;type=write\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_bytes(b"\x1B]5522;type=write:status=DONE\x1B\\", &kc_responses());
+
+        // The response echoes the request terminator, unlike kitty which
+        // always uses ST.
+        kc_reset();
+        s.next_slice(b"\x1B]5522;type=write:loc=primary\x07");
+        s.next_slice(b"\x1B]5522;type=wdata\x07");
+        assert_eq!(clipboard::Location::PRIMARY, kc(|c| c.last_location));
+        assert_bytes(b"\x1B]5522;type=write:status=DONE\x07", &kc_responses());
+
+        // A system without a primary selection answers a loc=primary write
+        // with ENOSYS, echoing the id.
+        kc_reset();
+        kc_set_write_result(Some(clipboard::WriteResult::Unsupported));
+        s.next_slice(b"\x1B]5522;type=write:loc=primary:id=p1\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(clipboard::Location::PRIMARY, kc(|c| c.last_location));
+        assert_bytes(b"\x1B]5522;type=write:status=ENOSYS:id=p1\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_write_without_clipboard_effect_responds_enosys() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, false));
+
+        // The transaction fails as soon as it begins; the rest of it is
+        // ignored without further responses.
+        s.next_slice(b"\x1B]5522;type=write:id=x\x1B\\");
+        assert_bytes(b"\x1B]5522;type=write:status=ENOSYS:id=x\x1B\\", &kc_responses());
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_bytes(b"\x1B]5522;type=write:status=ENOSYS:id=x\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_read_without_effect_is_denied_with_eperm() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // The denial never includes loc (only OK responses do) and echoes
+        // the sanitized id.
+        s.next_slice(b"\x1B]5522;type=read:loc=primary:id=*4 2*;dGV4dC9wbGFpbg==\x1B\\");
+        assert_bytes(b"\x1B]5522;type=read:status=EPERM:id=42\x1B\\", &kc_responses());
+
+        // A missing payload is an empty MIME list, still answered.
+        kc_reset();
+        s.next_slice(b"\x1B]5522;type=read\x07");
+        assert_bytes(b"\x1B]5522;type=read:status=EPERM\x07", &kc_responses());
+
+        // An undecodable payload is dropped without a response.
+        kc_reset();
+        s.next_slice(b"\x1B]5522;type=read;!!!\x1B\\");
+        assert_eq!(0, kc_responses_len());
+    }
+
+    #[test]
+    fn kitty_clipboard_read_round_trip() {
+        const CONTENTS: &[clipboard::Content<'static>] = &[
+            // Unrequested representations are never served, and the
+            // served ones follow request order, not reply order.
+            clipboard::Content {
+                mime: b"image/png",
+                data: b"\x89PNG",
+            },
+            clipboard::Content {
+                mime: b"text/html",
+                data: b"<b>hi</b>",
+            },
+            clipboard::Content {
+                mime: b"text/plain",
+                data: b"Ghostty",
+            },
+        ];
+        const AVAILABLE: &[&[u8]] = &[b"text/plain", b"text/html"];
+
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, true));
+
+        kc_set_read_result(Some(clipboard::ReadResult::Success(clipboard::ReadSuccess {
+            contents: CONTENTS,
+            available: AVAILABLE,
+            remember: false,
+        })));
+
+        // Request the targets listing plus two types from the primary
+        // selection: ". text/plain text/html".
+        s.next_slice(b"\x1B]5522;type=read:loc=primary:id=r1;LiB0ZXh0L3BsYWluIHRleHQvaHRtbA==\x1B\\");
+        kc(|c| {
+            assert_eq!(1, c.read_count);
+            assert_eq!(clipboard::Location::PRIMARY, c.last_read_location);
+            assert_eq!(2, c.last_read_mimes.len());
+            assert!(c.last_read_list);
+            assert_bytes(b"", &c.last_read_name);
+            assert!(!c.last_read_granted);
+            assert!(!c.last_read_can_remember);
+        });
+        assert_bytes(b"text/plain", &kc_read_mime_at(0));
+        assert_bytes(b"text/html", &kc_read_mime_at(1));
+        assert_bytes(
+            b"\x1B]5522;type=read:status=OK:loc=primary:id=r1\x1B\\\
+              \x1B]5522;type=read:status=DATA:id=r1:mime=Lg==;dGV4dC9wbGFpbiB0ZXh0L2h0bWwK\x1B\\\
+              \x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x1B\\\
+              \x1B]5522;type=read:status=DATA:id=r1:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\\
+              \x1B]5522;type=read:status=DONE:id=r1\x1B\\",
+            &kc_responses(),
+        );
+
+        // Without the listing request `available` is ignored. The response
+        // echoes the request terminator.
+        kc_clear_responses();
+        s.next_slice(b"\x1B]5522;type=read:id=r2;dGV4dC9wbGFpbg==\x07");
+        kc(|c| {
+            assert_eq!(clipboard::Location::STANDARD, c.last_read_location);
+            assert_eq!(1, c.last_read_mimes.len());
+            assert!(!c.last_read_list);
+        });
+        assert_bytes(
+            b"\x1B]5522;type=read:status=OK:id=r2\x07\
+              \x1B]5522;type=read:status=DATA:id=r2:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x07\
+              \x1B]5522;type=read:status=DONE:id=r2\x07",
+            &kc_responses(),
+        );
+
+        // A listing-only request carries no types.
+        kc_clear_responses();
+        s.next_slice(b"\x1B]5522;type=read;Lg==\x1B\\");
+        kc(|c| {
+            assert_eq!(0, c.last_read_mimes.len());
+            assert!(c.last_read_list);
+        });
+        assert_bytes(
+            b"\x1B]5522;type=read:status=OK\x1B\\\
+              \x1B]5522;type=read:status=DATA:mime=Lg==;dGV4dC9wbGFpbiB0ZXh0L2h0bWwK\x1B\\\
+              \x1B]5522;type=read:status=DONE\x1B\\",
+            &kc_responses(),
+        );
+    }
+
+    #[test]
+    fn kitty_clipboard_read_result_maps_to_response_status() {
+        const HELLO: &[clipboard::Content<'static>] = &[clipboard::Content {
+            mime: b"text/plain",
+            data: b"hello",
+        }];
+
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, true));
+
+        let cases: [(Option<clipboard::ReadResult<'static>>, &[u8]); 6] = [
+            (Some(clipboard::ReadResult::Denied), b"\x1B]5522;type=read:status=EPERM:id=x\x1B\\"),
+            (Some(clipboard::ReadResult::Unsupported), b"\x1B]5522;type=read:status=ENOSYS:id=x\x1B\\"),
+            (Some(clipboard::ReadResult::Busy), b"\x1B]5522;type=read:status=EBUSY:id=x\x1B\\"),
+            (Some(clipboard::ReadResult::IoError), b"\x1B]5522;type=read:status=EIO:id=x\x1B\\"),
+            // No reply at all is a denial rather than silence.
+            (None, b"\x1B]5522;type=read:status=EPERM:id=x\x1B\\"),
+            // A success with nothing to serve is still OK then DONE.
+            (
+                Some(read_success(false)),
+                b"\x1B]5522;type=read:status=OK:id=x\x1B\\\x1B]5522;type=read:status=DONE:id=x\x1B\\",
+            ),
+        ];
+
+        for (result, response) in cases {
+            kc_reset();
+            kc_set_read_result(result);
+            s.next_slice(b"\x1B]5522;type=read:id=x;dGV4dC9wbGFpbg==\x1B\\");
+            assert_eq!(1, kc_read_count());
+            assert_bytes(response, &kc_responses());
+        }
+
+        // A second reply is ignored.
+        kc_reset();
+        kc_set_read_result(Some(clipboard::ReadResult::Success(clipboard::ReadSuccess {
+            contents: HELLO,
+            ..Default::default()
+        })));
+        kc(|c| c.read_reply_twice = true);
+        s.next_slice(b"\x1B]5522;type=read;dGV4dC9wbGFpbg==\x1B\\");
+        assert_bytes(
+            b"\x1B]5522;type=read:status=OK\x1B\\\
+              \x1B]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1B\\\
+              \x1B]5522;type=read:status=DONE\x1B\\",
+            &kc_responses(),
+        );
+    }
+
+    #[test]
+    fn kitty_clipboard_read_caps_requested_types() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, true));
+
+        // "a/0 a/1 a/2 a/3 a/4 a/5 .": extras are dropped but the listing
+        // request after them still counts.
+        kc_set_read_result(Some(read_success(false)));
+        s.next_slice(b"\x1B]5522;type=read;YS8wIGEvMSBhLzIgYS8zIGEvNCBhLzUgLg==\x1B\\");
+        assert_eq!(1, kc_read_count());
+        assert_eq!(kitty_clipboard::MAX_READ_MIMES, kc(|c| c.last_read_mimes.len()));
+        assert_bytes(b"a/0", &kc_read_mime_at(0));
+        assert_bytes(b"a/3", &kc_read_mime_at(kitty_clipboard::MAX_READ_MIMES - 1));
+        assert!(kc(|c| c.last_read_list));
+    }
+
+    #[test]
+    fn kitty_clipboard_read_password_grants() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, true));
+
+        // Every read requests a data type ("text/plain"): a request with
+        // no data types never consults the grants at all.
+        //
+        // pw="secret", name="app": the first request isn't granted but the
+        // reply may ask to remember it.
+        kc_set_read_result(Some(read_success(true)));
+        s.next_slice(b"\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert_eq!(1, kc_read_count());
+        assert_bytes(b"app", &kc(|c| c.last_read_name.clone()));
+        assert!(!kc(|c| c.last_read_granted));
+        assert!(kc(|c| c.last_read_can_remember));
+
+        // The same password is now granted; a different one is not.
+        kc_set_read_result(Some(read_success(false)));
+        s.next_slice(b"\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(kc(|c| c.last_read_granted));
+        s.next_slice(b"\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(!kc(|c| c.last_read_granted));
+        assert!(kc(|c| c.last_read_can_remember));
+
+        // A password without a name doesn't count: it is neither granted
+        // nor rememberable, even if the reply asks.
+        kc_set_read_result(Some(read_success(true)));
+        s.next_slice(b"\x1B]5522;type=read:pw=c2VjcmV0;dGV4dC9wbGFpbg==\x1B\\");
+        assert_bytes(b"", &kc(|c| c.last_read_name.clone()));
+        assert!(!kc(|c| c.last_read_granted));
+        assert!(!kc(|c| c.last_read_can_remember));
+        s.next_slice(b"\x1B]5522;type=read:pw=b3RoZXI=;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(!kc(|c| c.last_read_can_remember));
+        kc_set_read_result(Some(read_success(false)));
+        s.next_slice(b"\x1B]5522;type=read:pw=b3RoZXI=:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(!kc(|c| c.last_read_granted));
+
+        // A grant is advisory: the request is still forwarded and the
+        // embedder may deny it.
+        kc_clear_responses();
+        kc_set_read_result(Some(clipboard::ReadResult::Denied));
+        s.next_slice(b"\x1B]5522;type=read:id=d:pw=c2VjcmV0:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(kc(|c| c.last_read_granted));
+        assert_bytes(b"\x1B]5522;type=read:status=EPERM:id=d\x1B\\", &kc_responses());
+
+        // Grants are freed with the stream.
+    }
+
+    #[test]
+    fn kitty_clipboard_read_targets_only_never_consumes_a_one_time_grant() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, false, true));
+
+        // A one-time read grant, as minted for a paste event.
+        s.handler.kitty_clipboard_grants.grant(b"otp", GrantDirection::Read, true);
+
+        // A targets-only read (payload ".") is prompt-exempt so it never
+        // consults, and must not burn, the one-time password.
+        kc_set_read_result(Some(read_success(false)));
+        s.next_slice(b"\x1B]5522;type=read:pw=b3Rw:name=YXBw;Lg==\x1B\\");
+        assert_eq!(1, kc_read_count());
+        assert!(kc(|c| c.last_read_list));
+        assert_eq!(0, kc(|c| c.last_read_mimes.len()));
+        assert!(!kc(|c| c.last_read_granted));
+
+        // The follow-up data read still consumes the grant, exactly once.
+        s.next_slice(b"\x1B]5522;type=read:pw=b3Rw:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(kc(|c| c.last_read_granted));
+        s.next_slice(b"\x1B]5522;type=read:pw=b3Rw:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        assert!(!kc(|c| c.last_read_granted));
+    }
+
+    #[test]
+    fn kitty_clipboard_write_password_grants() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, true));
+
+        // pw="secret", name="app": the first commit isn't granted but the
+        // reply may ask to remember it.
+        kc_set_write_result(Some(write_success(true)));
+        s.next_slice(b"\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(1, kc_write_count());
+        assert_bytes(b"app", &kc(|c| c.last_write_name.clone()));
+        assert!(!kc(|c| c.last_write_granted));
+        assert!(kc(|c| c.last_write_can_remember));
+
+        // The same password is now granted; a different one is not.
+        kc_set_write_result(Some(write_success(false)));
+        s.next_slice(b"\x1B]5522;type=write:pw=c2VjcmV0:name=YXBw\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert!(kc(|c| c.last_write_granted));
+        s.next_slice(b"\x1B]5522;type=write:pw=b3RoZXI=:name=YXBw\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert!(!kc(|c| c.last_write_granted));
+        assert!(kc(|c| c.last_write_can_remember));
+
+        // Directions are independent: a write grant doesn't satisfy reads.
+        kc_set_read_result(Some(read_success(false)));
+        s.next_slice(b"\x1B]5522;type=read:pw=c2VjcmV0:name=YXBw\x1B\\");
+        assert!(!kc(|c| c.last_read_granted));
+
+        // A password without a name doesn't count: it is neither granted
+        // nor rememberable, even if the reply asks.
+        kc_set_write_result(Some(write_success(true)));
+        s.next_slice(b"\x1B]5522;type=write:pw=c2VjcmV0\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_bytes(b"", &kc(|c| c.last_write_name.clone()));
+        assert!(!kc(|c| c.last_write_granted));
+        assert!(!kc(|c| c.last_write_can_remember));
+
+        // A grant is advisory: the request is still forwarded and the
+        // embedder may deny it.
+        kc_clear_responses();
+        kc_set_write_result(Some(clipboard::WriteResult::Denied));
+        s.next_slice(b"\x1B]5522;type=write:id=d:pw=c2VjcmV0:name=YXBw\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert!(kc(|c| c.last_write_granted));
+        assert_bytes(b"\x1B]5522;type=write:status=EPERM:id=d\x1B\\", &kc_responses());
+
+        // Grants are freed with the stream.
+    }
+
+    #[test]
+    fn kitty_clipboard_malformed_packets_are_silently_dropped() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // Missing type, unknown type, bare metadata record, invalid mime
+        // base64, and orphaned transaction packets all drop silently.
+        s.next_slice(b"\x1B]5522;loc=primary\x1B\\");
+        s.next_slice(b"\x1B]5522;type=bobr\x1B\\");
+        s.next_slice(b"\x1B]5522;type=read:bare\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=!!!;R2hvc3Q=\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.next_slice(b"\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;VEVYVA==\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_eq!(0, kc_responses_len());
+        assert!(!s.handler.semantic_failure);
+
+        // The terminal is still functional afterwards.
+        s.next_slice(b"ok");
+        assert_eq!("ok", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn kitty_clipboard_new_write_replaces_in_flight_transaction() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        s.next_slice(b"\x1B]5522;type=write:id=old\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;b2xk\x1B\\"); // "old"
+        s.next_slice(b"\x1B]5522;type=write:id=new\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bmV3\x1B\\"); // "new"
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+
+        assert_eq!(1, kc_write_count());
+        assert_eq!(1, kc(|c| c.last_contents_len));
+        assert_bytes(b"new", &kc_data_at(0));
+        assert_bytes(b"\x1B]5522;type=write:status=DONE:id=new\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_invalid_write_packets_abort_with_einval() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        let invalid_packets: [&[u8]; 4] = [
+            // Alias payload decodes to a non-UTF-8 byte.
+            b"\x1B]5522;type=walias:mime=dGV4dC9wbGFpbg==;/w==\x1B\\",
+            // Alias has no target MIME type.
+            b"\x1B]5522;type=walias;VEVYVA==\x1B\\",
+            // Alias target MIME decodes to non-UTF-8 bytes.
+            b"\x1B]5522;type=walias:mime=//4=;VEVYVA==\x1B\\",
+            // Write data MIME decodes to non-UTF-8 bytes.
+            b"\x1B]5522;type=wdata:mime=//4=;R2hvc3Q=\x1B\\",
+        ];
+
+        for packet in invalid_packets {
+            kc_clear_responses();
+            s.next_slice(b"\x1B]5522;type=write:id=w\x1B\\");
+            s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+            s.next_slice(packet);
+            assert_bytes(b"\x1B]5522;type=write:status=EINVAL:id=w\x1B\\", &kc_responses());
+            assert!(!s.handler.semantic_failure);
+
+            // The transaction is gone: a commit does nothing further.
+            s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+            assert_eq!(0, kc_write_count());
+            assert_bytes(b"\x1B]5522;type=write:status=EINVAL:id=w\x1B\\", &kc_responses());
+        }
+    }
+
+    #[test]
+    fn kitty_clipboard_invalid_read_text_does_not_abort_a_write() {
+        let mut t = term(80, 24);
+        kc_reset();
+        kc_set_read_result(Some(read_success(false)));
+        let mut s = stream(kc_handler(&mut t, true, true, true));
+
+        s.next_slice(b"\x1B]5522;type=write:id=w\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+
+        // The read payload decodes to a non-UTF-8 byte. It is dropped without
+        // invoking the clipboard effect or disturbing the write transaction.
+        s.next_slice(b"\x1B]5522;type=read;/w==\x1B\\");
+        assert_eq!(0, kc_read_count());
+        assert_eq!(0, kc_responses_len());
+
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(1, kc_write_count());
+        assert_bytes(b"\x1B]5522;type=write:status=DONE:id=w\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_oversized_text_write_aborts_with_efbig() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // Shrink the limit so the test doesn't have to stream the
+        // default 64MiB.
+        s.handler.kitty_clipboard_write_max_bytes = 4;
+
+        s.next_slice(b"\x1B]5522;type=write:id=w\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbA==\x1B\\"); // "Hell"
+        assert_eq!(0, kc_responses_len());
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bw==\x1B\\"); // "o"
+        assert_bytes(b"\x1B]5522;type=write:status=EFBIG:id=w\x1B\\", &kc_responses());
+        assert!(!s.handler.semantic_failure);
+
+        // The transaction is gone: later data and the commit do nothing.
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;IQ==\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_bytes(b"\x1B]5522;type=write:status=EFBIG:id=w\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_invalid_wdata_chunk_aborts_with_einval() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        s.next_slice(b"\x1B]5522;type=write:id=w\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbG8=\x1B\\"); // "Hello"
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;!!!bad!!!\x1B\\");
+        assert_bytes(b"\x1B]5522;type=write:status=EINVAL:id=w\x1B\\", &kc_responses());
+        assert!(!s.handler.semantic_failure);
+
+        // The transaction is gone: later data and the commit do nothing.
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;V29ybGQ=\x1B\\"); // "World"
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_bytes(b"\x1B]5522;type=write:status=EINVAL:id=w\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_wdata_chunks_split_one_base64_stream() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // "some data" encoded as one stream, split at non-group
+        // boundaries across packets.
+        s.next_slice(b"\x1B]5522;type=write\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;c29\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;tZSBk\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;YXRh\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+
+        assert_eq!(1, kc_write_count());
+        assert_bytes(b"some data", &kc_data_at(0));
+        assert_bytes(b"\x1B]5522;type=write:status=DONE\x1B\\", &kc_responses());
+    }
+
+    #[test]
+    fn kitty_clipboard_unpadded_wdata_stream_aborts_at_commit() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // "Hello" without its final padding byte: every packet decodes,
+        // but the stream ends mid-group so the commit reports EINVAL.
+        s.next_slice(b"\x1B]5522;type=write:id=w\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbG8\x1B\\");
+        assert_eq!(0, kc_responses_len());
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_bytes(b"\x1B]5522;type=write:status=EINVAL:id=w\x1B\\", &kc_responses());
+        assert!(!s.handler.semantic_failure);
+    }
+
+    #[test]
+    fn kitty_clipboard_in_flight_transaction_is_freed_on_deinit() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        // Never committed: stream deinit must free the transaction.
+        s.next_slice(b"\x1B]5522;type=write\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert!(s.handler.kitty_clipboard_write.is_some());
+        s.deinit();
+        assert!(s.handler.kitty_clipboard_write.is_none());
+    }
+
+    #[test]
+    fn kitty_clipboard_allocation_failure_is_ignored() {
+        // Port note: the Zig test swaps in a failing allocator for the
+        // transaction state; the same allocation fails here through the
+        // `VT_TW` tripwire.
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, true, true, false));
+
+        VT_TW.error_always(FailPoint::KittyClipboardWriteBegin, OutOfMemory);
+        s.next_slice(b"\x1B]5522;type=write\x1B\\");
+        VT_TW.end(tripwire::ResetMode::Reset).unwrap();
+
+        // Clipboard writes are external effects, best-effort like OSC 52;
+        // the failed transaction never started and is not a semantic
+        // failure.
+        assert!(!s.handler.semantic_failure);
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(0, kc_write_count());
+        assert_eq!(0, kc_responses_len());
+    }
+
+    #[test]
+    fn kitty_clipboard_without_write_pty_still_commits_writes() {
+        let mut t = term(80, 24);
+        kc_reset();
+        let mut s = stream(kc_handler(&mut t, false, true, false));
+
+        s.next_slice(b"\x1B]5522;type=write\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\");
+        s.next_slice(b"\x1B]5522;type=wdata\x1B\\");
+        assert_eq!(1, kc_write_count());
+        assert_bytes(b"Ghost", &kc_data_at(0));
+
+        // Reads are dropped without a way to respond.
+        s.next_slice(b"\x1B]5522;type=read\x1B\\");
+        assert_eq!(0, kc_responses_len());
+    }
 }
