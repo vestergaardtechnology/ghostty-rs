@@ -4,8 +4,7 @@
 //! `cargo check --target x86_64-apple-darwin`, tests not run on Linux)
 //!
 //! The Zig tests build `terminal.Terminal` and `terminal.RenderState`
-//! instances and feed them through a VT stream (the test stream handler in
-//! `terminal::render::test_vt`, TODO(port-dedupe): `Terminal::vt_stream`).
+//! instances and feed them through `Terminal::vt_stream`.
 
 #![cfg(any(target_os = "macos", target_os = "ios"))]
 
@@ -880,7 +879,6 @@ mod tests {
     use crate::font::embedded;
     use crate::font::face::{DesiredSize, Face};
     use crate::font::library::Library;
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::render::Cells;
     use crate::font::{backend::Backend, Style, OPTIONS};
 

@@ -182,7 +182,6 @@ impl Set {
 mod tests {
     use super::*;
     use crate::input::link::Action as LinkAction;
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
     fn coord(x: u16, y: u32) -> point::Coordinate {

@@ -3,8 +3,7 @@
 //! STATUS: ported
 //!
 //! The Zig tests build `terminal.Terminal` and `terminal.RenderState`
-//! instances and feed them through a VT stream (the test stream handler in
-//! `terminal::render::test_vt`, TODO(port-dedupe): `Terminal::vt_stream`).
+//! instances and feed them through `Terminal::vt_stream`.
 
 use crate::font::collection::{GetFaceError, Index};
 use crate::font::shape::{self, Cell, FeatureList, RunOptions, TextRun, DEFAULT_FEATURES};
@@ -475,7 +474,6 @@ mod tests {
     use crate::font::embedded;
     use crate::font::face::{DesiredSize, Face};
     use crate::font::library::Library;
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::render::{Cell as RenderCell, Cells};
     use crate::font::shared_grid::SharedGrid;
     use crate::font::{Style, OPTIONS};

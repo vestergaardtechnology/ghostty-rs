@@ -318,7 +318,6 @@ fn is_powerline(char: u32) -> bool {
 mod tests {
     use super::*;
     use crate::renderer::graphics_api::shaders::{CellText, CellTextAtlas, CellTextBools};
-    use crate::terminal::render::test_vt::VtStreamExt;
     use crate::terminal::render::RenderState;
     use crate::terminal::terminal::{Options as TerminalOptions, Terminal};
 
