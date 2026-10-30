@@ -5355,4 +5355,825 @@ mod tests {
         s.next_slice(b"\x1B]5522;type=read\x1B\\");
         assert_eq!(0, kc_responses_len());
     }
+
+    #[test]
+    fn request_mode_decrqm_with_write_pty_callback() {
+        let mut t = term(80, 24);
+
+        // Without callback, DECRQM should not crash
+        {
+            let mut s = stream(Handler::init(&mut t));
+
+            // DECRQM for mode 7 (wraparound) — should be silently ignored
+            s.next_slice(b"\x1B[?7$p");
+            s.next_slice(b"\x1B[4$p");
+        }
+
+        t.full_reset();
+
+        // With callback, DECRQM should produce a response
+        {
+            pty_reset();
+            let mut handler = Handler::init(&mut t);
+            handler.effects.write_pty = Some(pty_write);
+            let mut s = stream(handler);
+
+            // Wraparound mode (7) is set by default
+            s.next_slice(b"\x1B[?7$p");
+            assert_bytes(b"\x1B[?7;1$y", &pty_last().unwrap());
+
+            // Disable wraparound and query again
+            s.next_slice(b"\x1B[?7l");
+            s.next_slice(b"\x1B[?7$p");
+            assert_bytes(b"\x1B[?7;2$y", &pty_last().unwrap());
+
+            // A large unknown mode must not alias wraparound mode 7.
+            let before = s.handler.terminal.modes;
+            s.next_slice(b"\x1B[?32775$p");
+            assert_bytes(b"\x1B[?32775;0$y", &pty_last().unwrap());
+            assert_eq!(before, s.handler.terminal.modes);
+
+            // Query an unknown mode
+            s.next_slice(b"\x1B[?9999$p");
+            assert_bytes(b"\x1B[?9999;0$y", &pty_last().unwrap());
+
+            // Query DECECM, which Ghostty recognizes but does not allow changing
+            s.next_slice(b"\x1B[?117$p");
+            assert_bytes(b"\x1B[?117;4$y", &pty_last().unwrap());
+        }
+    }
+
+    #[test]
+    fn request_mode_decrqm_ansi_responses() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        for (num, mode) in [
+            ("2", Mode::DisableKeyboard),
+            ("4", Mode::Insert),
+            ("12", Mode::SendReceiveMode),
+            ("20", Mode::Linefeed),
+        ] {
+            for enabled in [false, true, false] {
+                s.next_slice(format!("\x1b[{}{}", num, if enabled { "h" } else { "l" }).as_bytes());
+                assert_eq!(enabled, s.handler.terminal.modes.get(mode));
+                let query = format!("\x1b[{}$p", num);
+                let query = query.as_bytes();
+                for split in 0..query.len() + 1 {
+                    pty_reset();
+                    s.next_slice(&query[..split]);
+                    if split < query.len() {
+                        assert_eq!(0, pty_calls());
+                    }
+                    s.next_slice(&query[split..]);
+                    assert_eq!(1, pty_calls());
+                    assert_bytes(
+                        format!("\x1b[{}{}", num, if enabled { ";1$y" } else { ";2$y" }).as_bytes(),
+                        &pty_last().unwrap(),
+                    );
+                    assert_eq!(enabled, s.handler.terminal.modes.get(mode));
+                }
+            }
+        }
+
+        // The two namespaces must report independent states for mode 4.
+        s.next_slice(b"\x1b[4h\x1b[?4l");
+        let cases: [(&[u8], &[u8]); 5] = [
+            (b"\x1b[4$p", b"\x1b[4;1$y"),
+            (b"\x1b[?4$p", b"\x1b[?4;2$y"),
+            (b"\x1b[9999$p", b"\x1b[9999;0$y"),
+            // Unimplemented ANSI modes report permanently reset (xterm parity).
+            (b"\x1b[1$p", b"\x1b[1;4$y"),
+            (b"\x1b[19$p", b"\x1b[19;4$y"),
+        ];
+        for (query, response) in cases {
+            pty_reset();
+            s.next_slice(query);
+            assert_eq!(1, pty_calls());
+            assert_bytes(response, &pty_last().unwrap());
+        }
+    }
+
+    #[test]
+    fn stream_csi_w_with_intermediate_but_no_params() {
+        // Regression test from AFL++ crash. CSI ? W without
+        // parameters caused an out-of-bounds access on input.params[0].
+        let mut t = Terminal::init(TerminalOptions {
+            max_scrollback_bytes: Some(100),
+            ..TerminalOptions::new(80, 24)
+        })
+        .unwrap();
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"\x1b[?W");
+    }
+
+    thread_local! {
+        static TITLE_CHANGED_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn title_changed(_: &mut Handler<'_>) {
+        TITLE_CHANGED_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    fn title_changed_count() -> usize {
+        TITLE_CHANGED_COUNT.with(|c| c.get())
+    }
+
+    #[test]
+    fn window_title_effect_is_called() {
+        TITLE_CHANGED_COUNT.with(|c| c.set(0));
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.title_changed = Some(title_changed);
+        let mut s = stream(handler);
+
+        // Set window title via OSC 2
+        s.next_slice(b"\x1b]2;Hello World\x1b\\");
+        assert_bytes(b"Hello World", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+    }
+
+    #[test]
+    fn window_title_effect_not_called_without_callback() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Should not crash when no callback is set
+        s.next_slice(b"\x1b]2;Hello World\x1b\\");
+
+        // Title should still be set on terminal state
+        assert_bytes(b"Hello World", s.handler.terminal.get_title().unwrap());
+
+        // Terminal should still be functional
+        s.next_slice(b"Test");
+        assert_eq!("Test", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn window_title_effect_with_empty_title() {
+        TITLE_CHANGED_COUNT.with(|c| c.set(0));
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.title_changed = Some(title_changed);
+        let mut s = stream(handler);
+
+        // Set empty window title
+        s.next_slice(b"\x1b]2;\x1b\\");
+        assert!(s.handler.terminal.get_title().is_none());
+        assert_eq!(1, title_changed_count());
+    }
+
+    #[test]
+    fn window_title_not_changed_by_cancelled_osc() {
+        TITLE_CHANGED_COUNT.with(|c| c.set(0));
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.title_changed = Some(title_changed);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b]2;before\x07");
+        assert_bytes(b"before", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+
+        // Cancelled with CAN and SUB, fed in one slice.
+        s.next_slice(b"\x1b]2;can\x18");
+        assert_bytes(b"before", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+        s.next_slice(b"\x1b]2;sub\x1a");
+        assert_bytes(b"before", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+
+        // Cancelled with CAN and SUB, fed one byte at a time.
+        for &c in b"\x1b]2;can\x18" {
+            s.next(c);
+        }
+        assert_bytes(b"before", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+        for &c in b"\x1b]2;sub\x1a" {
+            s.next(c);
+        }
+        assert_bytes(b"before", s.handler.terminal.get_title().unwrap());
+        assert_eq!(1, title_changed_count());
+
+        // An OSC that ends normally after a cancel still takes effect.
+        s.next_slice(b"\x1b]2;after\x1b\\");
+        assert_bytes(b"after", s.handler.terminal.get_title().unwrap());
+        assert_eq!(2, title_changed_count());
+    }
+
+    #[test]
+    fn kitty_keyboard_query() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Default kitty keyboard flags should be 0
+        s.next_slice(b"\x1b[?u");
+        assert_bytes(b"\x1b[?0u", &pty_last().unwrap());
+
+        // Push kitty keyboard mode with flags and query again
+        pty_reset();
+        s.next_slice(b"\x1b[>1u"); // push with disambiguate flag
+        s.next_slice(b"\x1b[?u");
+        assert_bytes(b"\x1b[?1u", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn xtversion_default() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Without xtversion effect set, should report "libghostty"
+        s.next_slice(b"\x1b[>0q");
+        assert_bytes(b"\x1bP>|libghostty\x1b\\", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn xtversion_with_effect() {
+        fn xtversion<'h>(_: &'h mut Handler<'_>) -> &'h [u8] {
+            b"ghostty 1.2.3"
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.xtversion = Some(xtversion);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b[>0q");
+        assert_bytes(b"\x1bP>|ghostty 1.2.3\x1b\\", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn xtversion_with_empty_string_effect() {
+        fn xtversion<'h>(_: &'h mut Handler<'_>) -> &'h [u8] {
+            b""
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.xtversion = Some(xtversion);
+        let mut s = stream(handler);
+
+        // Empty string from effect should fall back to "libghostty"
+        s.next_slice(b"\x1b[>0q");
+        assert_bytes(b"\x1bP>|libghostty\x1b\\", &pty_last().unwrap());
+    }
+
+    fn get_size_9x18(_: &mut Handler<'_>) -> Option<size_report::Size> {
+        Some(size_report::Size {
+            rows: 24,
+            columns: 80,
+            cell_width: 9,
+            cell_height: 18,
+        })
+    }
+
+    fn get_size_8x16(_: &mut Handler<'_>) -> Option<size_report::Size> {
+        Some(size_report::Size {
+            rows: 24,
+            columns: 80,
+            cell_width: 8,
+            cell_height: 16,
+        })
+    }
+
+    /// A stream with the pty capture and the 9x18 size effect, fed `input`.
+    fn size_report_response(input: &[u8]) -> Option<Vec<u8>> {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.size = Some(get_size_9x18);
+        let mut s = stream(handler);
+        s.next_slice(input);
+        pty_last()
+    }
+
+    #[test]
+    fn size_report_csi_14_t_with_effect() {
+        // CSI 14 t - report text area size in pixels
+        assert_bytes(b"\x1b[4;432;720t", &size_report_response(b"\x1b[14t").unwrap());
+    }
+
+    #[test]
+    fn mode_2048_enable_reports_current_geometry_and_disable_is_silent() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.size = Some(get_size_8x16);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1b[?2048h");
+        s.next_slice(b"\x1b[?2048h");
+
+        assert_eq!(2, pty_calls());
+        assert_bytes(b"\x1b[48;24;80;384;640t", &pty_last().unwrap());
+
+        s.next_slice(b"\x1b[?2048l");
+        assert_eq!(2, pty_calls());
+        assert!(!s.handler.terminal.modes.get(Mode::InBandSizeReports));
+    }
+
+    #[test]
+    fn mode_2048_enable_tolerates_missing_effects() {
+        pty_reset();
+
+        let mut no_size_terminal = term(80, 24);
+        {
+            let mut no_size_handler = Handler::init(&mut no_size_terminal);
+            no_size_handler.effects.write_pty = Some(pty_write);
+            let mut no_size_stream = stream(no_size_handler);
+
+            no_size_stream.next_slice(b"\x1b[?2048h");
+        }
+        assert!(no_size_terminal.modes.get(Mode::InBandSizeReports));
+        assert_eq!(0, pty_calls());
+
+        let mut no_write_terminal = term(80, 24);
+        {
+            let mut no_write_handler = Handler::init(&mut no_write_terminal);
+            no_write_handler.effects.size = Some(get_size_8x16);
+            let mut no_write_stream = stream(no_write_handler);
+
+            no_write_stream.next_slice(b"\x1b[?2048h");
+        }
+        assert!(no_write_terminal.modes.get(Mode::InBandSizeReports));
+        assert_eq!(0, pty_calls());
+    }
+
+    #[test]
+    fn size_report_csi_16_t_with_effect() {
+        // CSI 16 t - report cell size in pixels
+        assert_bytes(b"\x1b[6;18;9t", &size_report_response(b"\x1b[16t").unwrap());
+    }
+
+    #[test]
+    fn size_report_csi_18_t_with_effect() {
+        // CSI 18 t - report text area size in characters
+        assert_bytes(b"\x1b[8;24;80t", &size_report_response(b"\x1b[18t").unwrap());
+    }
+
+    #[test]
+    fn size_report_csi_19_t_with_effect() {
+        // CSI 19 t - report screen size in characters
+        assert_bytes(b"\x1b[9;24;80t", &size_report_response(b"\x1b[19t").unwrap());
+    }
+
+    #[test]
+    fn size_report_no_effect_callback() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Without size effect, size reports should be silently ignored
+        s.next_slice(b"\x1b[14t");
+        assert!(pty_last().is_none());
+    }
+
+    #[test]
+    fn size_report_csi_21_t_title_disabled_by_default() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Set a title first
+        s.next_slice(b"\x1b]2;My Title\x1b\\");
+
+        // CSI 21 t - report title (no size effect needed)
+        s.next_slice(b"\x1b[21t");
+        assert!(pty_last().is_none());
+    }
+
+    #[test]
+    fn size_report_csi_21_t_title_enabled() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.title_report = true;
+        let mut s = stream(handler);
+
+        // Set a title first
+        s.next_slice(b"\x1b]2;My Title\x1b\\");
+
+        // CSI 21 t - report title (no size effect needed)
+        s.next_slice(b"\x1b[21t");
+        assert_bytes(b"\x1b]lMy Title\x1b\\", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn decrqcra_disabled() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.next_slice(b"hello\x1b[1;1;1;1;1;5*y");
+        assert!(pty_last().is_none());
+    }
+
+    #[test]
+    fn decrqcra_enabled() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.xt_checksum_report = true;
+        let mut s = stream(handler);
+
+        // "hello" sums to 0x214, which the DEC checksum negates.
+        s.next_slice(b"hello\x1b[3;1;1;1;1;5*y");
+        assert_bytes(b"\x1bP3!~FDEC\x1b\\", &pty_last().unwrap());
+
+        // XTCHECKSUM 1 turns off the negation.
+        s.next_slice(b"\x1b[1#y\x1b[4;1;1;1;1;5*y");
+        assert_bytes(b"\x1bP4!~0214\x1b\\", &pty_last().unwrap());
+
+        // A full reset restores the DEC checksum.
+        s.next_slice(b"\x1bchello\x1b[5;1;1;1;1;5*y");
+        assert_bytes(b"\x1bP5!~FDEC\x1b\\", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn xtchecksum_ignored_without_xt_checksum_report() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"\x1b[1#y");
+        assert_eq!(xt_checksum::Flags::default(), s.handler.terminal.flags.xt_checksum);
+    }
+
+    #[test]
+    fn enquiry_no_effect() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // ENQ without enquiry effect should not write anything
+        s.next_slice(b"\x05");
+        assert!(pty_last().is_none());
+    }
+
+    #[test]
+    fn enquiry_with_effect() {
+        fn enquiry<'h>(_: &'h mut Handler<'_>) -> &'h [u8] {
+            b"ghostty"
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.enquiry = Some(enquiry);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x05");
+        assert_bytes(b"ghostty", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn enquiry_with_empty_response() {
+        fn enquiry<'h>(_: &'h mut Handler<'_>) -> &'h [u8] {
+            b""
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.enquiry = Some(enquiry);
+        let mut s = stream(handler);
+
+        // Empty enquiry response should not write anything
+        s.next_slice(b"\x05");
+        assert!(pty_last().is_none());
+    }
+
+    /// A stream with the pty capture fed each input in turn; returns the
+    /// last pty write.
+    fn device_status_response(inputs: &[&[u8]]) -> Option<Vec<u8>> {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+        for input in inputs {
+            s.next_slice(input);
+        }
+        pty_last()
+    }
+
+    #[test]
+    fn device_status_operating_status() {
+        // CSI 5 n — operating status report
+        assert_bytes(b"\x1B[0n", &device_status_response(&[b"\x1B[5n"]).unwrap());
+    }
+
+    #[test]
+    fn device_status_cursor_position() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Default position is 0,0 — reported as 1,1
+        s.next_slice(b"\x1B[6n");
+        assert_bytes(b"\x1B[1;1R", &pty_last().unwrap());
+
+        // Move cursor to row 5, col 10
+        s.next_slice(b"\x1B[5;10H");
+        s.next_slice(b"\x1B[6n");
+        assert_bytes(b"\x1B[5;10R", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn device_status_cursor_position_with_origin_mode() {
+        let response = device_status_response(&[
+            // Set scroll region rows 5-20
+            b"\x1B[5;20r",
+            // Enable origin mode
+            b"\x1B[?6h",
+            // Move to row 3, col 5 within the region
+            b"\x1B[3;5H",
+            // Query cursor position
+            b"\x1B[6n",
+        ]);
+        // Should report position relative to the scroll region
+        assert_bytes(b"\x1B[3;5R", &response.unwrap());
+    }
+
+    #[test]
+    fn device_status_extended_cursor_position() {
+        // DECXCPR (CSI ? 6 n) reports CSI ? row ; col ; page R.
+        // Ghostty has no page memory, so page is always 1.
+        let response = device_status_response(&[b"\x1B[5;3H", b"\x1B[?6n"]);
+        assert_bytes(b"\x1B[?5;3;1R", &response.unwrap());
+    }
+
+    #[test]
+    fn device_status_extended_cursor_position_with_origin_mode() {
+        let response = device_status_response(&[
+            // Set scroll region rows 5-20
+            b"\x1B[5;20r",
+            // Enable origin mode
+            b"\x1B[?6h",
+            // Move to row 3, col 5 within the region
+            b"\x1B[3;5H",
+            // DECXCPR reports position relative to the scroll region, plus page 1
+            b"\x1B[?6n",
+        ]);
+        assert_bytes(b"\x1B[?3;5;1R", &response.unwrap());
+    }
+
+    /// A stream with the pty capture and a color scheme effect, fed the
+    /// color scheme query; returns the last pty write.
+    fn color_scheme_response(
+        color_scheme: Option<for<'h, 't> fn(&'h mut Handler<'t>) -> Option<device_status::ColorScheme>>,
+    ) -> Option<Vec<u8>> {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.color_scheme = color_scheme;
+        let mut s = stream(handler);
+
+        // CSI ? 996 n — color scheme query
+        s.next_slice(b"\x1B[?996n");
+        pty_last()
+    }
+
+    #[test]
+    fn device_status_color_scheme_dark() {
+        fn color_scheme(_: &mut Handler<'_>) -> Option<device_status::ColorScheme> {
+            Some(device_status::ColorScheme::Dark)
+        }
+        assert_bytes(b"\x1B[?997;1n", &color_scheme_response(Some(color_scheme)).unwrap());
+    }
+
+    #[test]
+    fn device_status_color_scheme_light() {
+        fn color_scheme(_: &mut Handler<'_>) -> Option<device_status::ColorScheme> {
+            Some(device_status::ColorScheme::Light)
+        }
+        assert_bytes(b"\x1B[?997;2n", &color_scheme_response(Some(color_scheme)).unwrap());
+    }
+
+    #[test]
+    fn device_status_color_scheme_without_callback() {
+        // Without color_scheme effect, query should be silently ignored
+        assert!(color_scheme_response(None).is_none());
+    }
+
+    #[test]
+    fn visibility_reports() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Mode 2033 is supported and initially disabled.
+        s.next_slice(b"\x1B[?2033$p");
+        assert_bytes(b"\x1B[?2033;2$y", &pty_last().unwrap());
+
+        // A one-shot query reports the current state without enabling the mode.
+        s.next_slice(b"\x1B[?998n");
+        assert_bytes(b"\x1B[?999;1n", &pty_last().unwrap());
+        assert!(!s.handler.terminal.modes.get(Mode::ReportVisibility));
+
+        // Enabling always sends an immediate report, even when already enabled.
+        s.handler.terminal.flags.visible = false;
+        s.next_slice(b"\x1B[?2033h");
+        assert_bytes(b"\x1B[?999;2n", &pty_last().unwrap());
+        let count = pty_calls();
+        s.next_slice(b"\x1B[?2033h");
+        assert_eq!(count + 1, pty_calls());
+
+        // Disabling sends no report.
+        s.next_slice(b"\x1B[?2033l");
+        assert_eq!(count + 1, pty_calls());
+
+        // A terminal reset preserves the view's externally owned visibility.
+        s.next_slice(b"\x1Bc");
+        s.next_slice(b"\x1B[?998n");
+        assert_bytes(b"\x1B[?999;2n", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn device_status_readonly_ignores_all() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // All device status queries should be silently ignored without effects
+        s.next_slice(b"\x1B[5n");
+        s.next_slice(b"\x1B[6n");
+        s.next_slice(b"\x1B[?996n");
+        s.next_slice(b"\x1B[?998n");
+
+        // Terminal should still be functional
+        s.next_slice(b"Test");
+        assert_eq!("Test", plain(s.handler.terminal));
+    }
+
+    fn da_default(_: &mut Handler<'_>) -> device_attributes::Attributes {
+        device_attributes::Attributes::default()
+    }
+
+    /// A stream with the pty capture and the default device attributes
+    /// effect, fed `input`; returns the last pty write.
+    fn device_attributes_response(input: &[u8]) -> Option<Vec<u8>> {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.device_attributes = Some(da_default);
+        let mut s = stream(handler);
+        s.next_slice(input);
+        pty_last()
+    }
+
+    #[test]
+    fn device_attributes_primary_da() {
+        assert_bytes(b"\x1b[?62;22c", &device_attributes_response(b"\x1B[c").unwrap());
+    }
+
+    #[test]
+    fn device_attributes_secondary_da() {
+        assert_bytes(b"\x1b[>1;0;0c", &device_attributes_response(b"\x1B[>c").unwrap());
+    }
+
+    #[test]
+    fn device_attributes_tertiary_da() {
+        assert_bytes(b"\x1bP!|00000000\x1b\\", &device_attributes_response(b"\x1B[=c").unwrap());
+    }
+
+    #[test]
+    fn device_attributes_readonly_ignores() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // All DA queries should be silently ignored without effects
+        s.next_slice(b"\x1B[c");
+        s.next_slice(b"\x1B[>c");
+        s.next_slice(b"\x1B[=c");
+
+        // Terminal should still be functional
+        s.next_slice(b"Test");
+        assert_eq!("Test", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn device_attributes_custom_response() {
+        fn da(_: &mut Handler<'_>) -> device_attributes::Attributes {
+            device_attributes::Attributes {
+                primary: device_attributes::Primary {
+                    conformance_level: device_attributes::ConformanceLevel::VT420,
+                    features: &[
+                        device_attributes::Feature::ANSI_COLOR,
+                        device_attributes::Feature::CLIPBOARD,
+                    ],
+                },
+                secondary: device_attributes::Secondary {
+                    device_type: device_attributes::DeviceType::VT420,
+                    firmware_version: 100,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        handler.effects.device_attributes = Some(da);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1B[c");
+        assert_bytes(b"\x1b[?64;22;52c", &pty_last().unwrap());
+
+        s.next_slice(b"\x1B[>c");
+        assert_bytes(b"\x1b[>41;100;0c", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn kitty_graphics_apc_response() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        pty_reset();
+        let mut t = term(10, 10);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Send a kitty graphics transmit command with image id 1
+        s.next_slice(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\");
+
+        // Should have written a response back
+        assert_bytes(b"\x1b_Gi=1;OK\x1b\\", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn kitty_graphics_via_apc() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Send a kitty graphics transmit command via APC:
+        // ESC _ G <payload> ESC \
+        // a=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;//////// (1x2 RGB direct)
+        s.next_slice(b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2,c=10,r=1;////////\x1b\\");
+
+        let storage = &s.handler.terminal.screens.active.kitty_images;
+        let img = storage.image_by_id(1).unwrap();
+        assert_eq!(crate::terminal::kitty::graphics_command::Format::Rgb, img.format);
+    }
+
+    #[test]
+    fn kitty_graphics_apc_cancelled_or_aborted_is_discarded() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+
+        // CAN (0x18) and SUB (0x1A) cancel the APC, and CSI (0x9B), like
+        // any 8-bit control other than ST, aborts it. Either way the
+        // transmit command must not run, so image 7 is never stored.
+        for ending in [b"\x18", b"\x1a", b"\x9b"] {
+            let mut t = term(10, 10);
+            let mut s = stream(Handler::init(&mut t));
+
+            s.next_slice(b"\x1b_Ga=t,f=24,s=1,v=1,i=7;AAAA");
+            s.next_slice(ending);
+
+            let storage = &s.handler.terminal.screens.active.kitty_images;
+            assert!(storage.image_by_id(7).is_none());
+        }
+    }
 }
