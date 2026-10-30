@@ -64,6 +64,13 @@
 //!   owned values. `DerivedConfig` owns its data (no arena).
 //! * `updateFrame`/`drawFrame` return `Result<(), Error>` with a boxed
 //!   error (Zig: inferred error sets).
+//! * `frameCompleted` only releases the swap chain semaphore when a swap
+//!   chain exists (Zig unwraps it), so frames begun outside `drawFrame`
+//!   (the OpenGL frame test) can complete.
+//! * The macOS display link is `Option<*mut DisplayLink>` under
+//!   `cfg(target_os = "macos")` (Zig: `void` elsewhere).
+//! * The OSC 8 / regex link sets, preedit and overlay feature list taken
+//!   in the critical section are owned values (Zig: arena allocated).
 
 #![allow(clippy::too_many_arguments)]
 
@@ -800,7 +807,7 @@ impl DerivedConfig {
         );
 
         DerivedConfig {
-            background_opacity: config.background_opacity.clamp(0.0, 1.0).max(0.0),
+            background_opacity: config.background_opacity.clamp(0.0, 1.0),
             background_opacity_cells: config.background_opacity_cells,
             font_thicken: config.font_thicken,
             font_thicken_strength: config.font_thicken_strength,
@@ -810,7 +817,7 @@ impl DerivedConfig {
 
             cursor_color: config.cursor_color,
             cursor_text: config.cursor_text,
-            cursor_opacity: config.cursor_opacity.clamp(0.0, 1.0).max(0.0),
+            cursor_opacity: config.cursor_opacity.clamp(0.0, 1.0),
 
             background: config.background.to_terminal_rgb(),
             foreground: config.foreground.to_terminal_rgb(),
