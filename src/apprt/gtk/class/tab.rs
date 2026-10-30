@@ -1,7 +1,6 @@
 //! Port of `src/apprt/gtk/class/tab.zig`.
 //!
-//! STATUS: ported (against the `Application`, `SplitTree`, `Surface` and
-//! core `Surface` stand-ins in `class::port_stubs`, TODO(port-dedupe))
+//! STATUS: ported
 #![cfg(feature = "gtk")]
 
 use std::cell::RefCell;
@@ -21,12 +20,10 @@ use crate::apprt::gtk::ext::actions::Action;
 use crate::apprt::surface::NewSurfaceContext;
 use crate::datastruct::split_tree::Direction;
 
-// TODO(port-dedupe): replace with crate::apprt::gtk::class::{
-// application::Application, split_tree::SplitTree, surface::Surface} and
-// crate::surface::Surface (core).
-use crate::apprt::gtk::class::port_stubs::{
-    Application, CoreSurface, SplitTree, Surface, SurfaceTree,
-};
+use crate::apprt::gtk::class::application::Application;
+use crate::apprt::gtk::class::split_tree::SplitTree;
+use crate::apprt::gtk::class::surface::{Surface, Tree as SurfaceTree};
+use crate::surface::Surface as CoreSurface;
 
 const LOG: &str = "gtk_ghostty_window";
 
