@@ -5143,5 +5143,1903 @@ pub(crate) mod tests {
         unsafe { free(t) };
     }
 
-    // CHUNK3
+    #[test]
+    fn set_write_pty_callback_decrqm() {
+        let t = new_t(80, 24);
+
+        // Set userdata and write_pty callback
+        let mut sentinel: u8 = 42;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        set_write_pty(t);
+
+        // DECRQM for wraparound mode (mode 7, set by default) should trigger write_pty
+        vw(t, b"\x1B[?7$p");
+        assert_eq!(Some(b"\x1B[?7;1$y".to_vec()), last());
+        assert_eq!(o(&mut sentinel), LAST_UD.get());
+        assert_eq!(1, CALLS.get());
+
+        vw(t, b"\x1B[4h\x1B[4$p");
+        assert_eq!(2, CALLS.get());
+        assert_eq!(Some(b"\x1B[4;1$y".to_vec()), last());
+        assert_eq!(o(&mut sentinel), LAST_UD.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn write_pty_receives_decrqss_response() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        vw(t, b"\x1B[1m\x1BP$qm\x1B\\");
+        assert_eq!(Some(b"\x1BP1$r0;1m\x1B\\".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn write_pty_receives_osc_color_query_response() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        vw(t, b"\x1B]10;rgb:01/02/03\x1B\\");
+        assert!(last().is_none());
+
+        vw(t, b"\x1B]10;?\x1B\\");
+        assert_eq!(Some(b"\x1B]10;rgb:0101/0202/0303\x1B\\".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_write_pty_without_callback_ignores_queries() {
+        let t = new_t(80, 24);
+        // Without setting a callback, DECRQM should be silently ignored (no crash)
+        vw(t, b"\x1B[?7$p");
+        vw(t, b"\x1B[4$p");
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_write_pty_null_clears_callback() {
+        let t = new_t(80, 24);
+
+        // Set then clear the callback
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::WritePty, std::ptr::null()));
+
+        vw(t, b"\x1B[?7$p");
+        assert_eq!(0, CALLS.get());
+        unsafe { free(t) };
+    }
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+        static UD: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    /// A counting callback for the `fn(Terminal, userdata)` effects.
+    unsafe extern "C" fn count_cb(_: Terminal, ud: *mut c_void) {
+        COUNT.set(COUNT.get() + 1);
+        UD.set(ud);
+    }
+
+    #[test]
+    fn set_bell_callback() {
+        let t = new_t(80, 24);
+
+        // Set userdata and bell callback
+        let mut sentinel: u8 = 99;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(Result::Success, sopt(t, Option::Bell, count_cb as BellFn as *const c_void));
+
+        // Single BEL
+        vw(t, b"\x07");
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+
+        // Multiple BELs
+        vw(t, b"\x07\x07");
+        assert_eq!(3, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn bell_without_callback_is_silent() {
+        let t = new_t(80, 24);
+        // BEL without a callback should not crash
+        vw(t, b"\x07");
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_enquiry_callback() {
+        unsafe extern "C" fn enquiry(_: Terminal, _: *mut c_void) -> LibString {
+            LibString::init(b"OK")
+        }
+
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::Enquiry, enquiry as EnquiryFn as *const c_void));
+
+        // ENQ (0x05) should trigger the enquiry callback and write response via write_pty
+        vw(t, b"\x05");
+        assert_eq!(Some(b"OK".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn enquiry_without_callback_is_silent() {
+        let t = new_t(80, 24);
+        // ENQ without a callback should not crash
+        vw(t, b"\x05");
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_xtversion_callback() {
+        unsafe extern "C" fn xtversion(_: Terminal, _: *mut c_void) -> LibString {
+            LibString::init(b"myterm 1.0")
+        }
+
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::Xtversion, xtversion as XtversionFn as *const c_void));
+
+        // XTVERSION: CSI > q
+        vw(t, b"\x1B[>q");
+        // Response should be DCS >| version ST
+        assert_eq!(Some(b"\x1BP>|myterm 1.0\x1B\\".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn xtversion_without_callback_reports_default() {
+        let t = new_t(80, 24);
+
+        // Set write_pty but not xtversion — should get default "libghostty"
+        set_write_pty(t);
+
+        vw(t, b"\x1B[>q");
+        assert_eq!(Some(b"\x1BP>|libghostty\x1B\\".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_terminfo_name_option() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        // While no name is set the query goes unanswered; other capabilities
+        // are still served from the static map.
+        let query = format!("\x1BP+q{}\x1B\\", hex_upper(b"TN"));
+        vw(t, query.as_bytes());
+        assert!(last().is_none());
+        let co_query = format!("\x1BP+q{}\x1B\\", hex_upper(b"Co"));
+        vw(t, co_query.as_bytes());
+        assert_eq!(
+            Some(format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"Co"), hex_upper(b"256")).into_bytes()),
+            last()
+        );
+        clear_last();
+
+        // The name is copied, so the caller's buffer can go away afterwards.
+        let mut name: [u8; 14] = *b"xterm-256color";
+        let value = LibString {
+            ptr: name.as_ptr(),
+            len: name.len(),
+        };
+        assert_eq!(Result::Success, sopt(t, Option::TerminfoName, p(&value)));
+        name.fill(b'z');
+
+        vw(t, query.as_bytes());
+        assert_eq!(
+            Some(format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"TN"), hex_upper(b"xterm-256color")).into_bytes()),
+            last()
+        );
+
+        // Clearing with NULL leaves the query unanswered again.
+        clear_last();
+        assert_eq!(Result::Success, sopt(t, Option::TerminfoName, std::ptr::null()));
+        vw(t, query.as_bytes());
+        assert!(last().is_none());
+
+        // Names beyond the maximum are rejected rather than truncated.
+        let long = [b'a'; Handler::MAX_TERMINFO_NAME_BYTES + 1];
+        let long_value = LibString {
+            ptr: long.as_ptr(),
+            len: long.len(),
+        };
+        assert_eq!(Result::InvalidValue, sopt(t, Option::TerminfoName, p(&long_value)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_title_changed_callback() {
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 77;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::TitleChanged, count_cb as TitleChangedFn as *const c_void)
+        );
+
+        // OSC 2 ; title ST — set window title
+        vw(t, b"\x1B]2;Hello\x1B\\");
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+
+        // Another title change
+        vw(t, b"\x1B]2;World\x1B\\");
+        assert_eq!(2, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_render_hold_callback() {
+        thread_local! {
+            static EVENTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "C" fn hold(_: Terminal, ud: *mut c_void, held: bool) {
+            EVENTS.with(|e| e.borrow_mut().push(held));
+            UD.set(ud);
+        }
+        let events = || EVENTS.with(|e| e.borrow().clone());
+        let clear = || EVENTS.with(|e| e.borrow_mut().clear());
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 0;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(Result::Success, sopt(t, Option::RenderHold, hold as RenderHoldFn as *const c_void));
+
+        // A set during a hold and a reset without a hold are ignored.
+        let frame = b"\x1b[?2026h\x1b[?2026hA\x1b[?2026l\x1b[?2026l";
+        vw(t, frame);
+        assert_eq!(vec![true, false], events());
+        assert_eq!(o(&mut sentinel), UD.get());
+
+        // Resize and reset turn the mode off and end the hold.
+        let begin = b"\x1b[?2026h";
+        clear();
+        vw(t, begin);
+        assert_eq!(Result::Success, unsafe { resize(t, 80, 24, 9, 18) });
+        vw(t, begin);
+        unsafe {
+            reset(t);
+            reset(t);
+        }
+        assert_eq!(vec![true, false, true, false], events());
+
+        // Changing the mode ourselves (e.g. for a timeout) isn't reported.
+        clear();
+        vw(t, begin);
+        let off = ModeConfig {
+            mode: 2026,
+            value: false,
+        };
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&off)));
+        assert!(!zt(t).modes.get(Mode::SynchronizedOutput));
+        assert_eq!(vec![true], events());
+
+        // Clearing the callback silences it.
+        clear();
+        assert_eq!(Result::Success, sopt(t, Option::RenderHold, std::ptr::null()));
+        vw(t, frame);
+        assert!(events().is_empty());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn title_changed_without_callback_is_silent() {
+        let t = new_t(80, 24);
+        // OSC 2 without a callback should not crash
+        vw(t, b"\x1B]2;Hello\x1B\\");
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn kitty_image_medium_temp_file_empty_output() {
+        if !build_options::KITTY_GRAPHICS {
+            return;
+        }
+        let t = new_t(80, 24);
+
+        let empty = LibString::init(b"");
+        assert_eq!(Result::Success, sopt(t, Option::KittyImageMediumTempFile, p(&empty)));
+        let mut result = LibString {
+            ptr: std::ptr::null(),
+            len: 99,
+        };
+        assert_eq!(Result::Success, gdat(t, TerminalData::KittyImageMediumTempFile, o(&mut result)));
+        assert_eq!(0, result.len);
+        assert_eq!(LibString::empty_ptr(), result.ptr);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_desktop_notification_callback() {
+        thread_local! {
+            static LAST_N: RefCell<(usize, Vec<u8>, Vec<u8>)> = const { RefCell::new((0, Vec::new(), Vec::new())) };
+        }
+        unsafe extern "C" fn notify(_: Terminal, ud: *mut c_void, n: *const DesktopNotification) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let n = &*n;
+            LAST_N.with(|l| *l.borrow_mut() = (n.size, cs(n.title), cs(n.body)));
+        }
+        let last_n = || LAST_N.with(|l| l.borrow().clone());
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 99;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::DesktopNotification, notify as DesktopNotificationFn as *const c_void)
+        );
+
+        // Split OSC 777 across writes to exercise the persistent VT parser.
+        vw(t, b"\x1B]777;notify;Codex;");
+        assert_eq!(0, COUNT.get());
+        vw(t, b"Needs attention\x1B\\");
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+        let (size, title, body) = last_n();
+        assert_eq!(std::mem::size_of::<DesktopNotification>(), size);
+        assert_eq!(b"Codex", title.as_slice());
+        assert_eq!(b"Needs attention", body.as_slice());
+
+        // OSC 9 has no title and preserves its body.
+        let seq_c = b"\x1B]9;Build complete\x07";
+        vw(t, seq_c);
+        assert_eq!(2, COUNT.get());
+        let (_, title, body) = last_n();
+        assert_eq!(b"", title.as_slice());
+        assert_eq!(b"Build complete", body.as_slice());
+
+        // Removing the callback takes effect immediately.
+        assert_eq!(Result::Success, sopt(t, Option::DesktopNotification, std::ptr::null()));
+        vw(t, seq_c);
+        assert_eq!(2, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_resize_window_callback() {
+        thread_local! {
+            static LAST_RW: Cell<(c_int, ResizeWindowGrid)> = const { Cell::new((-1, ResizeWindowGrid { rows: 0, columns: 0 })) };
+        }
+        unsafe extern "C" fn resize_window(_: Terminal, ud: *mut c_void, request: *const ResizeWindow) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let r = &*request;
+            LAST_RW.set((r.tag as c_int, r.value.grid));
+        }
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 44;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ResizeWindow, resize_window as ResizeWindowFn as *const c_void)
+        );
+
+        let seq = b"\x1B[8;30;100t";
+        vw(t, seq);
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+        let (tag, grid) = LAST_RW.get();
+        assert_eq!(ResizeWindowTag::Grid as c_int, tag);
+        assert_eq!(30, grid.rows);
+        assert_eq!(100, grid.columns);
+
+        // Removing the callback takes effect immediately.
+        assert_eq!(Result::Success, sopt(t, Option::ResizeWindow, std::ptr::null()));
+        vw(t, seq);
+        assert_eq!(1, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_progress_report_callback() {
+        thread_local! {
+            static LAST_PR: Cell<(usize, ProgressState, i8)> = const { Cell::new((0, ProgressState::Remove, -1)) };
+        }
+        unsafe extern "C" fn progress_report(_: Terminal, ud: *mut c_void, report: *const ProgressReport) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let r = &*report;
+            LAST_PR.set((r.size, r.state, r.progress));
+        }
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 100;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ProgressReport, progress_report as ProgressReportFn as *const c_void)
+        );
+
+        let cases: [(&[u8], ProgressState, i8); 5] = [
+            (b"\x1B]9;4;0;\x1B\\", ProgressState::Remove, -1),
+            (b"\x1B]9;4;1;42\x07", ProgressState::Set, 42),
+            (b"\x1B]9;4;2;7\x1B\\", ProgressState::Error, 7),
+            (b"\x1B]9;4;3\x1B\\", ProgressState::Indeterminate, -1),
+            (b"\x1B]9;4;4;75\x1B\\", ProgressState::Pause, 75),
+        ];
+
+        for (i, (sequence, state, progress)) in cases.iter().enumerate() {
+            let expected_count = i + 1;
+            let midpoint = sequence.len() / 2;
+            vw(t, &sequence[..midpoint]);
+            assert_eq!(expected_count - 1, COUNT.get());
+            vw(t, &sequence[midpoint..]);
+            assert_eq!(expected_count, COUNT.get());
+            assert_eq!(o(&mut sentinel), UD.get());
+            let (size, last_state, last_progress) = LAST_PR.get();
+            assert_eq!(std::mem::size_of::<ProgressReport>(), size);
+            assert_eq!(*state, last_state);
+            assert_eq!(*progress, last_progress);
+        }
+
+        assert_eq!(Result::Success, sopt(t, Option::ProgressReport, std::ptr::null()));
+        vw(t, b"\x1B]9;4;1;90\x1B\\");
+        assert_eq!(cases.len(), COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_program_status_callback() {
+        #[derive(Clone)]
+        struct Last {
+            size: usize,
+            state: ProgramStatusState,
+            kind: ProgramStatusKind,
+            progress: i8,
+            id: Vec<u8>,
+            app: Vec<u8>,
+            title: Vec<u8>,
+            message: Vec<u8>,
+        }
+        thread_local! {
+            static LAST_PS: RefCell<std::option::Option<Last>> = const { RefCell::new(None) };
+        }
+        unsafe extern "C" fn program_status(_: Terminal, ud: *mut c_void, report: *const ProgramStatus) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let r = &*report;
+            LAST_PS.with(|l| {
+                *l.borrow_mut() = Some(Last {
+                    size: r.size,
+                    state: r.state,
+                    kind: r.kind,
+                    progress: r.progress,
+                    id: cs(r.id),
+                    app: cs(r.app),
+                    title: cs(r.title),
+                    message: cs(r.message),
+                })
+            });
+        }
+        let last_ps = || LAST_PS.with(|l| l.borrow().clone().unwrap());
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 100;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        set_write_pty(t);
+
+        // Without the callback, the support query is not answered.
+        let query = b"\x1B]7501;?\x1B\\";
+        vw(t, query);
+        assert!(all_written().is_empty());
+
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ProgramStatus, program_status as ProgramStatusFn as *const c_void)
+        );
+
+        // With the callback, it is answered with the states and kinds we
+        // accept and the same terminator.
+        vw(t, query);
+        assert_eq!(
+            b"\x1B]7501;?:states=idle,working,done,blocked,error:kinds=permission,question,auth\x1B\\".to_vec(),
+            all_written()
+        );
+        assert_eq!(0, COUNT.get());
+
+        // "Plan" and "Apply?"
+        let report =
+            b"\x1B]7501;state=blocked:kind=permission:progress=40:id=a/b:app=terraform:title=UGxhbg==:msg=QXBwbHk/\x07";
+        vw(t, report);
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+        let l = last_ps();
+        assert_eq!(std::mem::size_of::<ProgramStatus>(), l.size);
+        assert_eq!(ProgramStatusState::Blocked, l.state);
+        assert_eq!(ProgramStatusKind::Permission, l.kind);
+        assert_eq!(40, l.progress);
+        assert_eq!(b"a/b", l.id.as_slice());
+        assert_eq!(b"terraform", l.app.as_slice());
+        assert_eq!(b"Plan", l.title.as_slice());
+        assert_eq!(b"Apply?", l.message.as_slice());
+
+        // Absent values are empty, none, or -1.
+        let minimal = b"\x1B]7501;state=done\x1B\\";
+        vw(t, minimal);
+        assert_eq!(2, COUNT.get());
+        let l = last_ps();
+        assert_eq!(ProgramStatusState::Done, l.state);
+        assert_eq!(ProgramStatusKind::None, l.kind);
+        assert_eq!(-1, l.progress);
+        assert!(l.id.is_empty());
+        assert!(l.app.is_empty());
+        assert!(l.title.is_empty());
+        assert!(l.message.is_empty());
+
+        // Unsetting the callback ignores reports and the query again.
+        assert_eq!(Result::Success, sopt(t, Option::ProgramStatus, std::ptr::null()));
+        clear_all();
+        vw(t, query);
+        vw(t, minimal);
+        assert!(all_written().is_empty());
+        assert_eq!(2, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_semantic_prompt_callback() {
+        #[derive(Clone)]
+        struct Last {
+            size: usize,
+            kind: SemanticPromptKind,
+            prompt_kind: SemanticPromptPromptKind,
+            has_exit_code: bool,
+            exit_code: i32,
+            command: Vec<u8>,
+            error: Vec<u8>,
+        }
+        thread_local! {
+            static LAST_SP: RefCell<std::option::Option<Last>> = const { RefCell::new(None) };
+        }
+        unsafe extern "C" fn semantic_prompt(_: Terminal, ud: *mut c_void, event: *const SemanticPrompt) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let e = &*event;
+            LAST_SP.with(|l| {
+                *l.borrow_mut() = Some(Last {
+                    size: e.size,
+                    kind: e.kind,
+                    prompt_kind: e.prompt_kind,
+                    has_exit_code: e.has_exit_code,
+                    exit_code: e.exit_code,
+                    command: cs(e.command),
+                    error: cs(e.error),
+                })
+            });
+        }
+        let last_sp = || LAST_SP.with(|l| l.borrow().clone().unwrap());
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 100;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::SemanticPrompt, semantic_prompt as SemanticPromptFn as *const c_void)
+        );
+
+        let prompt = b"\x1B]133;P;k=r\x07";
+        vw(t, prompt);
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+        let l = last_sp();
+        assert_eq!(std::mem::size_of::<SemanticPrompt>(), l.size);
+        assert_eq!(SemanticPromptKind::PromptStart, l.kind);
+        assert_eq!(SemanticPromptPromptKind::Right, l.prompt_kind);
+        assert!(!l.has_exit_code);
+
+        vw(t, b"\x1B]133;B\x07");
+        assert_eq!(2, COUNT.get());
+        let l = last_sp();
+        assert_eq!(SemanticPromptKind::InputStart, l.kind);
+        assert_eq!(SemanticPromptPromptKind::Primary, l.prompt_kind);
+
+        vw(t, b"\x1B]133;C;cmdline_url=ls%20-la\x07");
+        assert_eq!(3, COUNT.get());
+        let l = last_sp();
+        assert_eq!(SemanticPromptKind::OutputStart, l.kind);
+        assert_eq!(b"ls -la", l.command.as_slice());
+
+        vw(t, b"\x1B]133;D;-1;err=boom\x07");
+        assert_eq!(4, COUNT.get());
+        let l = last_sp();
+        assert_eq!(SemanticPromptKind::CommandEnd, l.kind);
+        assert!(l.has_exit_code);
+        assert_eq!(-1, l.exit_code);
+        assert_eq!(b"boom", l.error.as_slice());
+        assert!(l.command.is_empty());
+
+        vw(t, b"\x1B]133;D\x07");
+        assert_eq!(5, COUNT.get());
+        let l = last_sp();
+        assert!(!l.has_exit_code);
+        assert_eq!(0, l.exit_code);
+        assert!(l.error.is_empty());
+
+        assert_eq!(Result::Success, sopt(t, Option::SemanticPrompt, std::ptr::null()));
+        vw(t, prompt);
+        assert_eq!(5, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_reset_callback() {
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 100;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(Result::Success, sopt(t, Option::Reset, count_cb as ResetFn as *const c_void));
+
+        // A soft reset (DECSTR) doesn't report a reset.
+        vw(t, b"\x1B[!p");
+        assert_eq!(0, COUNT.get());
+
+        let full = b"\x1Bc";
+        vw(t, full);
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+
+        assert_eq!(Result::Success, sopt(t, Option::Reset, std::ptr::null()));
+        vw(t, full);
+        assert_eq!(1, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_unknown_sequence_callback() {
+        #[derive(Clone)]
+        struct Last {
+            terminal: Terminal,
+            tag: UnknownSequenceTag,
+            truncated: bool,
+            terminator: osc::TerminatorC,
+            content: Vec<u8>,
+        }
+        thread_local! {
+            static LAST_US: RefCell<std::option::Option<Last>> = const { RefCell::new(None) };
+        }
+        unsafe extern "C" fn unknown_sequence(terminal_: Terminal, ud: *mut c_void, sequence: *const UnknownSequence) {
+            COUNT.set(COUNT.get() + 1);
+            UD.set(ud);
+            let s = &*sequence;
+            let prev_terminator = LAST_US.with(|l| l.borrow().as_ref().map_or(osc::TerminatorC::St, |l| l.terminator));
+            let (truncated, terminator, str_) = match s.tag {
+                UnknownSequenceTag::Apc => {
+                    let apc_value = s.value.apc;
+                    (apc_value.truncated, prev_terminator, apc_value.content)
+                }
+                UnknownSequenceTag::Osc => {
+                    let osc_value = s.value.osc;
+                    (osc_value.truncated, osc_value.terminator, osc_value.content)
+                }
+            };
+            let mut content = cs(str_);
+            content.truncate(64);
+            LAST_US.with(|l| {
+                *l.borrow_mut() = Some(Last {
+                    terminal: terminal_,
+                    tag: s.tag,
+                    truncated,
+                    terminator,
+                    content,
+                })
+            });
+        }
+        let last_us = || LAST_US.with(|l| l.borrow().clone().unwrap());
+
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 101;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+
+        let max_bytes: usize = 8;
+        assert_eq!(Result::Success, sopt(t, Option::UnknownMaxBytes, p(&max_bytes)));
+        assert_eq!(max_bytes, wr(t).stream.handler.apc_handler.unknown_max_bytes);
+        assert_eq!(max_bytes, wr(t).stream.parser.osc_parser.unknown_max_bytes);
+
+        // A byte limit without a callback performs no external effect.
+        let before_callback = b"\x1B_abc;xy\x1B\\";
+        vw(t, before_callback);
+        assert_eq!(0, COUNT.get());
+        assert!(wr(t).stream.handler.unknown_sequence.is_none());
+
+        let cb = unknown_sequence as UnknownSequenceFn as *const c_void;
+        assert_eq!(Result::Success, sopt(t, Option::UnknownSequence, cb));
+        assert!(wr(t).stream.handler.unknown_sequence.is_some());
+
+        // Split a complete APC across writes to exercise persistent parser state.
+        vw(t, b"\x1B_abc;");
+        assert_eq!(0, COUNT.get());
+        vw(t, b"xy\x1B\\");
+        assert_eq!(1, COUNT.get());
+        let l = last_us();
+        assert_eq!(t, l.terminal);
+        assert_eq!(o(&mut sentinel), UD.get());
+        assert_eq!(UnknownSequenceTag::Apc, l.tag);
+        assert!(!l.truncated);
+        assert_eq!(b"abc;xy", l.content.as_slice());
+
+        // Content beyond the generic limit is omitted and marked truncated.
+        vw(t, b"\x1B_abcdefghijkl\x1B\\");
+        assert_eq!(2, COUNT.get());
+        let l = last_us();
+        assert!(l.truncated);
+        assert_eq!(b"abcdefgh", l.content.as_slice());
+
+        // CAN aborts the APC and must not invoke the callback.
+        vw(t, b"\x1B_abcdef\x18");
+        assert_eq!(2, COUNT.get());
+
+        // Unknown OSCs share the callback and the byte limit.
+        let osc_st = b"\x1B]7400;x\x1B\\";
+        vw(t, osc_st);
+        assert_eq!(3, COUNT.get());
+        let l = last_us();
+        assert_eq!(UnknownSequenceTag::Osc, l.tag);
+        assert!(!l.truncated);
+        assert_eq!(osc::TerminatorC::St, l.terminator);
+        assert_eq!(b"7400;x", l.content.as_slice());
+
+        vw(t, b"\x1B]7400;abcdef\x07");
+        assert_eq!(4, COUNT.get());
+        let l = last_us();
+        assert_eq!(UnknownSequenceTag::Osc, l.tag);
+        assert!(l.truncated);
+        assert_eq!(osc::TerminatorC::Bel, l.terminator);
+        assert_eq!(b"7400;abc", l.content.as_slice());
+
+        // Aborted unknown OSCs and supported OSCs are not reported.
+        vw(t, b"\x1B]7400;x\x18\x1B]2;title\x07");
+        assert_eq!(4, COUNT.get());
+
+        // Clearing the callback restores the null fast path immediately.
+        assert_eq!(Result::Success, sopt(t, Option::UnknownSequence, std::ptr::null()));
+        assert!(wr(t).stream.handler.unknown_sequence.is_none());
+        vw(t, before_callback);
+        vw(t, osc_st);
+        assert_eq!(4, COUNT.get());
+
+        // A NULL limit disables capture even after reinstalling the callback.
+        assert_eq!(Result::Success, sopt(t, Option::UnknownSequence, cb));
+        assert_eq!(Result::Success, sopt(t, Option::UnknownMaxBytes, std::ptr::null()));
+        assert_eq!(0, wr(t).stream.handler.apc_handler.unknown_max_bytes);
+        assert_eq!(0, wr(t).stream.parser.osc_parser.unknown_max_bytes);
+        vw(t, before_callback);
+        vw(t, osc_st);
+        assert_eq!(4, COUNT.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_pwd_changed_callback() {
+        let t = new_t(80, 24);
+
+        let mut sentinel: u8 = 88;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(Result::Success, sopt(t, Option::PwdChanged, count_cb as PwdChangedFn as *const c_void));
+
+        // OSC 7 ; file:///tmp ST — report pwd
+        vw(t, b"\x1B]7;file:///tmp\x1B\\");
+        assert_eq!(1, COUNT.get());
+        assert_eq!(o(&mut sentinel), UD.get());
+        assert_eq!(Some(&b"file:///tmp"[..]), zt(t).get_pwd());
+
+        // Another pwd change
+        vw(t, b"\x1B]7;file:///home/user\x1B\\");
+        assert_eq!(2, COUNT.get());
+        assert_eq!(Some(&b"file:///home/user"[..]), zt(t).get_pwd());
+        unsafe { free(t) };
+    }
+
+    /// Capture state for the clipboard write callbacks.
+    #[derive(Clone, Default)]
+    struct ClipWriteState {
+        count: usize,
+        last_terminal: usize,
+        last_userdata: usize,
+        last_size: usize,
+        last_location: c_int,
+        last_contents_null: bool,
+        last_contents_len: usize,
+        last_mimes: Vec<Vec<u8>>,
+        last_data: Vec<Vec<u8>>,
+        last_name_len: usize,
+        last_granted: bool,
+        last_can_remember: bool,
+        next_result: c_int,
+        next_remember: bool,
+    }
+
+    thread_local! {
+        static CW: RefCell<ClipWriteState> = RefCell::new(ClipWriteState::default());
+    }
+
+    fn cw() -> ClipWriteState {
+        CW.with(|c| c.borrow().clone())
+    }
+
+    fn cw_mut(f: impl FnOnce(&mut ClipWriteState)) {
+        CW.with(|c| f(&mut c.borrow_mut()))
+    }
+
+    unsafe extern "C" fn clipboard_write_cb(terminal_: Terminal, ud: *mut c_void, request: *const ClipboardWrite) {
+        let r = &*request;
+        let contents: &[ClipboardContent] = super::super::types::slice_or_empty(r.contents, r.contents_len);
+        let (next_result, next_remember) = CW.with(|c| {
+            let mut s = c.borrow_mut();
+            s.count += 1;
+            s.last_terminal = terminal_ as usize;
+            s.last_userdata = ud as usize;
+            s.last_size = r.size;
+            s.last_location = r.location.0;
+            s.last_contents_null = r.contents.is_null();
+            s.last_contents_len = r.contents_len;
+            s.last_name_len = r.name.len;
+            s.last_granted = r.granted;
+            s.last_can_remember = r.can_remember;
+            if !r.contents.is_null() {
+                s.last_mimes = contents.iter().map(|c| cs(c.mime)).collect();
+                s.last_data = contents.iter().map(|c| cs(c.data)).collect();
+            }
+            (s.next_result, s.next_remember)
+        });
+        (r.reply)(
+            request,
+            &ClipboardWriteReply {
+                size: std::mem::size_of::<ClipboardWriteReply>(),
+                result: clipboard::WriteStatus(next_result),
+                remember: next_remember,
+            },
+        );
+    }
+
+    #[test]
+    fn set_clipboard_write_callback() {
+        let t = new_t(80, 24);
+        cw_mut(|s| s.next_result = clipboard::WriteStatus::DENIED.0);
+
+        let mut sentinel: u8 = 88;
+        assert_eq!(Result::Success, sopt(t, Option::Userdata, o(&mut sentinel)));
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ClipboardWrite, clipboard_write_cb as ClipboardWriteFn as *const c_void)
+        );
+
+        // Split OSC 52 write whose decoded payload contains an embedded NUL.
+        vw(t, b"\x1B]52;c;aGVs");
+        vw(t, b"bG8Ad29ybGQ=\x1B\\");
+        let s = cw();
+        assert_eq!(1, s.count);
+        assert_eq!(t as usize, s.last_terminal);
+        assert_eq!(o(&mut sentinel) as usize, s.last_userdata);
+        assert_eq!(std::mem::size_of::<ClipboardWrite>(), s.last_size);
+        assert_eq!(clipboard::Location::STANDARD.0, s.last_location);
+        assert!(!s.last_contents_null);
+        assert_eq!(1, s.last_contents_len);
+        assert_eq!(b"text/plain", s.last_mimes[0].as_slice());
+        assert_eq!(b"hello\x00world", s.last_data[0].as_slice());
+
+        // OSC 52 carries no program identity or password grant state.
+        assert_eq!(0, s.last_name_len);
+        assert!(!s.last_granted);
+        assert!(!s.last_can_remember);
+
+        // OSC 52 destinations are normalized rather than exposed as wire bytes.
+        for (selector, expected) in [
+            (b's', clipboard::Location::SELECTION),
+            (b'p', clipboard::Location::PRIMARY),
+            (b'q', clipboard::Location::STANDARD),
+        ] {
+            let seq = [0x1B, b']', b'5', b'2', b';', selector, b';', b'e', b'A', b'=', b'=', 0x1B, b'\\'];
+            vw(t, &seq);
+            assert_eq!(expected.0, cw().last_location);
+        }
+        assert_eq!(4, cw().count);
+
+        // An empty content list is a clear and retains a null descriptor pointer.
+        vw(t, b"\x1B]52;s;\x1B\\");
+        let s = cw();
+        assert_eq!(5, s.count);
+        assert_eq!(clipboard::Location::SELECTION.0, s.last_location);
+        assert!(s.last_contents_null);
+        assert_eq!(0, s.last_contents_len);
+
+        // Read requests and malformed base64 must never reach the callback.
+        vw(t, b"\x1B]52;c;?\x1B\\");
+        vw(t, b"\x1B]52;c;%%%\x1B\\");
+        assert_eq!(5, cw().count);
+
+        // iTerm2 Copy reaches the same normalized callback.
+        vw(t, b"\x1B]1337;Copy=:aVRlcm0=\x1B\\");
+        let s = cw();
+        assert_eq!(6, s.count);
+        assert_eq!(clipboard::Location::STANDARD.0, s.last_location);
+        assert_eq!(b"text/plain", s.last_mimes[0].as_slice());
+        assert_eq!(b"iTerm", s.last_data[0].as_slice());
+
+        // Every representation is converted, and callback replies propagate
+        // back through the C trampoline for protocols that can acknowledge
+        // writes.
+        let internal_contents = [
+            clipboard::Content {
+                mime: b"text/plain",
+                data: b"plain",
+            },
+            clipboard::Content {
+                mime: b"application/octet-stream",
+                data: b"a\x00b",
+            },
+            clipboard::Content {
+                mime: b"text/html",
+                data: b"<b>plain</b>",
+            },
+            clipboard::Content {
+                mime: b"text/rtf",
+                data: b"{\\rtf1 plain}",
+            },
+            clipboard::Content {
+                mime: b"image/png",
+                data: b"\x89PNG",
+            },
+        ];
+        thread_local! {
+            static REPLY_LAST: Cell<std::option::Option<clipboard::WriteResult>> = const { Cell::new(None) };
+        }
+        fn reply(_: *mut c_void, result: clipboard::WriteResult) {
+            REPLY_LAST.set(Some(result));
+        }
+        cw_mut(|s| s.next_result = clipboard::WriteStatus::BUSY.0);
+        let handler: *mut Handler<'static> = &mut wr(t).stream.handler;
+        unsafe {
+            let f = (*handler).effects.clipboard_write.unwrap();
+            f(
+                &mut *handler,
+                clipboard::Write {
+                    location: clipboard::Location::PRIMARY,
+                    contents: &internal_contents,
+                    name: b"app",
+                    granted: true,
+                    can_remember: true,
+                    reply_ctx: handler as *mut c_void,
+                    reply_fn: reply,
+                },
+            );
+        }
+        assert_eq!(Some(clipboard::WriteResult::Busy), REPLY_LAST.get());
+        let s = cw();
+        assert_eq!(3, s.last_name_len);
+        assert!(s.last_granted);
+        assert!(s.last_can_remember);
+        assert_eq!(7, s.count);
+        assert_eq!(5, s.last_contents_len);
+        assert_eq!(b"application/octet-stream", s.last_mimes[1].as_slice());
+        assert_eq!(b"a\x00b", s.last_data[1].as_slice());
+        assert_eq!(b"image/png", s.last_mimes[4].as_slice());
+        assert_eq!(b"\x89PNG", s.last_data[4].as_slice());
+
+        // Removing the callback takes effect immediately and uninstalls
+        // the trampoline.
+        assert_eq!(Result::Success, sopt(t, Option::ClipboardWrite, std::ptr::null()));
+        assert!(wr(t).stream.handler.effects.clipboard_write.is_none());
+        vw(t, b"\x1B]52;c;eA==\x1B\\");
+        assert_eq!(7, cw().count);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn clipboard_write_without_callback_is_unsupported_and_silent() {
+        let t = new_t(80, 24);
+
+        // OSC 52 without a callback should not crash
+        vw(t, b"\x1B]52;c;aGVsbG8=\x1B\\");
+
+        // No trampoline is installed until a callback is set, so the
+        // stream skips clipboard work (and never spools a Kitty clipboard
+        // transaction it can't deliver).
+        assert!(wr(t).stream.handler.effects.clipboard_write.is_none());
+        unsafe { free(t) };
+    }
+
+    /// Capture state for the clipboard read callbacks.
+    #[derive(Clone, Default)]
+    struct ClipReadState {
+        count: usize,
+        last_size: usize,
+        last_location: c_int,
+        last_mimes_len: usize,
+        last_mime_is_text: bool,
+        last_list: bool,
+        last_name_len: usize,
+        last_granted: bool,
+        last_can_remember: bool,
+        result: c_int,
+    }
+
+    thread_local! {
+        static CR: RefCell<ClipReadState> = RefCell::new(ClipReadState::default());
+    }
+
+    fn cr() -> ClipReadState {
+        CR.with(|c| c.borrow().clone())
+    }
+
+    unsafe extern "C" fn clipboard_read_cb(_: Terminal, _: *mut c_void, request: *const ClipboardRead) {
+        let r = &*request;
+        let mimes: &[LibString] = super::super::types::slice_or_empty(r.mimes, r.mimes_len);
+        let result = CR.with(|c| {
+            let mut s = c.borrow_mut();
+            s.count += 1;
+            s.last_size = r.size;
+            s.last_location = r.location.0;
+            s.last_mimes_len = r.mimes_len;
+            s.last_mime_is_text = r.mimes_len > 0 && cs(mimes[0]) == b"text/plain";
+            s.last_list = r.list;
+            s.last_name_len = r.name.len;
+            s.last_granted = r.granted;
+            s.last_can_remember = r.can_remember;
+            s.result
+        });
+
+        let contents = [ClipboardContent {
+            mime: LibString::init(b"text/plain"),
+            data: LibString::init(b"hello"),
+        }];
+        (r.reply)(
+            request,
+            &ClipboardReadReply {
+                size: std::mem::size_of::<ClipboardReadReply>(),
+                result: clipboard::ReadStatus(result),
+                contents: contents.as_ptr(),
+                contents_len: contents.len(),
+                available: std::ptr::null(),
+                available_len: 0,
+                remember: false,
+            },
+        );
+    }
+
+    #[test]
+    fn kitty_clipboard_write_via_c_effects() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ClipboardWrite, clipboard_write_cb as ClipboardWriteFn as *const c_void)
+        );
+
+        // A full OSC 5522 write transaction: begin, chunked data for two
+        // representations, commit. Only the commit invokes the callback,
+        // and its result maps to the DONE response.
+        let seqs: [&[u8]; 5] = [
+            b"\x1B]5522;type=write:id=c1\x1B\\",
+            b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;R2hvc3Q=\x1B\\", // "Ghost"
+            b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;dHk=\x1B\\",     // "ty"
+            b"\x1B]5522;type=wdata:mime=dGV4dC9odG1s;PGI+aGk8L2I+\x1B\\", // "<b>hi</b>"
+            b"\x1B]5522;type=wdata\x1B\\",
+        ];
+        for seq in seqs {
+            vw(t, seq);
+        }
+
+        let s = cw();
+        assert_eq!(1, s.count);
+        assert_eq!(clipboard::Location::STANDARD.0, s.last_location);
+        assert_eq!(2, s.last_contents_len);
+        assert_eq!(b"text/plain", s.last_mimes[0].as_slice());
+        assert_eq!(b"Ghostty", s.last_data[0].as_slice());
+        assert_eq!(b"text/html", s.last_mimes[1].as_slice());
+        assert_eq!(b"<b>hi</b>", s.last_data[1].as_slice());
+        assert_eq!(b"\x1B]5522;type=write:status=DONE:id=c1\x1B\\".to_vec(), all_written());
+        assert!(!s.last_granted);
+        assert!(!s.last_can_remember);
+
+        // Password grants round-trip through the C reply: the first pw'd
+        // commit isn't granted and asks to remember, so the next one
+        // arrives granted.
+        clear_all();
+        cw_mut(|s| s.next_remember = true);
+        let grant_seqs: [&[u8]; 4] = [
+            b"\x1B]5522;type=write:id=g1:pw=c2VjcmV0:name=YXBw\x1B\\",
+            b"\x1B]5522;type=wdata\x1B\\",
+            b"\x1B]5522;type=write:id=g2:pw=c2VjcmV0:name=YXBw\x1B\\",
+            b"\x1B]5522;type=wdata\x1B\\",
+        ];
+        for seq in grant_seqs {
+            vw(t, seq);
+        }
+        let s = cw();
+        assert_eq!(3, s.count);
+        assert!(s.last_granted);
+        assert!(s.last_can_remember);
+        assert_eq!(
+            b"\x1B]5522;type=write:status=DONE:id=g1\x1B\\\x1B]5522;type=write:status=DONE:id=g2\x1B\\".to_vec(),
+            all_written()
+        );
+        cw_mut(|s| s.next_remember = false);
+
+        // Without a read callback reads are denied.
+        clear_all();
+        vw(t, b"\x1B]5522;type=read:id=r1;dGV4dC9wbGFpbg==\x1B\\");
+        assert_eq!(3, cw().count);
+        assert_eq!(b"\x1B]5522;type=read:status=EPERM:id=r1\x1B\\".to_vec(), all_written());
+
+        // With a read callback the request is served through it.
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ClipboardRead, clipboard_read_cb as ClipboardReadFn as *const c_void)
+        );
+        clear_all();
+        // name="app" without a password: forwarded for prompts, not
+        // rememberable.
+        vw(t, b"\x1B]5522;type=read:id=r2:name=YXBw;dGV4dC9wbGFpbg==\x1B\\");
+        let r = cr();
+        assert_eq!(1, r.count);
+        assert_eq!(1, r.last_mimes_len);
+        assert!(r.last_mime_is_text);
+        assert!(!r.last_list);
+        assert_eq!(3, r.last_name_len);
+        assert!(!r.last_granted);
+        assert!(!r.last_can_remember);
+        assert_eq!(
+            concat!(
+                "\x1B]5522;type=read:status=OK:id=r2\x1B\\",
+                "\x1B]5522;type=read:status=DATA:id=r2:mime=dGV4dC9wbGFpbg==;aGVsbG8=\x1B\\",
+                "\x1B]5522;type=read:status=DONE:id=r2\x1B\\",
+            )
+            .as_bytes()
+            .to_vec(),
+            all_written()
+        );
+
+        // Without a clipboard callback the transaction fails up front.
+        assert_eq!(Result::Success, sopt(t, Option::ClipboardWrite, std::ptr::null()));
+        clear_all();
+        vw(t, b"\x1B]5522;type=write:id=c2\x1B\\");
+        assert_eq!(b"\x1B]5522;type=write:status=ENOSYS:id=c2\x1B\\".to_vec(), all_written());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_clipboard_write_max_bytes() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ClipboardWrite, clipboard_write_cb as ClipboardWriteFn as *const c_void)
+        );
+
+        // The built-in default reads back.
+        let mut max: usize = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ClipboardWriteMaxBytes, o(&mut max)));
+        assert_eq!(kitty_clipboard::MAX_WRITE_SIZE, max);
+
+        // Set a tiny limit; an oversized text write fails with EFBIG and
+        // never reaches the callback.
+        let limit: usize = 4;
+        assert_eq!(Result::Success, sopt(t, Option::ClipboardWriteMaxBytes, p(&limit)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ClipboardWriteMaxBytes, o(&mut max)));
+        assert_eq!(limit, max);
+
+        let seqs: [&[u8]; 4] = [
+            b"\x1B]5522;type=write:id=c1\x1B\\",
+            b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;SGVsbA==\x1B\\", // "Hell"
+            b"\x1B]5522;type=wdata:mime=dGV4dC9wbGFpbg==;bw==\x1B\\",     // "o"
+            b"\x1B]5522;type=wdata\x1B\\",
+        ];
+        for seq in seqs {
+            vw(t, seq);
+        }
+        assert_eq!(0, cw().count);
+        assert_eq!(b"\x1B]5522;type=write:status=EFBIG:id=c1\x1B\\".to_vec(), all_written());
+
+        // A NULL value reverts to the built-in default.
+        assert_eq!(Result::Success, sopt(t, Option::ClipboardWriteMaxBytes, std::ptr::null()));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ClipboardWriteMaxBytes, o(&mut max)));
+        assert_eq!(kitty_clipboard::MAX_WRITE_SIZE, max);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_clipboard_read_callback() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        // Without a callback the handler effect is unset and reads are silent.
+        assert!(wr(t).stream.handler.effects.clipboard_read.is_none());
+        let read_st = b"\x1B]52;c;?\x1B\\";
+        vw(t, read_st);
+        assert!(last().is_none());
+
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::ClipboardRead, clipboard_read_cb as ClipboardReadFn as *const c_void)
+        );
+        assert!(wr(t).stream.handler.effects.clipboard_read.is_some());
+
+        vw(t, b"\x1B]52;p;?\x07");
+        let r = cr();
+        assert_eq!(1, r.count);
+        assert_eq!(std::mem::size_of::<ClipboardRead>(), r.last_size);
+        assert_eq!(clipboard::Location::PRIMARY.0, r.last_location);
+        assert_eq!(1, r.last_mimes_len);
+        assert!(r.last_mime_is_text);
+        assert!(!r.last_list);
+        assert_eq!(0, r.last_name_len);
+        assert!(!r.last_granted);
+        assert!(!r.last_can_remember);
+        assert_eq!(Some(b"\x1B]52;p;aGVsbG8=\x07".to_vec()), last());
+
+        // Denied replies with an empty clipboard.
+        CR.with(|c| c.borrow_mut().result = clipboard::ReadStatus::DENIED.0);
+        vw(t, read_st);
+        assert_eq!(2, cr().count);
+        assert_eq!(Some(b"\x1B]52;c;\x1B\\".to_vec()), last());
+
+        // Clearing the callback uninstalls the handler effect.
+        assert_eq!(Result::Success, sopt(t, Option::ClipboardRead, std::ptr::null()));
+        assert!(wr(t).stream.handler.effects.clipboard_read.is_none());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn pwd_changed_without_callback_is_silent() {
+        let t = new_t(80, 24);
+        // OSC 7 without a callback should not crash, but should still set the pwd
+        vw(t, b"\x1B]7;file:///tmp\x1B\\");
+        assert_eq!(Some(&b"file:///tmp"[..]), zt(t).get_pwd());
+        unsafe { free(t) };
+    }
+
+    unsafe extern "C" fn size_cb(_: Terminal, _: *mut c_void, out_size: *mut size_report::Size) -> bool {
+        COUNT.set(COUNT.get() + 1);
+        *out_size = size_report::Size {
+            rows: 24,
+            columns: 80,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        true
+    }
+
+    #[test]
+    fn set_size_callback() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::Size, size_cb as SizeFn as *const c_void));
+
+        // CSI 18 t — report text area size in characters
+        vw(t, b"\x1B[18t");
+        assert_eq!(Some(b"\x1b[8;24;80t".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn size_without_callback_is_silent() {
+        let t = new_t(80, 24);
+        // CSI 18 t without a size callback should not crash
+        vw(t, b"\x1B[18t");
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn mode_2048_enable_and_disable_use_c_callbacks() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::Size, size_cb as SizeFn as *const c_void));
+
+        let enable = b"\x1B[?2048h";
+        let disable = b"\x1B[?2048l";
+        vw(t, enable);
+        vw(t, enable);
+
+        assert_eq!(2, CALLS.get());
+        assert_eq!(Some(b"\x1B[48;24;80;384;640t".to_vec()), last());
+        vw(t, disable);
+
+        assert_eq!(2, CALLS.get());
+        assert!(!zt(t).modes.get(Mode::InBandSizeReports));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn mode_2048_enable_tolerates_missing_c_callbacks() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        let sequence = b"\x1B[?2048h";
+        vw(t, sequence);
+
+        assert_eq!(0, CALLS.get());
+        assert!(zt(t).modes.get(Mode::InBandSizeReports));
+        let no_write = new_t(80, 24);
+        assert_eq!(Result::Success, sopt(no_write, Option::Size, size_cb as SizeFn as *const c_void));
+        vw(no_write, sequence);
+        assert_eq!(1, COUNT.get());
+        assert!(zt(no_write).modes.get(Mode::InBandSizeReports));
+        unsafe {
+            free(no_write);
+            free(t);
+        }
+    }
+
+    thread_local! {
+        static DA: Cell<std::option::Option<DeviceAttributes>> = const { Cell::new(None) };
+    }
+
+    unsafe extern "C" fn da_cb(_: Terminal, _: *mut c_void, out: *mut DeviceAttributes) -> bool {
+        match DA.get() {
+            Some(da) => {
+                *out = da;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn da(conformance_level: u16, features: &[u16], device_type: u16, firmware_version: u16, unit_id: u32) -> DeviceAttributes {
+        let mut f = [0u16; 64];
+        f[..features.len()].copy_from_slice(features);
+        DeviceAttributes {
+            primary: DeviceAttributesPrimary {
+                conformance_level,
+                features: f,
+                num_features: features.len(),
+            },
+            secondary: DeviceAttributesSecondary {
+                device_type,
+                firmware_version,
+                rom_cartridge: 0,
+            },
+            tertiary: DeviceAttributesTertiary { unit_id },
+        }
+    }
+
+    fn da_terminal(attrs: std::option::Option<DeviceAttributes>) -> Terminal {
+        DA.set(attrs);
+        let t = new_t(80, 24);
+        set_write_pty(t);
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::DeviceAttributes, da_cb as DeviceAttributesFn as *const c_void)
+        );
+        t
+    }
+
+    #[test]
+    fn set_device_attributes_callback_primary() {
+        let t = da_terminal(Some(da(64, &[22, 52], 1, 10, 0)));
+        // CSI c — primary DA
+        vw(t, b"\x1B[c");
+        assert_eq!(Some(b"\x1b[?64;22;52c".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_device_attributes_callback_secondary() {
+        let t = da_terminal(Some(da(62, &[22], 1, 10, 0)));
+        // CSI > c — secondary DA
+        vw(t, b"\x1B[>c");
+        assert_eq!(Some(b"\x1b[>1;10;0c".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_device_attributes_callback_tertiary() {
+        let t = da_terminal(Some(da(62, &[], 1, 0, 0xAABBCCDD)));
+        // CSI = c — tertiary DA
+        vw(t, b"\x1B[=c");
+        assert_eq!(Some(b"\x1bP!|AABBCCDD\x1b\\".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn device_attributes_without_callback_uses_default() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        // Without setting a device_attributes callback, DA1 should return the default
+        vw(t, b"\x1B[c");
+        assert_eq!(Some(b"\x1b[?62;22c".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn device_attributes_callback_returns_false_uses_default() {
+        // Callback returns false, should use default response
+        let t = da_terminal(None);
+        vw(t, b"\x1B[c");
+        assert_eq!(Some(b"\x1b[?62;22c".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    fn get_string(t: Terminal, data: TerminalData) -> Vec<u8> {
+        let mut s = LibString {
+            ptr: std::ptr::null(),
+            len: 99,
+        };
+        assert_eq!(Result::Success, gdat(t, data, o(&mut s)));
+        cs(s)
+    }
+
+    #[test]
+    fn set_and_get_title() {
+        let t = new_t(80, 24);
+
+        // No title set yet — should return empty string
+        assert!(get_string(t, TerminalData::Title).is_empty());
+
+        // Set title via option
+        let hello = LibString::init(b"Hello");
+        assert_eq!(Result::Success, sopt(t, Option::Title, p(&hello)));
+        assert_eq!(b"Hello", get_string(t, TerminalData::Title).as_slice());
+
+        // Overwrite title
+        let world = LibString::init(b"World");
+        assert_eq!(Result::Success, sopt(t, Option::Title, p(&world)));
+        assert_eq!(b"World", get_string(t, TerminalData::Title).as_slice());
+
+        // Clear title with NULL
+        assert_eq!(Result::Success, sopt(t, Option::Title, std::ptr::null()));
+        assert!(get_string(t, TerminalData::Title).is_empty());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_and_get_pwd() {
+        let t = new_t(80, 24);
+
+        // No pwd set yet — should return empty string
+        assert!(get_string(t, TerminalData::Pwd).is_empty());
+
+        // Set pwd via option
+        let home = LibString::init(b"/home/user");
+        assert_eq!(Result::Success, sopt(t, Option::Pwd, p(&home)));
+        assert_eq!(b"/home/user", get_string(t, TerminalData::Pwd).as_slice());
+
+        // Clear pwd with NULL
+        assert_eq!(Result::Success, sopt(t, Option::Pwd, std::ptr::null()));
+        assert!(get_string(t, TerminalData::Pwd).is_empty());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_title_set_via_vt_write() {
+        let t = new_t(80, 24);
+        // Set title via OSC 2
+        vw(t, b"\x1B]2;VT Title\x1B\\");
+        assert_eq!(b"VT Title", get_string(t, TerminalData::Title).as_slice());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn title_report_requires_explicit_opt_in() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        let query_title = b"\x1B[21t";
+        vw(t, b"\x1B]2;echo vulnerable\x1B\\");
+
+        // WRITE_PTY alone must not enable the security-sensitive response.
+        vw(t, query_title);
+        assert!(last().is_none());
+
+        let enabled = true;
+        assert_eq!(Result::Success, sopt(t, Option::TitleReport, p(&enabled)));
+        vw(t, query_title);
+        assert_eq!(Some(b"\x1b]lecho vulnerable\x1b\\".to_vec()), last());
+
+        // NULL restores the secure default.
+        clear_last();
+        assert_eq!(Result::Success, sopt(t, Option::TitleReport, std::ptr::null()));
+        vw(t, query_title);
+        assert!(last().is_none());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn checksum_report_requires_explicit_opt_in() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        let query = b"\x1B[1;1;1;1;1;5*y";
+        vw(t, b"hello");
+
+        // WRITE_PTY alone must not enable the security-sensitive response.
+        vw(t, query);
+        assert!(last().is_none());
+
+        let enabled = true;
+        assert_eq!(Result::Success, sopt(t, Option::XtChecksumReport, p(&enabled)));
+        vw(t, query);
+        assert_eq!(Some(b"\x1bP1!~FDEC\x1b\\".to_vec()), last());
+
+        // NULL restores the secure default.
+        clear_last();
+        assert_eq!(Result::Success, sopt(t, Option::XtChecksumReport, std::ptr::null()));
+        vw(t, query);
+        assert!(last().is_none());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn checksum_extension_survives_resets() {
+        let t = new_t(80, 24);
+
+        let enabled = true;
+        set_write_pty(t);
+        assert_eq!(Result::Success, sopt(t, Option::XtChecksumReport, p(&enabled)));
+
+        // Don't negate the result.
+        let positive: u8 = 1;
+        assert_eq!(Result::Success, sopt(t, Option::XtChecksumExtension, p(&positive)));
+
+        let text = b"hello";
+        let query = b"\x1B[1;1;1;1;1;5*y";
+        vw(t, text);
+        vw(t, query);
+        assert_eq!(Some(b"\x1bP1!~0214\x1b\\".to_vec()), last());
+
+        // A reset restores the configured calculation, not the DEC one.
+        vw(t, b"\x1B[0#y");
+        vw(t, b"\x1Bc");
+        vw(t, text);
+        vw(t, query);
+        assert_eq!(Some(b"\x1bP1!~0214\x1b\\".to_vec()), last());
+
+        // NULL restores the DEC calculation.
+        assert_eq!(Result::Success, sopt(t, Option::XtChecksumExtension, std::ptr::null()));
+        vw(t, query);
+        assert_eq!(Some(b"\x1bP1!~FDEC\x1b\\".to_vec()), last());
+
+        let invalid: u8 = 32;
+        assert_eq!(Result::InvalidValue, sopt(t, Option::XtChecksumExtension, p(&invalid)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_updates_pixel_dimensions() {
+        let t = new_t(80, 24);
+
+        // Pixel geometry must still be applied when the cell dimensions match.
+        assert_eq!(Result::Success, unsafe { resize(t, 80, 24, 9, 18) });
+        assert_eq!(80 * 9, zt(t).width_px);
+        assert_eq!(24 * 18, zt(t).height_px);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_pixel_overflow_saturates() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::Success, unsafe { resize(t, 100, 40, u32::MAX, u32::MAX) });
+        assert_eq!(u32::MAX, zt(t).width_px);
+        assert_eq!(u32::MAX, zt(t).height_px);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_disables_synchronized_output() {
+        let t = new_t(80, 24);
+        zt(t).modes.set(Mode::SynchronizedOutput, true);
+
+        // The terminal-level reset must run even if grid work is unnecessary.
+        assert_eq!(Result::Success, unsafe { resize(t, 80, 24, 9, 18) });
+        assert!(!zt(t).modes.get(Mode::SynchronizedOutput));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_sends_in_band_size_report() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        // Enable in-band size reports (mode 2048)
+        zt(t).modes.set(Mode::InBandSizeReports, true);
+
+        assert_eq!(Result::Success, unsafe { resize(t, 100, 40, 9, 18) });
+
+        // Expected: \x1B[48;rows;cols;height_px;width_pxt
+        // height_px = 40*18 = 720, width_px = 100*9 = 900
+        assert_eq!(Some(b"\x1B[48;40;100;720;900t".to_vec()), last());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_no_size_report_without_mode_2048() {
+        let t = new_t(80, 24);
+        set_write_pty(t);
+
+        // in_band_size_reports is off by default
+        assert_eq!(Result::Success, unsafe { resize(t, 100, 40, 9, 18) });
+        assert_eq!(0, CALLS.get());
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_in_band_report_without_write_pty_callback() {
+        let t = new_t(80, 24);
+
+        // Enable mode 2048 but don't set a write_pty callback — should not crash
+        zt(t).modes.set(Mode::InBandSizeReports, true);
+        assert_eq!(Result::Success, unsafe { resize(t, 100, 40, 9, 18) });
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_null_terminal() {
+        assert_eq!(Result::InvalidValue, unsafe { resize(std::ptr::null_mut(), 100, 40, 9, 18) });
+    }
+
+    #[test]
+    fn resize_zero_cols() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::InvalidValue, unsafe { resize(t, 0, 40, 9, 18) });
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_zero_rows() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::InvalidValue, unsafe { resize(t, 100, 0, 9, 18) });
+        unsafe { free(t) };
+    }
+
+    fn rgbc(r: u8, g: u8, b: u8) -> color::RgbC {
+        color::RgbC { r, g, b }
+    }
+
+    fn color_roundtrip(option: Option, data: TerminalData, value: color::RgbC) {
+        let t = new_t(80, 24);
+
+        // Initially unset
+        let mut rgb = rgbc(0, 0, 0);
+        assert_eq!(Result::NoValue, gdat(t, data, o(&mut rgb)));
+
+        // Set a value
+        assert_eq!(Result::Success, sopt(t, option, p(&value)));
+        assert_eq!(Result::Success, gdat(t, data, o(&mut rgb)));
+        assert_eq!(value, rgb);
+
+        // Clear with null
+        assert_eq!(Result::Success, sopt(t, option, std::ptr::null()));
+        assert_eq!(Result::NoValue, gdat(t, data, o(&mut rgb)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_and_get_color_foreground() {
+        color_roundtrip(Option::ColorForeground, TerminalData::ColorForeground, rgbc(0xAA, 0xBB, 0xCC));
+    }
+
+    #[test]
+    fn set_and_get_color_background() {
+        color_roundtrip(Option::ColorBackground, TerminalData::ColorBackground, rgbc(0x11, 0x22, 0x33));
+    }
+
+    #[test]
+    fn set_and_get_color_cursor() {
+        color_roundtrip(Option::ColorCursor, TerminalData::ColorCursor, rgbc(0xFF, 0x00, 0x88));
+    }
+
+    #[test]
+    fn set_and_get_color_palette() {
+        let t = new_t(80, 24);
+
+        // Get default palette
+        let mut palette: color::PaletteC = [rgbc(0, 0, 0); 256];
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorPalette, o(&mut palette)));
+        assert_eq!(color::DEFAULT[0].cval(), palette[0]);
+
+        // Set custom palette
+        let mut custom = color::palette_cval(&color::DEFAULT);
+        custom[0] = rgbc(0x12, 0x34, 0x56);
+        assert_eq!(Result::Success, sopt(t, Option::ColorPalette, p(&custom)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorPalette, o(&mut palette)));
+        assert_eq!(custom[0], palette[0]);
+
+        // Reset with null restores default
+        assert_eq!(Result::Success, sopt(t, Option::ColorPalette, std::ptr::null()));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorPalette, o(&mut palette)));
+        assert_eq!(color::DEFAULT[0].cval(), palette[0]);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_color_default_vs_effective_with_override() {
+        let t = new_t(80, 24);
+        let mut rgb = rgbc(1, 1, 1);
+
+        // Set defaults
+        let fg = rgbc(0xAA, 0xBB, 0xCC);
+        let bg = rgbc(0x11, 0x22, 0x33);
+        let cur = rgbc(0xFF, 0x00, 0x88);
+        assert_eq!(Result::Success, sopt(t, Option::ColorForeground, p(&fg)));
+        assert_eq!(Result::Success, sopt(t, Option::ColorBackground, p(&bg)));
+        assert_eq!(Result::Success, sopt(t, Option::ColorCursor, p(&cur)));
+
+        // Simulate OSC overrides
+        let ov = color::Rgb { r: 0, g: 0, b: 0 };
+        zt(t).colors.foreground.r#override = Some(ov);
+        zt(t).colors.background.r#override = Some(ov);
+        zt(t).colors.cursor.r#override = Some(ov);
+
+        // Effective returns override
+        for data in [TerminalData::ColorForeground, TerminalData::ColorBackground, TerminalData::ColorCursor] {
+            assert_eq!(Result::Success, gdat(t, data, o(&mut rgb)));
+            assert_eq!(ov.cval(), rgb);
+        }
+
+        // Default returns original
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorForegroundDefault, o(&mut rgb)));
+        assert_eq!(fg, rgb);
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorBackgroundDefault, o(&mut rgb)));
+        assert_eq!(bg, rgb);
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorCursorDefault, o(&mut rgb)));
+        assert_eq!(cur, rgb);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_color_default_returns_no_value_when_unset() {
+        let t = new_t(80, 24);
+        let mut rgb = rgbc(0, 0, 0);
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ColorForegroundDefault, o(&mut rgb)));
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ColorBackgroundDefault, o(&mut rgb)));
+        assert_eq!(Result::NoValue, gdat(t, TerminalData::ColorCursorDefault, o(&mut rgb)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_color_palette_default_vs_current() {
+        let t = new_t(80, 24);
+
+        // Set a custom default palette
+        let mut custom = color::palette_cval(&color::DEFAULT);
+        custom[0] = rgbc(0x12, 0x34, 0x56);
+        assert_eq!(Result::Success, sopt(t, Option::ColorPalette, p(&custom)));
+
+        // Simulate OSC override on index 0
+        zt(t).colors.palette.set(0, color::Rgb { r: 0xFF, g: 0xFF, b: 0xFF });
+
+        // Current palette returns the override
+        let mut palette: color::PaletteC = [rgbc(0, 0, 0); 256];
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorPalette, o(&mut palette)));
+        assert_eq!(rgbc(0xFF, 0xFF, 0xFF), palette[0]);
+
+        // Default palette returns the original
+        assert_eq!(Result::Success, gdat(t, TerminalData::ColorPaletteDefault, o(&mut palette)));
+        assert_eq!(custom[0], palette[0]);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_color_sets_dirty_flag() {
+        let t = new_t(80, 24);
+        zt(t).flags.dirty.palette = false;
+
+        let fg = rgbc(0xFF, 0xFF, 0xFF);
+        assert_eq!(Result::Success, sopt(t, Option::ColorForeground, p(&fg)));
+        assert!(zt(t).flags.dirty.palette);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_glyph_protocol_disables_apc_handling_and_clears_glossary() {
+        if !build_options::GLYPH_PROTOCOL {
+            return;
+        }
+        use crate::terminal::apc::Protocol;
+
+        let t = new_t(80, 24);
+
+        let register = b"\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\";
+        vw(t, register);
+        assert!(zt(t).glyph_glossary.contains(0xE0A0));
+
+        let disabled = false;
+        assert_eq!(Result::Success, sopt(t, Option::GlyphProtocol, p(&disabled)));
+        assert!(!wr(t).stream.handler.apc_handler.enabled.contains(Protocol::Glyph));
+        assert!(!zt(t).glyph_glossary.contains(0xE0A0));
+
+        vw(t, register);
+        assert!(!zt(t).glyph_glossary.contains(0xE0A0));
+
+        let enabled = true;
+        assert_eq!(Result::Success, sopt(t, Option::GlyphProtocol, p(&enabled)));
+        vw(t, register);
+        assert!(zt(t).glyph_glossary.contains(0xE0A0));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_multi_success() {
+        let t = new_t(80, 24);
+
+        let mut cols: u16 = 0;
+        let mut rows: u16 = 0;
+        let mut written: usize = 0;
+
+        let keys = [TerminalData::Cols as c_int, TerminalData::Rows as c_int];
+        let values = [o(&mut cols), o(&mut rows)];
+        assert_eq!(Result::Success, unsafe {
+            get_multi(t, keys.len(), keys.as_ptr(), values.as_ptr(), &mut written)
+        });
+        assert_eq!(keys.len(), written);
+        assert_eq!(80, cols);
+        assert_eq!(24, rows);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_multi_error_sets_out_written() {
+        let t = new_t(80, 24);
+
+        let mut cols: u16 = 0;
+        let mut written: usize = 99;
+
+        let keys = [TerminalData::Cols as c_int, TerminalData::Invalid as c_int];
+        let values = [o(&mut cols), o(&mut cols)];
+        assert_eq!(Result::InvalidValue, unsafe {
+            get_multi(t, keys.len(), keys.as_ptr(), values.as_ptr(), &mut written)
+        });
+        assert_eq!(1, written);
+        assert_eq!(80, cols);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_multi_null_keys_returns_invalid_value() {
+        let mut cols: u16 = 0;
+        let values = [o(&mut cols)];
+        assert_eq!(Result::InvalidValue, unsafe {
+            get_multi(std::ptr::null_mut(), 1, std::ptr::null(), values.as_ptr(), std::ptr::null_mut())
+        });
+    }
+
+    #[test]
+    fn get_mouse_shape() {
+        use crate::terminal::mouse::Shape;
+
+        let t = new_t(80, 24);
+
+        let mut shape: c_int = -1;
+        assert_eq!(Result::Success, gdat(t, TerminalData::MouseShape, o(&mut shape)));
+        assert_eq!(Shape::Text as c_int, shape);
+
+        let cases: [(&[u8], Shape); 7] = [
+            (b"\x1b]22;pointer\x07", Shape::Pointer),
+            (b"\x1b]22;crosshair\x1b\\", Shape::Crosshair),
+            // Invalid names leave the last accepted shape unchanged.
+            (b"\x1b]22;not-a-pointer-shape\x07", Shape::Crosshair),
+            // Hyperlinks don't override the application's requested shape.
+            (b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", Shape::Crosshair),
+            (b"\x1b]22;\x1b\\", Shape::Text),
+            (b"\x1b]22;default\x07", Shape::Default),
+            (b"\x1b]22;text\x07", Shape::Text),
+        ];
+        for (seq, expected) in cases {
+            vw(t, seq);
+            assert_eq!(Result::Success, gdat(t, TerminalData::MouseShape, o(&mut shape)));
+            assert_eq!(expected as c_int, shape);
+        }
+
+        // An incomplete OSC must not update the shape before its terminator.
+        vw(t, b"\x1b]22;wait");
+        assert_eq!(Result::Success, gdat(t, TerminalData::MouseShape, o(&mut shape)));
+        assert_eq!(Shape::Text as c_int, shape);
+        vw(t, b"\x07");
+        assert_eq!(Result::Success, gdat(t, TerminalData::MouseShape, o(&mut shape)));
+        assert_eq!(Shape::Wait as c_int, shape);
+        unsafe { free(t) };
+    }
 }
