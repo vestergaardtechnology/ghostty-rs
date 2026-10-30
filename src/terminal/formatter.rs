@@ -1,9 +1,6 @@
 //! Port of `src/terminal/formatter.zig`.
 //!
-//! STATUS: partial — `Format`, `formatStyled`, `CodepointMap`, `Options`,
-//! `PinMap`, `ScreenFormatter`, `PageListFormatter` and `PageFormatter`
-//! (all emit formats) are ported. `TerminalFormatter` (needs the
-//! `Terminal` port) and all of the formatter tests are pending.
+//! STATUS: ported
 //!
 //! Notes on the port:
 //! - Writers are `std::io::Write` trait objects; Zig's
@@ -16,6 +13,10 @@
 //!   [`CursorOrigin`], `PageFormatter.PointMap` is [`PointMap`] and
 //!   `PageFormatter.TrailingState` is [`TrailingState`].
 //! - `CodepointMap` lists are a `Vec` (Zig: `std.MultiArrayList`).
+//! - `TerminalFormatter.Extra` is [`TerminalFormatterExtra`].
+//! - The tests feed VT input through a private test-only stream handler
+//!   (stand-in for `Terminal.vtStream`, see `TODO(port-dedupe)` in the
+//!   tests).
 
 use std::io::{self, Write};
 
@@ -2586,7 +2587,10 @@ mod tests {
 
     /// Feed bytes to the terminal (Zig: `t.vtStream().nextSlice(bytes)`).
     fn feed(t: &mut Terminal, bytes: impl AsRef<[u8]>) {
-        let mut s = Stream::new(TestHandler { terminal: t });
+        let mut s = Stream::init(crate::terminal::stream::Options {
+            allocator: Some(osc::Allocator::GLOBAL),
+            ..crate::terminal::stream::Options::new(TestHandler { terminal: t })
+        });
         s.next_slice(bytes.as_ref());
     }
 
@@ -3995,5 +3999,1559 @@ mod tests {
         assert_eq!(expected, out);
     }
 
-    // @@TESTS-PART-2@@
+    /// Format a terminal with a pin map. `f` configures the formatter.
+    fn fmt_term(t: &Terminal, opts: Options<'_>, f: impl FnOnce(&mut TerminalFormatter<'_>)) -> (String, PinMapMap) {
+        let mut map = PinMapMap::EMPTY;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut formatter = TerminalFormatter::init(t, opts);
+            f(&mut formatter);
+            formatter.pin_map = Some(PinMap { map: &mut map });
+            formatter.format(&mut buf).unwrap();
+        }
+        (String::from_utf8(buf).unwrap(), map)
+    }
+
+    /// Format a terminal without a pin map.
+    fn fmt_term_nomap(t: &Terminal, opts: Options<'_>, f: impl FnOnce(&mut TerminalFormatter<'_>)) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut formatter = TerminalFormatter::init(t, opts);
+        f(&mut formatter);
+        formatter.format(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Format a screen with a pin map. `f` configures the formatter.
+    fn fmt_screen(s: &Screen, opts: Options<'_>, f: impl FnOnce(&mut ScreenFormatter<'_>)) -> (String, PinMapMap) {
+        let mut map = PinMapMap::EMPTY;
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut formatter = ScreenFormatter::init(s, opts);
+            f(&mut formatter);
+            formatter.pin_map = Some(PinMap { map: &mut map });
+            formatter.format(&mut buf).unwrap();
+        }
+        (String::from_utf8(buf).unwrap(), map)
+    }
+
+    fn act(x: usize, y: usize) -> Point {
+        Point::Active(c(x, y))
+    }
+
+    /// The selection of the active cells from (x0, y0) to (x1, y1).
+    fn sel(t: &Terminal, x0: usize, y0: usize, x1: usize, y1: usize) -> Selection {
+        Selection::init(
+            t.screens.active.pages.pin(act(x0, y0)).unwrap(),
+            t.screens.active.pages.pin(act(x1, y1)).unwrap(),
+            false,
+        )
+    }
+
+    fn dump(t: &Terminal) -> String {
+        t.screens
+            .active
+            .dump_string_alloc(Point::Screen(Coordinate::default()))
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_formatter_plain_no_selection() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+
+        let out = fmt_term_nomap(&t, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", out);
+    }
+
+    #[test]
+    fn terminal_formatter_vt_with_palette() {
+        let mut t = term(80, 24);
+
+        // Modify some palette colors using VT sequences
+        feed(&mut t, "\x1b]4;0;rgb:12/34/56\x1b\\");
+        feed(&mut t, "\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        feed(&mut t, "\x1b]4;255;rgb:ff/00/ff\x1b\\");
+        feed(&mut t, "test");
+
+        let output = fmt_term_nomap(&t, Options::VT, |_| {});
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify the palettes match
+        assert_eq!(t.colors.palette.current[0], t2.colors.palette.current[0]);
+        assert_eq!(t.colors.palette.current[1], t2.colors.palette.current[1]);
+        assert_eq!(t.colors.palette.current[255], t2.colors.palette.current[255]);
+    }
+
+    #[test]
+    fn terminal_formatter_with_selection() {
+        let mut t = term(80, 24);
+        feed(&mut t, "line1\r\nline2\r\nline3");
+
+        let s = sel(&t, 0, 1, 4, 1);
+        let out = fmt_term_nomap(&t, Options::PLAIN, |f| {
+            f.content = ScreenFormatterContent::Selection(Some(s));
+        });
+        assert_eq!("line2", out);
+    }
+
+    #[test]
+    fn terminal_formatter_plain_with_pin_map() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, world");
+
+        let (output, pin_map) = fmt_term(&t, Options::PLAIN, |_| {});
+        assert_eq!("hello, world", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(pin_at(node, i, 0), pin_map.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn terminal_formatter_plain_multiline_with_pin_map() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+
+        let (output, pin_map) = fmt_term(&t, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+
+        // "hello" (5 chars)
+        for i in 0..5 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(0, pin_map.get(i).unwrap().y);
+        }
+
+        // "\n" maps to end of first line
+        assert_eq!(node, pin_map.get(5).unwrap().node);
+
+        // "world" (5 chars)
+        for i in 0..5 {
+            let idx = 6 + i;
+            assert_eq!(node, pin_map.get(idx).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(idx).unwrap().x);
+            assert_eq!(1, pin_map.get(idx).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn terminal_formatter_vt_with_palette_and_pin_map() {
+        let mut t = term(80, 24);
+
+        // Modify some palette colors using VT sequences
+        feed(&mut t, "\x1b]4;0;rgb:12/34/56\x1b\\");
+        feed(&mut t, "test");
+
+        let (output, pin_map) = fmt_term(&t, Options::VT, |_| {});
+
+        // Verify pin map - palette bytes should be mapped to top left
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn terminal_formatter_with_selection_and_pin_map() {
+        let mut t = term(80, 24);
+        feed(&mut t, "line1\r\nline2\r\nline3");
+
+        let s = sel(&t, 0, 1, 4, 1);
+        let (output, pin_map) = fmt_term(&t, Options::PLAIN, |f| {
+            f.content = ScreenFormatterContent::Selection(Some(s));
+        });
+        assert_eq!("line2", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+
+        // "line2" (5 chars) from row 1
+        for i in 0..5 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(1, pin_map.get(i).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn screen_plain_single_line() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, world");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::PLAIN, |_| {});
+        assert_eq!("hello, world", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(pin_at(node, i, 0), pin_map.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn screen_plain_multiline() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::PLAIN, |_| {});
+        assert_eq!("hello\nworld", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+
+        // "hello" (5 chars)
+        for i in 0..5 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(0, pin_map.get(i).unwrap().y);
+        }
+
+        // "\n" maps to end of first line
+        assert_eq!(node, pin_map.get(5).unwrap().node);
+
+        // "world" (5 chars)
+        for i in 0..5 {
+            let idx = 6 + i;
+            assert_eq!(node, pin_map.get(idx).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(idx).unwrap().x);
+            assert_eq!(1, pin_map.get(idx).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn screen_plain_with_selection() {
+        let mut t = term(80, 24);
+        feed(&mut t, "line1\r\nline2\r\nline3");
+
+        let s = sel(&t, 0, 1, 4, 1);
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::PLAIN, |f| {
+            f.content = ScreenFormatterContent::Selection(Some(s));
+        });
+        assert_eq!("line2", output);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+
+        // "line2" (5 chars) from row 1
+        for i in 0..5 {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+            assert_eq!(i as CellCountInt, pin_map.get(i).unwrap().x);
+            assert_eq!(1, pin_map.get(i).unwrap().y);
+        }
+    }
+
+    #[test]
+    fn screen_vt_with_cursor_position() {
+        let mut t = term(80, 24);
+
+        // Position cursor at a specific location
+        feed(&mut t, "hello\r\nworld");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.cursor = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify cursor positions match
+        assert_eq!(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+        assert_eq!(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+
+        // Verify pin map - the extras should be mapped to the last pin
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        let content_len = "hello\r\nworld".len();
+
+        // Content bytes map to their positions
+        for i in 0..content_len {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+
+        // Extra bytes (cursor position) map to last content pin
+        for i in content_len..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    /// TerminalFormatter extras with only the screen cursor.
+    fn cursor_only(f: &mut TerminalFormatter<'_>) {
+        f.extra = TerminalFormatterExtra::NONE;
+        f.extra.screen.cursor = true;
+    }
+
+    fn cursor_cell(t: &Terminal) -> Cell {
+        // SAFETY: the cursor cell pointer is live.
+        unsafe { *t.screens.active.cursor.page_cell }
+    }
+
+    #[test]
+    fn terminal_vt_cursor_preserves_pending_wrap() {
+        let mut source = term(4, 2);
+        feed(&mut source, "abcd");
+        assert!(source.screens.active.cursor.pending_wrap);
+
+        let (output, pin_map) = fmt_term(&source, Options::VT, cursor_only);
+        assert_eq!(output.len(), pin_map.count());
+
+        let mut target = term(4, 2);
+        feed(&mut target, &output);
+        assert_eq!(
+            source.screens.active.cursor.pending_wrap,
+            target.screens.active.cursor.pending_wrap
+        );
+
+        feed(&mut source, "X");
+        feed(&mut target, "X");
+
+        assert_eq!(dump(&source), dump(&target));
+    }
+
+    #[test]
+    fn terminal_vt_cursor_preserves_pending_wrap_over_a_blank_cell() {
+        let mut source = term(4, 2);
+
+        // Saving the cursor saves the pending wrap and erasing the line clears
+        // it, so restoring the cursor leaves a pending wrap over a blank cell.
+        feed(&mut source, "abcd\x1b7\x1b[2K\x1b8");
+        assert!(source.screens.active.cursor.pending_wrap);
+        assert!(!cursor_cell(&source).has_text());
+
+        let (output, pin_map) = fmt_term(&source, Options::VT, cursor_only);
+        assert_eq!(output.len(), pin_map.count());
+
+        let mut target = term(4, 2);
+        feed(&mut target, &output);
+        assert_eq!(
+            source.screens.active.cursor.pending_wrap,
+            target.screens.active.cursor.pending_wrap
+        );
+        assert!(!cursor_cell(&target).has_text());
+
+        // Formatting the restored terminal gives the same output.
+        let target_output = fmt_term_nomap(&target, Options::VT, cursor_only);
+        assert_eq!(output, target_output);
+
+        // The next character goes on the next row.
+        feed(&mut source, "X");
+        feed(&mut target, "X");
+
+        assert_eq!(dump(&source), dump(&target));
+    }
+
+    #[test]
+    fn terminal_vt_cursor_preserves_pending_wrap_after_a_wide_character() {
+        let mut source = term(4, 2);
+        feed(&mut source, "ab\u{1F600}");
+        assert!(source.screens.active.cursor.pending_wrap);
+        assert_eq!(Wide::SpacerTail, cursor_cell(&source).wide());
+
+        let output = fmt_term_nomap(&source, Options::VT, cursor_only);
+
+        let mut target = term(4, 2);
+        feed(&mut target, &output);
+        assert_eq!(
+            source.screens.active.cursor.pending_wrap,
+            target.screens.active.cursor.pending_wrap
+        );
+
+        feed(&mut source, "X");
+        feed(&mut target, "X");
+
+        assert_eq!(dump(&source), dump(&target));
+    }
+
+    #[test]
+    fn screen_vt_with_style() {
+        let mut t = term(80, 24);
+
+        // Set some style attributes
+        feed(&mut t, "\x1b[1;31mhello");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.style = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify styles match
+        assert!(t.screens.active.cursor.style.eql(&t2.screens.active.cursor.style));
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    fn node_page<'a>(n: NodePtr) -> &'a mut Page {
+        // SAFETY: test nodes are live while their terminal is alive.
+        unsafe { (*n.as_ptr()).page() }
+    }
+
+    #[test]
+    fn screen_vt_with_hyperlink() {
+        let mut t = term(80, 24);
+
+        // Set a hyperlink
+        feed(&mut t, "\x1b]8;;http://example.com\x1b\\hello");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.hyperlink = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify hyperlinks match
+        let has_link1 = t.screens.active.cursor.hyperlink.is_some();
+        let has_link2 = t2.screens.active.cursor.hyperlink.is_some();
+        assert_eq!(has_link1, has_link2);
+        if has_link1 {
+            let link1 = t.screens.active.cursor.hyperlink.as_ref().unwrap();
+            let link2 = t2.screens.active.cursor.hyperlink.as_ref().unwrap();
+            assert_eq!(link1.uri, link2.uri);
+        }
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    /// Format the last page without a point map.
+    fn fmt_last_page_nomap(t: &Terminal, opts: Options<'_>) -> String {
+        let page = last_page(t);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut formatter = PageFormatter::init(page, opts);
+        formatter.format(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn page_vt_with_hyperlinks() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal");
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+    }
+
+    #[test]
+    fn page_vt_with_explicit_hyperlink_id() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b]8;id=a;https://example.com\x1b\\one\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            "\x1b]8;id=a;https://example.com\x1b\\one\x1b]8;;\x1b\\",
+            fmt_last_page_nomap(&t, Options::VT)
+        );
+    }
+
+    #[test]
+    fn page_vt_with_hyperlink_across_rows() {
+        let mut t = term(80, 24);
+
+        // The hyperlink stays open across the line break.
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\ab\r\ncd\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            "\x1b]8;;https://example.com\x1b\\ab\r\ncd\x1b]8;;\x1b\\",
+            fmt_last_page_nomap(&t, Options::VT)
+        );
+    }
+
+    #[test]
+    fn page_vt_steps_over_blank_cells_in_a_hyperlink() {
+        let mut t = term(80, 24);
+
+        // The cells skipped by the cursor movement are blank and have no
+        // hyperlink. Stepping over them doesn't write them, so the
+        // hyperlink stays open.
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\ab\x1b[5Gcd\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            "\x1b]8;;https://example.com\x1b\\ab\x1b[2Ccd\x1b]8;;\x1b\\",
+            fmt_last_page_nomap(&t, Options::VT)
+        );
+    }
+
+    #[test]
+    fn page_vt_unwrap_closes_a_hyperlink_before_blank_cells() {
+        let mut t = term(10, 5);
+
+        // The blanks before the wrapped wide character carry over to the
+        // next row, so they are written as spaces, which must not have the
+        // hyperlink.
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\abc\x1b[10G中\x1b]8;;\x1b\\");
+
+        let mut o = opts(Format::Vt);
+        o.unwrap = true;
+        assert_eq!(
+            concat!(
+                "\x1b]8;;https://example.com\x1b\\abc\x1b]8;;\x1b\\",
+                "      ",
+                "\x1b]8;;https://example.com\x1b\\中\x1b]8;;\x1b\\",
+            ),
+            fmt_last_page_nomap(&t, o)
+        );
+    }
+
+    #[test]
+    fn page_vt_switches_between_hyperlinks_without_closing() {
+        let mut t = term(80, 24);
+
+        // Opening a hyperlink replaces the open one, so no close is needed
+        // between two hyperlinks.
+        feed(
+            &mut t,
+            "\x1b]8;;https://a.example\x1b\\ab\x1b]8;;https://b.example\x1b\\cd\x1b]8;;\x1b\\",
+        );
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::VT, |_| {});
+
+        let open_a = "\x1b]8;;https://a.example\x1b\\";
+        let open_b = "\x1b]8;;https://b.example\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        assert_eq!(format!("{open_a}ab{open_b}cd{close}"), r.out);
+
+        // Each opening maps to its first cell, the close to the last cell.
+        let mut expected: Vec<Coordinate> = Vec::new();
+        expected.extend(std::iter::repeat_n(c(0, 0), open_a.len() + 1));
+        expected.push(c(1, 0));
+        expected.extend(std::iter::repeat_n(c(2, 0), open_b.len() + 1));
+        expected.extend(std::iter::repeat_n(c(3, 0), 1 + close.len()));
+        assert_eq!(expected, r.map);
+    }
+
+    #[test]
+    fn page_vt_closes_a_hyperlink_on_a_row_without_hyperlinks() {
+        let mut t = term(80, 24);
+
+        // The hyperlink is still open at the end of the first row, and the
+        // second row has none.
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\ab\x1b]8;;\x1b\\\r\ncd");
+
+        assert_eq!(
+            "\x1b]8;;https://example.com\x1b\\ab\r\n\x1b]8;;\x1b\\cd",
+            fmt_last_page_nomap(&t, Options::VT)
+        );
+    }
+
+    #[test]
+    fn terminal_vt_restores_hyperlinks_of_cells() {
+        let mut source = term(20, 3);
+        feed(
+            &mut source,
+            concat!(
+                "\x1b]8;;https://a.example\x1b\\aa\x1b]8;;\x1b\\ ",
+                "\x1b]8;id=x;https://b.example\x1b\\bb\x1b[5Gbb\x1b]8;;\x1b\\\r\n",
+                "\x1b]8;;https://a.example\x1b\\\x1b[1mcc\x1b[0m\x1b]8;;\x1b\\ plain",
+            ),
+        );
+
+        let output = fmt_term_nomap(&source, Options::VT, |_| {});
+
+        let mut target = term(20, 3);
+        feed(&mut target, &output);
+
+        for y in 0..3 {
+            for x in 0..20 {
+                let pt = act(x, y);
+                let a = source.screens.active.pages.get_cell(pt).unwrap();
+                let b = target.screens.active.pages.get_cell(pt).unwrap();
+                // SAFETY: cell pointers of live pages.
+                let (a_cell, b_cell) = unsafe { (&*a.cell, &*b.cell) };
+                assert_eq!(a_cell.hyperlink(), b_cell.hyperlink());
+                if !a_cell.hyperlink() {
+                    continue;
+                }
+
+                let a_page = node_page(a.node);
+                let b_page = node_page(b.node);
+                // SAFETY: the hyperlink ids are live entries of their pages.
+                let a_link = unsafe { *a_page.hyperlink_set.get(a_page.memory, a_page.lookup_hyperlink(a_cell).unwrap()) };
+                let b_link = unsafe { *b_page.hyperlink_set.get(b_page.memory, b_page.lookup_hyperlink(b_cell).unwrap()) };
+                // SAFETY: the slices are in their page's memory.
+                unsafe {
+                    assert_eq!(a_link.uri.slice(a_page.memory), b_link.uri.slice(b_page.memory));
+                }
+                match (a_link.id, b_link.id) {
+                    (hyperlink::PageEntryId::Explicit(a_id), hyperlink::PageEntryId::Explicit(b_id)) => {
+                        // SAFETY: the slices are in their page's memory.
+                        unsafe {
+                            assert_eq!(a_id.slice(a_page.memory), b_id.slice(b_page.memory));
+                        }
+                    }
+                    (hyperlink::PageEntryId::Implicit(_), hyperlink::PageEntryId::Implicit(_)) => {}
+                    _ => panic!("hyperlink id kinds differ"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn screen_vt_with_protection() {
+        let mut t = term(80, 24);
+
+        // Enable protection mode
+        feed(&mut t, "\x1b[1\"qhello");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.protection = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify protection state matches
+        assert_eq!(t.screens.active.cursor.protected, t2.screens.active.cursor.protected);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn screen_vt_with_kitty_keyboard() {
+        let mut t = term(80, 24);
+
+        // Set kitty keyboard flags (disambiguate + report_events = 3)
+        feed(&mut t, "\x1b[=3;1uhello");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.kitty_keyboard = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify kitty keyboard state matches
+        let flags1 = t.screens.active.kitty_keyboard.current().int();
+        let flags2 = t2.screens.active.kitty_keyboard.current().int();
+        assert_eq!(flags1, flags2);
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn screen_vt_with_charsets() {
+        let mut t = term(80, 24);
+
+        // Set G0 to DEC special and shift to G1
+        feed(&mut t, "\x1b(0\x0ehello");
+
+        let (output, pin_map) = fmt_screen(&t.screens.active, Options::VT, |f| f.extra.charsets = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify charset state matches
+        assert_eq!(t.screens.active.charset.gl, t2.screens.active.charset.gl);
+        assert_eq!(t.screens.active.charset.gr, t2.screens.active.charset.gr);
+        assert_eq!(
+            t.screens.active.charset.charsets.get(charsets::Slots::G0),
+            t2.screens.active.charset.charsets.get(charsets::Slots::G0)
+        );
+
+        // Verify pin map
+        assert_eq!(output.len(), pin_map.count());
+        let node = t.screens.active.pages.pages.first.unwrap();
+        for i in 0..output.len() {
+            assert_eq!(node, pin_map.get(i).unwrap().node);
+        }
+    }
+
+    #[test]
+    fn terminal_vt_without_trim_keeps_blank_rows_at_the_bottom() {
+        let mut source = term(10, 5);
+
+        // Scroll three lines into the scrollback, then erase the bottom of
+        // the screen, as clearing below a prompt does.
+        feed(&mut source, "1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8");
+        feed(&mut source, "\x1b[3;1H\x1b[J");
+
+        let mut o = opts(Format::Vt);
+        o.trim = false;
+        let (output, pin_map) = fmt_term(&source, o, cursor_only);
+        assert_eq!(output.len(), pin_map.count());
+
+        let mut target = term(10, 5);
+        feed(&mut target, &output);
+
+        // The blank rows are part of the layout: without them, the replay
+        // scrolls less and the rows above them end up too low.
+        let source_contents = source
+            .screens
+            .active
+            .dump_string_alloc(Point::Active(Coordinate::default()))
+            .unwrap();
+        let target_contents = target
+            .screens
+            .active
+            .dump_string_alloc(Point::Active(Coordinate::default()))
+            .unwrap();
+        assert_eq!(source_contents, target_contents);
+        assert_eq!(source.screens.active.cursor.y, target.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn terminal_vt_with_scrolling_region() {
+        let mut t = term(80, 24);
+
+        // Set scrolling region: top=5, bottom=20
+        feed(&mut t, "\x1b[6;21rhello");
+
+        let output = fmt_term_nomap(&t, Options::VT, |f| f.extra.scrolling_region = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify scrolling regions match
+        assert_eq!(t.scrolling_region.top, t2.scrolling_region.top);
+        assert_eq!(t.scrolling_region.bottom, t2.scrolling_region.bottom);
+        assert_eq!(t.scrolling_region.left, t2.scrolling_region.left);
+        assert_eq!(t.scrolling_region.right, t2.scrolling_region.right);
+    }
+
+    #[test]
+    fn terminal_vt_with_cursor_in_origin_mode() {
+        // Each stream sets a scrolling region and origin mode, then moves
+        // the cursor within the region; the last one leaves a pending wrap
+        // in the right column, which is restored by printing that cell again.
+        // The left and right margins need mode 69.
+        let streams: [&str; 3] = [
+            "\x1b[3;8r\x1b[?6h\x1b[2;5H",
+            "\x1b[?69h\x1b[3;8r\x1b[4;15s\x1b[?6h\x1b[2;3H",
+            "\x1b[3;8r\x1b[?6h\x1b[2;20Hx",
+        ];
+
+        for stream in streams {
+            let mut t = term(20, 10);
+            feed(&mut t, stream);
+
+            let output = fmt_term_nomap(&t, Options::VT, |f| f.extra = TerminalFormatterExtra::ALL);
+
+            let mut t2 = term(20, 10);
+            feed(&mut t2, &output);
+
+            assert!(t2.modes.get(modes::Mode::Origin));
+            assert_eq!(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+            assert_eq!(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+            assert_eq!(
+                t.screens.active.cursor.pending_wrap,
+                t2.screens.active.cursor.pending_wrap
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_vt_with_cursor_in_origin_mode_without_the_region() {
+        let mut t = term(20, 10);
+        feed(&mut t, "\x1b[3;8r\x1b[?6h\x1b[2;5H");
+
+        // Without the scrolling region in the output, the replaying terminal
+        // keeps full-screen margins, so the position stays absolute.
+        let output = fmt_term_nomap(&t, Options::VT, |f| {
+            f.extra = TerminalFormatterExtra::ALL;
+            f.extra.scrolling_region = false;
+        });
+        assert!(output.contains("\x1b[4;5H"));
+    }
+
+    #[test]
+    fn terminal_vt_with_modes() {
+        let mut t = term(80, 24);
+
+        // Enable some modes that differ from defaults
+        feed(&mut t, "\x1b[?2004h"); // Bracketed paste
+        feed(&mut t, "\x1b[?1000h"); // Mouse event normal
+        feed(&mut t, "\x1b[?7l"); // Disable wraparound (default is true)
+        feed(&mut t, "hello");
+
+        let output = fmt_term_nomap(&t, Options::VT, |f| f.extra.modes = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify modes match
+        assert_eq!(
+            t.modes.get(modes::Mode::BracketedPaste),
+            t2.modes.get(modes::Mode::BracketedPaste)
+        );
+        assert_eq!(
+            t.modes.get(modes::Mode::MouseEventNormal),
+            t2.modes.get(modes::Mode::MouseEventNormal)
+        );
+        assert_eq!(t.modes.get(modes::Mode::Wraparound), t2.modes.get(modes::Mode::Wraparound));
+    }
+
+    #[test]
+    fn terminal_vt_with_tabstops() {
+        let mut t = term(80, 24);
+
+        // Clear all tabs and set custom tabstops
+        feed(&mut t, "\x1b[3g"); // Clear all tabs
+        feed(&mut t, "\x1b[5G\x1bH"); // Set tab at column 5
+        feed(&mut t, "\x1b[15G\x1bH"); // Set tab at column 15
+        feed(&mut t, "\x1b[30G\x1bH"); // Set tab at column 30
+        feed(&mut t, "\x1b[Hhello");
+
+        let (output, pin_map) = fmt_term(&t, Options::VT, |f| {
+            f.extra.tabstops = true;
+            f.extra.screen.cursor = true;
+        });
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify tabstops match (columns are 0-indexed in the API)
+        assert_eq!(t.tabstops.get(4), t2.tabstops.get(4));
+        assert_eq!(t.tabstops.get(14), t2.tabstops.get(14));
+        assert_eq!(t.tabstops.get(29), t2.tabstops.get(29));
+        assert!(t2.tabstops.get(4)); // Column 5 (1-indexed)
+        assert!(t2.tabstops.get(14)); // Column 15 (1-indexed)
+        assert!(t2.tabstops.get(29)); // Column 30 (1-indexed)
+        assert!(!t2.tabstops.get(8)); // Not a tab
+
+        // Tabstop serialization must not offset the screen contents.
+        for (col, expected) in "hello".bytes().enumerate() {
+            let cell = t2.screens.active.pages.get_cell(scr(col, 0)).unwrap();
+            // SAFETY: cell pointer of a live page.
+            assert_eq!(expected as u32, unsafe { (*cell.cell).codepoint() });
+        }
+
+        // Emitting tabstops moves the cursor to each configured column. When
+        // cursor state is included, it must be restored afterwards.
+        assert_eq!(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+        assert_eq!(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+
+        // Verify the reordered terminal state is still represented in the map.
+        assert_eq!(output.len(), pin_map.count());
+    }
+
+    #[test]
+    fn terminal_vt_with_keyboard_modes() {
+        let mut t = term(80, 24);
+
+        // Set modify other keys mode 2
+        feed(&mut t, "\x1b[>4;2m");
+        feed(&mut t, "hello");
+
+        let output = fmt_term_nomap(&t, Options::VT, |f| f.extra.keyboard = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify keyboard mode matches
+        assert_eq!(t.flags.modify_other_keys_2, t2.flags.modify_other_keys_2);
+        assert!(t2.flags.modify_other_keys_2);
+    }
+
+    #[test]
+    fn terminal_vt_with_pwd() {
+        let mut t = term(80, 24);
+
+        // Set pwd using OSC 7
+        feed(&mut t, "\x1b]7;file://host/home/user\x1b\\hello");
+
+        let output = fmt_term_nomap(&t, Options::VT, |f| f.extra.pwd = true);
+
+        // Create a second terminal and apply the output
+        let mut t2 = term(80, 24);
+        feed(&mut t2, &output);
+
+        // Verify pwd matches
+        assert_eq!(t.pwd, t2.pwd);
+    }
+
+    const HTML_WRAPPER_START: &str = "<div style=\"font-family: monospace; white-space: pre;\">";
+
+    #[test]
+    fn page_html_with_multiple_styles() {
+        let mut t = term(80, 24);
+
+        // Set bold, then italic, then reset
+        feed(&mut t, "\x1b[1mbold\x1b[3mitalic\x1b[0mnormal");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;font-weight: bold;\">bold</div>",
+                "<div style=\"display: inline;font-weight: bold;font-style: italic;\">italic</div>",
+                "normal",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_plain_text() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello, world");
+
+        // Plain text without styles should be wrapped in monospace div
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">hello, world</div>",
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_with_colors() {
+        let mut t = term(80, 24);
+
+        // Set red foreground, blue background
+        feed(&mut t, "\x1b[31;44mcolored");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;color: var(--vt-palette-1);background-color: var(--vt-palette-4);\">colored</div>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn terminal_formatter_html_with_palette() {
+        let mut t = term(80, 24);
+
+        // Modify some palette colors
+        feed(&mut t, "\x1b]4;0;rgb:12/34/56\x1b\\");
+        feed(&mut t, "\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        feed(&mut t, "\x1b]4;255;rgb:ff/00/ff\x1b\\");
+        feed(&mut t, "test");
+
+        let output = fmt_term_nomap(&t, Options::HTML, |f| f.extra.palette = true);
+
+        // Verify palette CSS variables are emitted
+        assert!(output.contains("<style>:root{"));
+        assert!(output.contains("--vt-palette-0: #123456;"));
+        assert!(output.contains("--vt-palette-1: #abcdef;"));
+        assert!(output.contains("--vt-palette-255: #ff00ff;"));
+        assert!(output.contains("}</style>"));
+        assert!(output.contains("test"));
+    }
+
+    #[test]
+    fn page_html_with_background_and_foreground_colors() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+
+        let mut o = opts(Format::Html);
+        o.background = Some(color::Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        });
+        o.foreground = Some(color::Rgb {
+            r: 0xab,
+            g: 0xcd,
+            b: 0xef,
+        });
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;background-color: #123456;color: #abcdef;\">hello</div>",
+            fmt_last_page_nomap(&t, o)
+        );
+    }
+
+    #[test]
+    fn page_html_with_escaping() {
+        let mut t = term(80, 24);
+        feed(&mut t, "<tag>&\"'text");
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::HTML, |_| {});
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">&lt;tag&gt;&amp;&quot;&#39;text</div>",
+            r.out
+        );
+
+        // Verify point map length matches output
+        assert_eq!(r.out.len(), r.map.len());
+
+        // Opening wrapper div
+        let wrapper_start_len = HTML_WRAPPER_START.len();
+        assert_same(&r.map, 0, wrapper_start_len, 0, 0);
+
+        // Verify each character maps correctly, accounting for escaping
+        let offset = wrapper_start_len;
+
+        // < (4 bytes: &lt;) -> x=0
+        assert_same(&r.map, offset, 4, 0, 0);
+        // t (1 byte) -> x=1
+        assert_eq!(c(1, 0), r.map[offset + 4]);
+        // a (1 byte) -> x=2
+        assert_eq!(c(2, 0), r.map[offset + 5]);
+        // g (1 byte) -> x=3
+        assert_eq!(c(3, 0), r.map[offset + 6]);
+        // > (4 bytes: &gt;) -> x=4
+        assert_same(&r.map, offset + 7, 4, 4, 0);
+        // & (5 bytes: &amp;) -> x=5
+        assert_same(&r.map, offset + 11, 5, 5, 0);
+        // " (6 bytes: &quot;) -> x=6
+        assert_same(&r.map, offset + 16, 6, 6, 0);
+        // ' (5 bytes: &#39;) -> x=7
+        assert_same(&r.map, offset + 22, 5, 7, 0);
+        // t (1 byte) -> x=8
+        assert_eq!(c(8, 0), r.map[offset + 27]);
+        // e (1 byte) -> x=9
+        assert_eq!(c(9, 0), r.map[offset + 28]);
+        // x (1 byte) -> x=10
+        assert_eq!(c(10, 0), r.map[offset + 29]);
+        // t (1 byte) -> x=11
+        assert_eq!(c(11, 0), r.map[offset + 30]);
+    }
+
+    #[test]
+    fn page_html_with_unicode_as_numeric_entities() {
+        let mut t = term(80, 24);
+
+        // Box drawing characters that caused issue #9426
+        feed(&mut t, "╰─ ❯");
+
+        // Expected: box drawing chars as numeric entities
+        // ╰ = U+2570 = 9584, ─ = U+2500 = 9472, ❯ = U+276F = 10095
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">&#9584;&#9472; &#10095;</div>",
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_trailing_blank_lines() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello\r\nworld\r\n\r\n");
+        let page = single_page(&t);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut formatter = PageFormatter::init(page, Options::HTML);
+        let state = formatter.format_with_state(&mut buf).unwrap();
+
+        // The closing div behaves as a newline
+        assert_eq!(page.size.rows as usize - 2, state.rows);
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">hello\nworld</div>",
+            String::from_utf8(buf).unwrap()
+        );
+    }
+
+    #[test]
+    fn page_html_ascii_characters_unchanged() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+
+        // ASCII should be emitted directly
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">hello world</div>",
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_mixed_ascii_and_unicode() {
+        let mut t = term(80, 24);
+        feed(&mut t, "test ╰─❯ ok");
+
+        // Mix of ASCII and Unicode entities
+        assert_eq!(
+            "<div style=\"font-family: monospace; white-space: pre;\">test &#9584;&#9472;&#10095; ok</div>",
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_vt_with_palette_option_emits_rgb() {
+        let mut t = term(80, 24);
+
+        // Set a custom palette color and use it
+        feed(&mut t, "\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        feed(&mut t, "\x1b[31mred");
+
+        // Without palette option - should emit palette index
+        assert_eq!("\x1b[0m\x1b[38;5;1mred\x1b[0m", fmt_last_page_nomap(&t, Options::VT));
+
+        // With palette option - should emit RGB directly
+        let palette = t.colors.palette.current;
+        let mut o = opts(Format::Vt);
+        o.palette = Some(&palette);
+        assert_eq!("\x1b[0m\x1b[38;2;171;205;239mred\x1b[0m", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_html_with_palette_option_emits_rgb() {
+        let mut t = term(80, 24);
+
+        // Set a custom palette color and use it
+        feed(&mut t, "\x1b]4;1;rgb:ab/cd/ef\x1b\\");
+        feed(&mut t, "\x1b[31mred");
+
+        // Without palette option - should emit CSS variable
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;color: var(--vt-palette-1);\">red</div>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+
+        // With palette option - should emit RGB directly
+        let palette = t.colors.palette.current;
+        let mut o = opts(Format::Html);
+        o.palette = Some(&palette);
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;color: rgb(171, 205, 239);\">red</div>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, o)
+        );
+    }
+
+    #[test]
+    fn page_vt_style_reset_properly_closes_styles() {
+        let mut t = term(80, 24);
+
+        // Set bold, then reset with SGR 0
+        feed(&mut t, "\x1b[1mbold\x1b[0mnormal");
+
+        // The reset should properly close the bold style
+        assert_eq!("\x1b[0m\x1b[1mbold\x1b[0mnormal", fmt_last_page_nomap(&t, Options::VT));
+    }
+
+    fn cp_map(range: [char; 2], replacement: Replacement) -> CodepointMap {
+        CodepointMap {
+            range: [range[0] as u32, range[1] as u32],
+            replacement,
+        }
+    }
+
+    #[test]
+    fn page_codepoint_map_single_replacement() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+
+        // Replace 'o' with 'x'
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![cp_map(['o', 'o'], Replacement::Codepoint('x' as u32))]);
+
+        let page = last_page(&t);
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("hellx wxrld", r.out);
+
+        // Verify point map - each output byte should map to original cell position
+        assert_eq!(r.out.len(), r.map.len());
+        // "hello world" -> "hellx wxrld"
+        // h e l l o   w o r l d
+        // 0 1 2 3 4 5 6 7 8 9 10
+        assert_run(&r.map, 0, 11, 0, 0);
+    }
+
+    #[test]
+    fn page_codepoint_map_conflicting_replacement_prefers_last() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+
+        // Replace 'o' with 'x', then with 'y' - should prefer last
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![
+            cp_map(['o', 'o'], Replacement::Codepoint('x' as u32)),
+            cp_map(['o', 'o'], Replacement::Codepoint('y' as u32)),
+        ]);
+
+        let page = last_page(&t);
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("helly", r.out);
+    }
+
+    #[test]
+    fn page_codepoint_map_replace_with_string() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello");
+
+        // Replace 'o' with a multi-byte string
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![cp_map(['o', 'o'], Replacement::String("XYZ".to_owned()))]);
+
+        let page = last_page(&t);
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("hellXYZ", r.out);
+
+        // Verify point map - string replacements should all map to the original cell
+        assert_eq!(r.out.len(), r.map.len());
+        // "hello" -> "hellXYZ"
+        // h e l l o
+        // 0 1 2 3 4
+        assert_run(&r.map, 0, 4, 0, 0);
+        // All bytes of the replacement string "XYZ" should point to position 4 (where 'o' was)
+        assert_same(&r.map, 4, 3, 4, 0);
+    }
+
+    #[test]
+    fn page_codepoint_map_range_replacement() {
+        let mut t = term(80, 24);
+        feed(&mut t, "abcdefg");
+
+        // Replace 'b' through 'e' with 'X'
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![cp_map(['b', 'e'], Replacement::Codepoint('X' as u32))]);
+
+        assert_eq!("aXXXXfg", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_codepoint_map_multiple_ranges() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+
+        // Replace 'a'-'m' with 'A' and 'n'-'z' with 'Z'
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![
+            cp_map(['a', 'm'], Replacement::Codepoint('A' as u32)),
+            cp_map(['n', 'z'], Replacement::Codepoint('Z' as u32)),
+        ]);
+
+        // h e l l o   w o r l d
+        // A A A A Z   Z Z Z A A
+        assert_eq!("AAAAZ ZZZAA", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_codepoint_map_unicode_replacement() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello ⚡ world");
+
+        // Replace lightning bolt with fire emoji
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(vec![cp_map(['⚡', '⚡'], Replacement::String("🔥".to_owned()))]);
+
+        let page = last_page(&t);
+        let r = fmt_page(page, o, |_| {});
+        assert_eq!("hello 🔥 world", r.out);
+
+        // Verify point map
+        assert_eq!(r.out.len(), r.map.len());
+        // "hello ⚡ world"
+        // h e l l o   ⚡   w o r l  d
+        // 0 1 2 3 4 5 6   8 9 10 11 12
+        // Note: ⚡ is a wide character occupying cells 6-7
+        assert_run(&r.map, 0, 6, 0, 0);
+        // 🔥 is 4 UTF-8 bytes, all should map to cell 6 (where ⚡ was)
+        let fire_start = 6; // "hello " is 6 bytes
+        assert_same(&r.map, fire_start, 4, 6, 0);
+        // " world" follows
+        let world_start = fire_start + 4;
+        assert_run(&r.map, world_start, 6, 8, 0);
+    }
+
+    #[test]
+    fn page_codepoint_map_with_styled_formats() {
+        let mut t = term(10, 24);
+        feed(&mut t, "\x1b[31mred text\x1b[0m");
+
+        // Replace 'e' with 'X' in styled text
+        let mut o = opts(Format::Vt);
+        o.codepoint_map = Some(vec![cp_map(['e', 'e'], Replacement::Codepoint('X' as u32))]);
+
+        // Should preserve styles while replacing text
+        // "red text" becomes "rXd tXxt"
+        // VT format uses \x1b[38;5;1m for palette color 1
+        assert_eq!("\x1b[0m\x1b[38;5;1mrXd tXxt\x1b[0m", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_codepoint_map_empty_map() {
+        let mut t = term(80, 24);
+        feed(&mut t, "hello world");
+
+        // Empty map should not change anything
+        let mut o = opts(Format::Plain);
+        o.codepoint_map = Some(Vec::new());
+
+        assert_eq!("hello world", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn page_vt_background_color_on_trailing_blank_cells() {
+        // This test reproduces a bug where trailing cells with background color
+        // but no text are emitted as plain spaces without SGR sequences.
+        // This causes TUIs like htop to lose background colors on rehydration.
+        let mut t = term(20, 5);
+
+        // Simulate a TUI row: "CPU:" with text, then trailing cells with red background
+        // to end of line (no text after the colored region).
+        // \x1b[41m sets red background, then EL fills rest of row with that bg.
+        feed(&mut t, "CPU:\x1b[41m\x1b[K");
+        // Reset colors and move to next line with different content
+        feed(&mut t, "\x1b[0m\r\nline2");
+
+        let mut o = opts(Format::Vt);
+        o.trim = false; // Don't trim so we can see the trailing behavior
+        let output = fmt_last_page_nomap(&t, o);
+
+        // The output should preserve the red background SGR for trailing cells on line 1.
+        // Bug: the first row outputs "CPU:\r\n" only - losing the background color fill.
+        // The red background should appear BEFORE the newline, not after.
+
+        // Find position of CRLF
+        let crlf_pos = output.find("\r\n").expect("No CRLF found");
+
+        // Check that red background (48;5;1) appears BEFORE the newline (on line 1)
+        let line1 = &output[..crlf_pos];
+        let has_red_bg_line1 = line1.contains("\x1b[41m") || line1.contains("\x1b[48;5;1m");
+
+        // This should be true but currently fails due to the bug
+        assert!(has_red_bg_line1);
+    }
+
+    #[test]
+    fn page_vt_steps_over_a_gap() {
+        let mut t = term(20, 5);
+
+        // The gap after the red text is empty and has no background.
+        feed(&mut t, "\x1b[41mred\x1b[0m\x1b[10Gplain");
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("\x1b[0m\x1b[48;5;1mred\x1b[6C\x1b[0mplain", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+
+        // The CUF maps to the first cell of the gap.
+        let cuf = r.out.find("\x1b[6C").unwrap();
+        assert_same(&r.map, cuf, 4, 3, 0);
+    }
+
+    #[test]
+    fn page_vt_erases_cells_that_only_have_a_background() {
+        let mut t = term(10, 5);
+
+        // Erasing to the end of the row with a background set.
+        feed(&mut t, "CPU:\x1b[41m\x1b[K\x1b[0m");
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::VT, |_| {});
+        assert_eq!("CPU:\x1b[0m\x1b[48;5;1m\x1b[6X\x1b[6C\x1b[0m", r.out);
+        assert_eq!(r.out.len(), r.map.len());
+    }
+
+    #[test]
+    fn page_vt_keeps_rows_that_only_have_a_background() {
+        let mut t = term(5, 2);
+
+        // Erasing the screen with a background set paints every cell.
+        feed(&mut t, "\x1b[44m\x1b[2J\x1b[Hab\x1b[0m");
+
+        assert_eq!(
+            concat!(
+                "\x1b[0m\x1b[48;5;4mab\x1b[3X\x1b[3C\x1b[0m\r\n",
+                "\x1b[0m\x1b[48;5;4m\x1b[5X\x1b[5C\x1b[0m",
+            ),
+            fmt_last_page_nomap(&t, Options::VT)
+        );
+    }
+
+    #[test]
+    fn page_vt_unwrap_writes_blanks_before_a_wrapped_wide_character() {
+        let mut t = term(10, 5);
+
+        // The wide character doesn't fit in the last column, so it wraps,
+        // and the blanks before it carry over to the next row.
+        feed(&mut t, "\x1b[41mabc\x1b[0m\x1b[10G中");
+
+        // CUF can't cross the row, so the blanks are spaces, written
+        // without the pen of the text before them.
+        let mut o = opts(Format::Vt);
+        o.unwrap = true;
+        assert_eq!("\x1b[0m\x1b[48;5;1mabc\x1b[0m      中", fmt_last_page_nomap(&t, o));
+    }
+
+    #[test]
+    fn terminal_vt_restores_gaps_and_cells_that_only_have_a_background() {
+        let mut source = term(20, 4);
+        feed(
+            &mut source,
+            concat!(
+                "\x1b[41mred\x1b[0m\x1b[10Gplain\r\n",
+                "\x1b[44m\x1b[K\x1b[0m\r\n",
+                "CPU:\x1b[42m\x1b[K\x1b[48;2;1;2;3m\x1b[15G\x1b[3X\x1b[0m\x1b[19Gx\r\n",
+                "  spaces  \x1b[1mbold\x1b[0m",
+            ),
+        );
+
+        let output = fmt_term_nomap(&source, Options::VT, |_| {});
+
+        let mut target = term(20, 4);
+        feed(&mut target, &output);
+
+        for y in 0..4 {
+            for x in 0..20 {
+                let pt = act(x, y);
+                let a = source.screens.active.pages.get_cell(pt).unwrap();
+                let b = target.screens.active.pages.get_cell(pt).unwrap();
+                // SAFETY: cell pointers of live pages.
+                let (a_cell, b_cell) = unsafe { (&*a.cell, &*b.cell) };
+                assert_eq!(a_cell.content_tag(), b_cell.content_tag());
+                assert_eq!(a_cell.wide(), b_cell.wide());
+                match a_cell.content_tag() {
+                    ContentTag::Codepoint | ContentTag::CodepointGrapheme => {
+                        assert_eq!(a_cell.codepoint(), b_cell.codepoint())
+                    }
+                    ContentTag::BgColorPalette => {
+                        assert_eq!(a_cell.content_color_palette(), b_cell.content_color_palette())
+                    }
+                    ContentTag::BgColorRgb => assert_eq!(a_cell.content_color_rgb(), b_cell.content_color_rgb()),
+                }
+                assert!(a.style().eql(&b.style()));
+            }
+        }
+    }
+
+    #[test]
+    fn page_html_with_hyperlinks() {
+        let mut t = term(80, 24);
+
+        // Start a hyperlink, write some text, end it
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\link text\x1b]8;;\x1b\\ normal");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<a href=\"https://example.com\">link text</a> normal",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_with_multiple_hyperlinks() {
+        let mut t = term(80, 24);
+
+        // Two different hyperlinks
+        feed(&mut t, "\x1b]8;;https://first.com\x1b\\first\x1b]8;;\x1b\\ ");
+        feed(&mut t, "\x1b]8;;https://second.com\x1b\\second\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<a href=\"https://first.com\">first</a>",
+                " ",
+                "<a href=\"https://second.com\">second</a>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_with_hyperlink_escaping() {
+        let mut t = term(80, 24);
+
+        // URL with special characters that need escaping
+        feed(&mut t, "\x1b]8;;https://example.com?a=1&b=2\x1b\\link\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<a href=\"https://example.com?a=1&amp;b=2\">link</a>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_with_styled_hyperlink() {
+        let mut t = term(80, 24);
+
+        // Bold hyperlink
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\\x1b[1mbold link\x1b[0m\x1b]8;;\x1b\\");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;font-weight: bold;\">",
+                "<a href=\"https://example.com\">bold link</div></a>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_hyperlink_closes_style_before_anchor() {
+        let mut t = term(80, 24);
+
+        // Styled hyperlink followed by plain text
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\\x1b[1mbold\x1b[0m plain");
+
+        assert_eq!(
+            concat!(
+                "<div style=\"font-family: monospace; white-space: pre;\">",
+                "<div style=\"display: inline;font-weight: bold;\">",
+                "<a href=\"https://example.com\">bold</div> plain</a>",
+                "</div>",
+            ),
+            fmt_last_page_nomap(&t, Options::HTML)
+        );
+    }
+
+    #[test]
+    fn page_html_hyperlink_point_map_maps_closing_to_previous_cell() {
+        let mut t = term(80, 24);
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ normal");
+
+        let page = last_page(&t);
+        let r = fmt_page(page, Options::HTML, |_| {});
+
+        let expected_output = concat!(
+            "<div style=\"font-family: monospace; white-space: pre;\">",
+            "<a href=\"https://example.com\">link</a> normal",
+            "</div>",
+        );
+        assert_eq!(expected_output, r.out);
+        assert_eq!(expected_output.len(), r.map.len());
+
+        // The </a> closing tag bytes should all map to the last cell of the link
+        let closing_idx = expected_output.find("</a>").unwrap();
+        let expected_coord = r.map[closing_idx - 1];
+        for i in closing_idx..closing_idx + "</a>".len() {
+            assert_eq!(expected_coord, r.map[i]);
+        }
+    }
 }
