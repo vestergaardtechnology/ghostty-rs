@@ -128,7 +128,7 @@ pub unsafe fn gobj_of(core: *const crate::surface::Surface) -> class::surface::S
     rt_surface(&*(*core).rt_surface).gobj()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gtk"))]
 mod tests {
     #[test]
     fn ref_all_decls() {

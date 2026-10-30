@@ -1888,7 +1888,7 @@ fn find_active_window() -> Option<gtk4::Window> {
 }
 
 /// All apprt action handlers
-mod action_fns {
+pub(crate) mod action_fns {
     use super::*;
     use crate::apprt::action::{
         CellSize, CommandFinished, Inspector, InitialSize, KeySequence, KeyTable, MouseOverLink, MouseVisibility,
@@ -2841,7 +2841,13 @@ pub(crate) mod test_support {
             }
 
             let core = Box::leak(CoreApp::create().expect("core app"));
-            let app = Application::new_with_config(core, CoreConfig::default(), None);
+            // The test config is not finalized (gtk-single-instance stays
+            // `detect`), so keep the cgroup hooks out of child processes.
+            let config = CoreConfig {
+                linux_cgroup: crate::config::config::LinuxCgroup::Never,
+                ..CoreConfig::default()
+            };
+            let app = Application::new_with_config(core, config, None);
             let rt = Box::leak(Box::new(apprt::App::default()));
             app.set_rt(rt);
             app.set_default();
@@ -2884,7 +2890,6 @@ mod tests {
             let app = Application::default();
             assert_eq!(Application::try_default().as_ref(), Some(&app));
             assert!(app.get_config().is_some());
-            assert!(app.surfaces().is_empty());
             assert!(app.with_winproto(|_| ()).is_some());
 
             // Unhandled actions report false, app-targeted surface actions

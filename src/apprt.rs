@@ -264,6 +264,10 @@ pub mod standin {
 
         /// The runtime app (Zig: `rtApp`).
         pub fn rt_app(&self) -> *mut App {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.rt_app();
+            }
             self.app
         }
 

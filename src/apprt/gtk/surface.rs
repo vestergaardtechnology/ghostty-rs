@@ -11,6 +11,7 @@
 use std::ffi::CStr;
 use std::fmt;
 
+use glib::subclass::prelude::InstanceStructExt;
 use glib::translate::{from_glib_borrow, Borrowed, ToGlibPtr};
 
 use crate::apprt;
@@ -48,7 +49,7 @@ impl Surface {
     pub fn deinit(&mut self) {}
 
     /// Returns the GObject surface for this apprt surface without taking a
-    /// reference (safe even while the surface is being finalized).
+    /// reference. Only valid while the surface is alive (not finalizing).
     fn borrow(&self) -> Borrowed<GSurface> {
         // SAFETY: the GObject surface owns (and outlives) this struct.
         unsafe { from_glib_borrow(self.surface) }
@@ -61,9 +62,14 @@ impl Surface {
     }
 
     pub fn core(&self) -> *mut CoreSurface {
+        // This reads the private data directly (no wrapper/reference), so
+        // it also works while the surface is finalized, when the core app
+        // removes the surface.
+        // SAFETY: the GObject surface owns (and outlives) this struct.
+        let imp = unsafe { (*self.surface).imp() };
         // This asserts the non-optional because libghostty should only
         // be calling this for initialized surfaces.
-        self.borrow().core().expect("core surface is initialized")
+        imp.core_surface.get().expect("core surface is initialized")
     }
 
     pub fn rt_app(&self) -> *mut apprt::App {

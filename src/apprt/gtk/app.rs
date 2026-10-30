@@ -104,3 +104,91 @@ impl App {
         surface.redraw_inspector();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::apprt::gtk::class::application::action_fns;
+    use crate::apprt::gtk::class::overrides::Overrides;
+    use crate::apprt::gtk::class::window::Window;
+    use crate::apprt::gtk::ext::test_gtk;
+    use crate::config::Command;
+    use crate::input::binding::Action as BindingAction;
+    use crate::renderer::opengl::device::test_context::egl_lock;
+
+    #[test]
+    fn constants() {
+        assert!(APPLICATION_ID.starts_with("com.mitchellh.ghostty"));
+        assert!(OBJECT_PATH.starts_with("/com/mitchellh/ghostty"));
+    }
+
+    #[test]
+    fn perform_ipc_without_instance() {
+        // No running instance on the (absent) session bus: the IPC fails
+        // or reports that it wasn't performed, but never panics.
+        let _ = App::perform_ipc(&ipc::Target::Class(c"com.mitchellh.ghostty-test-none"), &ipc::Action::ToggleQuickTerminal);
+    }
+
+    /// Not a Zig test: a GTK window with a real terminal surface (core
+    /// surface, OpenGL renderer and a shell on a pty) on the GTK test
+    /// thread, driven by iterating the main context and ticking the core
+    /// app like `Application.run` does.
+    #[test]
+    fn window_runs_shell() {
+        let _guard = egl_lock();
+        let Some(text) = test_gtk::run(|| {
+            let app = Application::default();
+            let overrides = Overrides {
+                command: Some(Command::Direct(
+                    ["/bin/sh", "-c", "echo SMOKE-$((6*7)); sleep 30"].iter().map(|a| (*a).into()).collect(),
+                )),
+                ..Overrides::NONE
+            };
+            let win = Window::new(&app, Some("smoke"));
+            action_fns::init_and_show_window(&app, &win, None, &overrides);
+
+            let ctx = glib::MainContext::default();
+            let start = Instant::now();
+            let mut text = String::new();
+            while start.elapsed() < Duration::from_secs(30) {
+                while ctx.iteration(false) {}
+                // SAFETY: the test app's runtime app is leaked.
+                let rt = unsafe { &*app.rt() };
+                let _ = app.core().tick(rt);
+
+                if let Some(core) = win.get_active_surface().and_then(|s| s.core()) {
+                    // SAFETY: the surface is alive while its window is.
+                    let core = unsafe { &mut *core };
+                    if core.perform_binding_action(BindingAction::SelectAll).unwrap_or(false) {
+                        text = core.selection_string().unwrap_or_default();
+                        if text.contains("SMOKE-42") {
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+
+            // The surface is registered with the core app.
+            assert_eq!(app.surfaces().len(), 1);
+            assert_eq!(win.get_active_surface().as_ref(), app.surfaces().first());
+
+            // Destroying the window frees the surface, which removes it from
+            // the core app (in finalize).
+            gtk4::prelude::GtkWindowExt::destroy(&win);
+            drop(win);
+            let start = Instant::now();
+            while !app.surfaces().is_empty() && start.elapsed() < Duration::from_secs(5) {
+                while ctx.iteration(false) {}
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(app.surfaces().is_empty(), "surface leaked after its window was destroyed");
+            text
+        }) else {
+            return;
+        };
+        assert!(text.contains("SMOKE-42"), "{text:?}");
+    }
+}

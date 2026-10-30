@@ -740,7 +740,7 @@ mod imp {
     impl Drop for Surface {
         // Zig: `finalize`.
         fn drop(&mut self) {
-            if let Some(v) = self.core_surface.take() {
+            if let Some(v) = self.core_surface.get() {
                 // Remove ourselves from the list of known surfaces in the
                 // app. We do this before deinit in case a callback triggers
                 // searching for this surface.
@@ -761,6 +761,8 @@ mod imp {
                     (*v).deinit();
                     drop(Box::from_raw(v));
                 }
+
+                self.core_surface.set(None);
             }
 
             // Clean up key sequence and key table state (dropped with the

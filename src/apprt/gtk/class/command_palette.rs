@@ -710,8 +710,8 @@ mod tests {
 
             // Jump commands need surfaces with a core surface (a running
             // terminal); they are covered by the GTK app smoke test in
-            // `apprt/gtk/app.rs`. The test application has none.
-            assert!(Application::default().surfaces().is_empty());
+            // `apprt/gtk/app.rs`.
+            let n_surfaces = Application::default().surfaces().len();
 
             let palette = CommandPalette::new();
             palette.set_property(properties::CONFIG, &config);
@@ -724,13 +724,14 @@ mod tests {
                         .prop_get_title().unwrap()
                 })
                 .collect();
-            assert!(!titles.iter().any(|t| t.starts_with("Focus:")));
+            assert_eq!(titles.iter().filter(|t| t.starts_with("Focus:")).count(), n_surfaces);
 
             // Activating a regular command emits trigger.
             let triggered = Rc::new(RefCell::new(None));
             let t = triggered.clone();
             palette.connect_trigger(move |_, a| *t.borrow_mut() = Some(a.clone()));
-            palette.activated(0);
+            let pos = titles.iter().position(|t| !t.starts_with("Focus:")).unwrap();
+            palette.activated(pos as u32);
             assert!(triggered.borrow().is_some());
 
             // The palette drops its own reference when its dialog closes.
