@@ -376,6 +376,11 @@ impl App {
     /// If the app currently has focus then all key events are processed.
     /// If the app does not have focus then only global key events are
     /// processed.
+    ///
+    /// Only runtimes with an app-level `config` (the embedded runtime and the
+    /// recording stand-in) call this; Zig compiles it lazily, so it is not
+    /// built with the GTK runtime.
+    #[cfg(any(test, not(feature = "gtk")))]
     pub fn key_event(&mut self, rt_app: &apprt::App, event: input::KeyEvent<'_>) -> bool {
         match event.action {
             // We don't care about key release events.

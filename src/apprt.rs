@@ -1,7 +1,6 @@
 //! Port of `src/apprt.zig`.
 //!
-//! STATUS: partial — `App`/`Surface` are stand-ins until the GTK apprt
-//! (`apprt/gtk.zig`) is ported (TODO(port-dedupe)).
+//! STATUS: ported
 //!
 //! "apprt" is the "application runtime" package. This abstracts the
 //! application runtime and lifecycle management such as creating windows,
@@ -17,6 +16,13 @@
 //! Rust notes: Zig's `apprt.runtime` (the comptime-selected implementation
 //! module) is [`rt`] because `runtime` is the module port of
 //! `apprt/runtime.zig` (whose `Runtime` enum is re-exported here).
+//!
+//! [`App`]/[`Surface`] are the GTK runtime's types when built with the
+//! `gtk` Cargo feature. Builds without it (and all test builds) use the
+//! recording [`standin`] types; in test builds with `gtk` the stand-ins
+//! wrap an optional real GTK app/surface and forward to it, so the core
+//! test suite can observe what it asked of the runtime while GTK smoke
+//! tests run the real apprt.
 
 // @generated-mods-begin (tools/scaffold.py; do not edit by hand)
 #[path = "apprt/action.rs"]
@@ -59,27 +65,44 @@ pub use self::gtk as rt;
 #[cfg(target_os = "macos")]
 pub use self::embedded as rt;
 
-// TODO(port-dedupe): replace with `rt::App` / `rt::Surface` once the GTK
-// (and embedded) apprts are ported.
+/// The runtime app and surface (Zig: `apprt.runtime.App`/`Surface`).
+#[cfg(all(feature = "gtk", not(test)))]
+pub use self::gtk::{App, Surface};
+#[cfg(any(test, not(feature = "gtk")))]
 pub use self::standin::{App, Surface};
 
-/// Stand-ins for the runtime's `App` and `Surface` types.
+/// An error from the runtime (Zig: the runtimes' inferred error sets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Error(pub String);
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Recording stand-ins for the runtime's `App` and `Surface` types: the
+/// runtime of builds without a GUI apprt (the `none` runtime) and of all
+/// test builds.
 ///
 /// They implement the subset of the apprt API that the core (`App.zig`,
 /// `Surface.zig`, the renderer and termio) calls, with the same method
-/// names as the Zig runtimes (in snake_case) so the GTK port drops in.
-/// They also record what the core asked of them so tests can observe it.
+/// names as the Zig runtimes (in snake_case). They also record what the
+/// core asked of them so tests can observe it. With the `gtk` feature, a
+/// stand-in can wrap a real GTK runtime object (`rt`), to which it then
+/// forwards every call (GTK smoke tests).
 ///
-/// API notes for the eventual runtimes:
+/// API notes (shared with the GTK runtime):
 /// * `perform_action` takes `&self` (the app is shared with other
-///   threads for `wakeup`) and fails with [`standin::Error`].
+///   threads for `wakeup`) and fails with [`Error`].
 /// * `clipboard_request` borrows the request; a runtime that keeps the
 ///   request (e.g. for a confirmation prompt) clones it, and hands it back
 ///   to `Surface::complete_clipboard_request` by reference.
 pub mod standin {
     use std::collections::HashMap;
     use std::ffi::{CStr, CString};
-    use std::fmt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -92,25 +115,19 @@ pub mod standin {
     use crate::config::Config;
     use crate::renderer;
 
-    /// An error from the runtime (Zig: the runtimes' inferred error sets).
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct Error(pub String);
-
-    impl fmt::Display for Error {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(&self.0)
-        }
-    }
-
-    impl std::error::Error for Error {}
+    pub use super::Error;
 
     fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// TODO(port-dedupe): replace with `crate::apprt::rt::App`.
+    /// The recording runtime app.
     #[derive(Debug, Default)]
     pub struct App {
+        /// The real GTK runtime app this stand-in forwards to, if any.
+        #[cfg(feature = "gtk")]
+        pub rt: Option<crate::apprt::gtk::App>,
+
         /// The app configuration (Zig: `App.config`).
         pub config: Config,
 
@@ -136,6 +153,10 @@ pub mod standin {
         /// Wake up the app event loop so it processes its mailbox.
         pub fn wakeup(&self) {
             self.wakeup_count.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                rt.wakeup();
+            }
         }
 
         /// The number of wakeups so far.
@@ -150,6 +171,10 @@ pub mod standin {
                 lock(&self.titles).push(v.title.to_owned());
             }
             lock(&self.actions).push((target, action.key()));
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.perform_action(target, action);
+            }
             Ok(self.handled)
         }
 
@@ -162,9 +187,13 @@ pub mod standin {
         }
     }
 
-    /// TODO(port-dedupe): replace with `crate::apprt::rt::Surface`.
+    /// The recording runtime surface.
     #[derive(Debug)]
     pub struct Surface {
+        /// The real GTK runtime surface this stand-in forwards to, if any.
+        #[cfg(feature = "gtk")]
+        pub rt: Option<crate::apprt::gtk::Surface>,
+
         /// The core surface (Zig: `core_surface`).
         pub core_surface: *mut crate::surface::Surface,
 
@@ -203,6 +232,8 @@ pub mod standin {
     impl Default for Surface {
         fn default() -> Self {
             Surface {
+                #[cfg(feature = "gtk")]
+                rt: None,
                 core_surface: std::ptr::null_mut(),
                 app: std::ptr::null_mut(),
                 size: SurfaceSize {
@@ -224,6 +255,10 @@ pub mod standin {
     impl Surface {
         /// The core surface.
         pub fn core(&self) -> *mut crate::surface::Surface {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.core();
+            }
             self.core_surface
         }
 
@@ -241,22 +276,42 @@ pub mod standin {
         }
 
         pub fn get_content_scale(&self) -> Result<ContentScale, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.get_content_scale();
+            }
             Ok(self.content_scale)
         }
 
         pub fn get_size(&self) -> Result<SurfaceSize, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.get_size();
+            }
             Ok(self.size)
         }
 
         pub fn get_cursor_pos(&self) -> Result<CursorPos, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.get_cursor_pos();
+            }
             Ok(self.cursor_pos)
         }
 
         pub fn get_title(&self) -> Option<&CStr> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.get_title();
+            }
             self.title.as_deref()
         }
 
         pub fn close(&self, process_active: bool) {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                rt.close(process_active);
+            }
             *lock(&self.closed) = Some(process_active);
         }
 
@@ -273,6 +328,10 @@ pub mod standin {
             contents: &[ClipboardContent<'_>],
             _confirm: bool,
         ) -> Result<(), Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.set_clipboard(clipboard, contents, _confirm);
+            }
             let contents = contents
                 .iter()
                 .map(|c| {
@@ -299,6 +358,10 @@ pub mod standin {
             clipboard: Clipboard,
             req: &ClipboardRequest,
         ) -> Result<ClipboardReadResult, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.clipboard_request(clipboard, req);
+            }
             if !self.supports_clipboard(clipboard) {
                 return Ok(ClipboardReadResult::Unsupported);
             }
@@ -307,6 +370,10 @@ pub mod standin {
         }
 
         pub fn default_termio_env(&self) -> Result<EnvMap, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.default_termio_env();
+            }
             Ok(match &self.env {
                 Some(env) => env.clone(),
                 None => crate::global::environ_map(),
@@ -314,6 +381,10 @@ pub mod standin {
         }
 
         pub fn render_device_options(&self) -> Result<renderer::DeviceOptions, Error> {
+            #[cfg(feature = "gtk")]
+            if let Some(rt) = &self.rt {
+                return rt.render_device_options();
+            }
             Ok(renderer::DeviceOptions::default())
         }
     }

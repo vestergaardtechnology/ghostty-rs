@@ -27,7 +27,9 @@ use crate::input::command::Command as InputCommand;
 
 // TODO(port-dedupe): replace with crate::apprt::gtk::class::{
 // application::Application, surface::Surface, window::Window}.
-use crate::apprt::gtk::class::port_stubs::{Application, Surface, Window};
+use crate::apprt::gtk::class::application::Application;
+use crate::apprt::gtk::class::surface::Surface;
+use crate::apprt::gtk::class::window::Window;
 
 const LOG: &str = "gtk_ghostty_command_palette";
 
@@ -507,7 +509,9 @@ impl Command {
             glib::Object::builder().property(command_properties::CONFIG, config).build();
 
         // Surface should be initialized at this point.
-        let sort_key = surface.core().expect("jump surface must be initialized").id as usize;
+        let core = surface.core().expect("jump surface must be initialized");
+        // SAFETY: an initialized surface's core surface is live.
+        let sort_key = unsafe { (*core).id } as usize;
         let mut jump = JumpData { surface: WeakRef::empty(), title: None, description: None, sort_key };
         jump.surface.set(Some(surface));
         this.imp().data.replace(Some(CommandData::Jump(jump)));

@@ -27,7 +27,8 @@ use crate::apprt::gtk::class::{self, Blueprint};
 
 // TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
 // and crate::surface::Surface (core).
-use crate::apprt::gtk::class::port_stubs::{CoreSurface, Surface};
+use crate::apprt::gtk::class::surface::Surface;
+use crate::surface::Surface as CoreSurface;
 
 const LOG: &str = "gtk_ghostty_inspector_widget";
 

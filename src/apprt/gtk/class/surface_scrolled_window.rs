@@ -21,7 +21,7 @@ use crate::apprt::gtk::gtk_version;
 use crate::config::config::Scrollbar;
 
 // TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
-use crate::apprt::gtk::class::port_stubs::Surface;
+use crate::apprt::gtk::class::surface::Surface;
 
 /// The template of this class (Zig: `gresource.blueprint(...)`).
 pub const BLUEPRINT: Blueprint =
@@ -219,7 +219,7 @@ fn closure_scrollbar_policy(config: Option<&Config>) -> gtk4::PolicyType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::apprt::gtk::class::port_stubs::Size;
+    use crate::apprt::gtk::class::surface::Size;
     use crate::apprt::gtk::ext::test_gtk;
 
     #[test]

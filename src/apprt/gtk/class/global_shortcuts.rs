@@ -34,7 +34,7 @@ use crate::input::binding::{self, Action, Trigger};
 
 // TODO(port-dedupe): replace with
 // crate::apprt::gtk::class::application::Application
-use crate::apprt::gtk::class::port_stubs::Application;
+use crate::apprt::gtk::class::application::Application;
 
 const LOG: &str = "gtk_ghostty_global_shortcuts";
 

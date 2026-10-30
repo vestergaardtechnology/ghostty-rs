@@ -21,7 +21,7 @@ use crate::apprt::gtk::weak_ref::WeakRef;
 use crate::build_config;
 
 // TODO(port-dedupe): replace with crate::apprt::gtk::class::surface::Surface
-use crate::apprt::gtk::class::port_stubs::Surface;
+use crate::apprt::gtk::class::surface::Surface;
 
 /// The template of this class (Zig: `gresource.blueprint(...)`).
 pub const BLUEPRINT: Blueprint = Blueprint { major: 1, minor: 4, name: "inspector-window" };
