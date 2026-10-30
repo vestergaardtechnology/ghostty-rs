@@ -1165,3 +1165,3080 @@ impl KittySequence<'_> {
         writer.write_all(&[self.final_])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::input::key_mods::ModsSide;
+
+    #[test]
+    fn csi_u_mods_modifier_sequence_values() {
+        // This is all sort of trivially seen by looking at the code but
+        // we want to make sure we never regress this.
+        let mut mods = CsiUMods::default();
+        assert_eq!(1u8, mods.seq_int());
+
+        mods = CsiUMods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(2u8, mods.seq_int());
+
+        mods = CsiUMods {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(3u8, mods.seq_int());
+
+        mods = CsiUMods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(5u8, mods.seq_int());
+
+        mods = CsiUMods {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(4u8, mods.seq_int());
+
+        mods = CsiUMods {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(6u8, mods.seq_int());
+
+        mods = CsiUMods {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(7u8, mods.seq_int());
+
+        mods = CsiUMods {
+            alt: true,
+            ctrl: true,
+            shift: true,
+        };
+        assert_eq!(8u8, mods.seq_int());
+    }
+
+    #[test]
+    fn kitty_mods_modifier_sequence_values() {
+        // This is all sort of trivially seen by looking at the code but
+        // we want to make sure we never regress this.
+        let mut mods = KittyMods::default();
+        assert_eq!(1u16, mods.seq_int());
+
+        mods = KittyMods {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(2u16, mods.seq_int());
+
+        mods = KittyMods {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(3u16, mods.seq_int());
+
+        mods = KittyMods {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(5u16, mods.seq_int());
+
+        mods = KittyMods {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(4u16, mods.seq_int());
+
+        mods = KittyMods {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(6u16, mods.seq_int());
+
+        mods = KittyMods {
+            alt: true,
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(7u16, mods.seq_int());
+
+        mods = KittyMods {
+            alt: true,
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(8u16, mods.seq_int());
+    }
+
+    #[test]
+    fn kittysequence_backspace() {
+        // Plain
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127u");
+        }
+
+        // Release event
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                event: KittySequenceEvent::Release,
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;1:3u");
+        }
+
+        // Shift
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                mods: KittyMods {
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;2u");
+        }
+    }
+
+    #[test]
+    fn kittysequence_text() {
+        // Plain
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                text: b"A",
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;;65u");
+        }
+
+        // Release
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                event: KittySequenceEvent::Release,
+                text: b"A",
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;1:3;65u");
+        }
+
+        // Shift
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                mods: KittyMods {
+                    shift: true,
+                    ..Default::default()
+                },
+                text: b"A",
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;2;65u");
+        }
+    }
+
+    #[test]
+    fn kittysequence_text_with_control_characters() {
+        // By itself
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                text: b"\x0a",
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127u");
+        }
+
+        // With other printables
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            let seq = KittySequence {
+                key: 127,
+                final_: b'u',
+                text: b"A\x0a",
+                ..Default::default()
+            };
+            seq.encode(&mut writer).unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;;65u");
+        }
+    }
+
+    #[test]
+    fn kittysequence_special_no_mods() {
+        let mut writer: Vec<u8> = Vec::new();
+        let seq = KittySequence {
+            key: 1,
+            final_: b'A',
+            ..Default::default()
+        };
+        seq.encode(&mut writer).unwrap();
+        assert_eq!(&writer[..], b"\x1b[A");
+    }
+
+    #[test]
+    fn kittysequence_special_mods_only() {
+        let mut writer: Vec<u8> = Vec::new();
+        let seq = KittySequence {
+            key: 1,
+            final_: b'A',
+            mods: KittyMods {
+                shift: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        seq.encode(&mut writer).unwrap();
+        assert_eq!(&writer[..], b"\x1b[1;2A");
+    }
+
+    #[test]
+    fn kittysequence_special_mods_and_event() {
+        let mut writer: Vec<u8> = Vec::new();
+        let seq = KittySequence {
+            key: 1,
+            final_: b'A',
+            event: KittySequenceEvent::Release,
+            mods: KittyMods {
+                shift: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        seq.encode(&mut writer).unwrap();
+        assert_eq!(&writer[..], b"\x1b[1;2:3A");
+    }
+
+    #[test]
+    fn kitty_plain_text() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyA,
+                mods: Mods::default(),
+                utf8: b"abcd",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"abcd");
+    }
+
+    #[test]
+    fn kitty_repeat_with_just_disambiguate() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyA,
+                action: key::Action::Repeat,
+                mods: Mods::default(),
+                utf8: b"a",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"a");
+    }
+
+    #[test]
+    fn kitty_enter_backspace_tab() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Enter,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x0d");
+        }
+        {
+            // DECBKM reset
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Backspace,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    backarrow_key_mode: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x7f");
+        }
+        {
+            // DECBKM set (Kitty does not support DECBKM so there should be no change)
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Backspace,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    backarrow_key_mode: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x7f");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Tab,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x09");
+        }
+
+        // No release events if "report_all" is not set
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Enter,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Backspace,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Tab,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"");
+        }
+
+        // Release events if "report_all" is set
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Enter,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        report_all: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[13;1:3u");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Backspace,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        report_all: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[127;1:3u");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Tab,
+                    mods: Mods::default(),
+                    utf8: b"",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        report_all: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[9;1:3u");
+        }
+    }
+
+    #[test]
+    fn kitty_shift_backspace_emits_csi_u() {
+        // Backspace with shift modifier should emit CSI u sequence, not raw 0x7F.
+        // This is important for programs that want to distinguish shift+backspace.
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[127;2u");
+    }
+
+    #[test]
+    fn kitty_alt_backspace_emits_csi_u() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[127;3u");
+    }
+
+    #[test]
+    fn kitty_shift_enter_emits_csi_u() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Enter,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn kitty_shift_tab_emits_csi_u() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Tab,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[9;2u");
+    }
+
+    #[test]
+    fn kitty_enter_with_all_flags() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[13u");
+    }
+
+    #[test]
+    fn kitty_ctrl_with_all_flags() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::ControlLeft,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[57442;5u");
+    }
+
+    #[test]
+    fn kitty_ctrl_release_with_ctrl_mod_set() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                action: key::Action::Release,
+                key: Key::ControlLeft,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[57442;5:3u");
+    }
+
+    #[test]
+    fn kitty_delete() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Delete,
+                    mods: Mods::default(),
+                    utf8: b"\x7f",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[3~");
+        }
+    }
+
+    #[test]
+    fn kitty_composing_with_no_modifier() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyA,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                composing: true,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[test]
+    fn kitty_composing_with_modifier() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::ShiftLeft,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                composing: true,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[57441;2u");
+    }
+
+    #[test]
+    fn kitty_composed_text_with_report_all() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Unidentified,
+                mods: Mods::default(),
+                utf8: b"\xc3\xbb",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\xc3\xbb");
+    }
+
+    // A key whose base (unshifted) keysym is a dead key has no unshifted
+    // codepoint, so it has no kitty entry and falls back to writing the text
+    // directly. That must not happen on release or the text is inserted twice.
+    #[test]
+    fn kitty_text_fallback_on_release() {
+        for report_all in [false, true] {
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    action: key::Action::Release,
+                    key: Key::Unidentified,
+                    mods: Mods {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    utf8: b"!",
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_events: true,
+                        report_alternates: true,
+                        report_all: report_all,
+                        report_associated: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"");
+        }
+    }
+
+    #[test]
+    fn kitty_text_fallback_on_repeat() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                action: key::Action::Repeat,
+                key: Key::Unidentified,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"!",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"!");
+    }
+
+    #[test]
+    fn kitty_shift_a_on_us_keyboard() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyA,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"A",
+                unshifted_codepoint: 97,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[97:65;2u");
+    }
+
+    #[test]
+    fn kitty_matching_unshifted_codepoint() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyA,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"A",
+                unshifted_codepoint: 65,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // WARNING: This is not a valid encoding. This is a hypothetical encoding
+        // just to test that our logic is correct around matching unshifted
+        // codepoints. We get an alternate here because the unshifted_codepoint does
+        // not match the base key
+        assert_eq!(&writer[..], b"\x1b[65::97;2u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_with_caps() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyJ,
+                mods: Mods {
+                    caps_lock: true,
+                    ..Default::default()
+                },
+                utf8: b"J",
+                unshifted_codepoint: 106,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[106;65;74u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_colon_shift() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Semicolon,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b":",
+                unshifted_codepoint: ';' as u32,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[59:58;2;58u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_with_ru_layout() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Semicolon,
+                mods: Mods::default(),
+                utf8: b"\xd1\x87",
+                unshifted_codepoint: 1095,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[1095::59;;1095u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_with_ru_layout_shifted() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Semicolon,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"\xd0\xa7",
+                unshifted_codepoint: 1095,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[1095:1063:59;2;1063u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_with_ru_layout_caps_lock() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Semicolon,
+                mods: Mods {
+                    caps_lock: true,
+                    ..Default::default()
+                },
+                utf8: b"\xd0\xa7",
+                unshifted_codepoint: 1095,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[1095::59;65;1063u");
+    }
+
+    #[test]
+    fn kitty_report_alternates_with_hu_layout_release() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                action: key::Action::Release,
+                key: Key::BracketLeft,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                unshifted_codepoint: 337,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    report_events: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[337::91;5:3u");
+    }
+
+    // macOS generates utf8 text for arrow keys.
+    #[test]
+    fn kitty_up_arrow_with_utf8() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::ArrowUp,
+                mods: Mods::default(),
+                utf8: &[30],
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[A");
+    }
+
+    #[test]
+    fn kitty_shift_tab() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Tab,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[9;2u");
+    }
+
+    #[test]
+    fn kitty_left_shift() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::ShiftLeft,
+                mods: Mods::default(),
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[test]
+    fn kitty_left_shift_with_report_all() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::ShiftLeft,
+                mods: Mods::default(),
+                utf8: b"",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[57441u");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn kitty_report_associated_with_alt_text_on_macos_with_option() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyW,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                utf8: b"\xe2\x88\x91",
+                unshifted_codepoint: 119,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                macos_option_as_alt: OptionAsAlt::False,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[119;3;8721u");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn kitty_report_associated_with_alt_text_on_macos_with_alt() {
+        {
+            // With Alt modifier
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::KeyW,
+                    mods: Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    utf8: b"\xe2\x88\x91",
+                    unshifted_codepoint: 119,
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_all: true,
+                        report_alternates: true,
+                        report_associated: true,
+                        ..Default::default()
+                    },
+                    macos_option_as_alt: OptionAsAlt::True,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[119;3u");
+        }
+
+        {
+            // Without Alt modifier
+            let mut writer: Vec<u8> = Vec::new();
+            kitty(
+                &mut writer,
+                KeyEvent {
+                    key: Key::KeyW,
+                    mods: Mods::default(),
+                    utf8: b"\xe2\x88\x91",
+                    unshifted_codepoint: 119,
+                    ..Default::default()
+                },
+                Options {
+                    kitty_flags: KittyFlags {
+                        disambiguate: true,
+                        report_all: true,
+                        report_alternates: true,
+                        report_associated: true,
+                        ..Default::default()
+                    },
+                    macos_option_as_alt: OptionAsAlt::True,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[119;;8721u");
+        }
+    }
+
+    #[test]
+    fn kitty_report_associated_with_modifiers() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyJ,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"j",
+                unshifted_codepoint: 106,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[106;5u");
+    }
+
+    #[test]
+    fn kitty_report_associated() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyJ,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"J",
+                unshifted_codepoint: 106,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[106:74;2;74u");
+    }
+
+    #[test]
+    fn kitty_report_associated_on_release() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                action: key::Action::Release,
+                key: Key::KeyJ,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"J",
+                unshifted_codepoint: 106,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_all: true,
+                    report_alternates: true,
+                    report_associated: true,
+                    report_events: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[106:74;2:3u");
+    }
+
+    #[test]
+    fn kitty_alternates_omit_control_characters() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Delete,
+                mods: Mods::default(),
+                utf8: &[0x7F],
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    report_all: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[3~");
+    }
+
+    #[test]
+    fn kitty_enter_with_utf8_dead_key_state() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Enter,
+                utf8: b"A",
+                unshifted_codepoint: 0x0D,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_alternates: true,
+                    report_all: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"A");
+    }
+
+    #[test]
+    fn kitty_keypad_number() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Numpad1,
+                mods: Mods::default(),
+                utf8: b"1",
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[57400;;49u");
+    }
+
+    #[test]
+    fn kitty_backspace_with_utf8_dead_key_state() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                utf8: b"A",
+                unshifted_codepoint: 0x0D,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[test]
+    fn legacy_backspace_with_utf8_dead_key_state() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                utf8: b"A",
+                unshifted_codepoint: 0x0D,
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[test]
+    fn kitty_backspace_decbkm_reset_report_all_true() {
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                backarrow_key_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[127u");
+    }
+
+    #[test]
+    fn kitty_backspace_decbkm_set_report_all_true() {
+        // Kitty does not support DECBKM so there should be no difference.
+        let mut writer: Vec<u8> = Vec::new();
+        kitty(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                ..Default::default()
+            },
+            Options {
+                kitty_flags: KittyFlags {
+                    disambiguate: true,
+                    report_events: true,
+                    report_alternates: true,
+                    report_all: true,
+                    report_associated: true,
+                    ..Default::default()
+                },
+                backarrow_key_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[127u");
+    }
+
+    #[test]
+    fn legacy_enter_with_utf8_dead_key_state() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Enter,
+                utf8: b"A",
+                unshifted_codepoint: 0x0D,
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"A");
+    }
+
+    #[test]
+    fn legacy_esc_with_utf8_dead_key_state() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Escape,
+                utf8: b"A",
+                unshifted_codepoint: 0x0D,
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"A");
+    }
+
+    #[test]
+    fn legacy_alt_escape_with_modify_other_state_2() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Escape,
+                    mods: Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b\x1b");
+        }
+
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Escape,
+                    mods: Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Options {
+                    modify_other_keys_state_2: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[27;3;27~");
+        }
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_minus_underscore_on_us() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Minus,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"_",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1f");
+    }
+
+    #[test]
+    fn legacy_ctrl_alt_c() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyC,
+                mods: Mods {
+                    ctrl: true,
+                    alt: true,
+                    ..Default::default()
+                },
+                utf8: b"c",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b\x03");
+    }
+
+    #[test]
+    fn legacy_alt_c() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyC,
+                utf8: b"c",
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1bc");
+    }
+
+    #[test]
+    fn legacy_alt_e_only_unshifted() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyE,
+                unshifted_codepoint: 'e' as u32,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1be");
+    }
+
+    #[test]
+    fn legacy_alt_unicode() {
+        struct Case {
+            text: &'static str,
+            codepoint: u32,
+            expected: &'static [u8],
+        }
+        let cases = [
+            Case {
+                text: "é",
+                codepoint: 'é' as u32,
+                expected: "\x1Bé".as_bytes(),
+            },
+            Case {
+                text: "ő",
+                codepoint: 'ő' as u32,
+                expected: "\x1Bő".as_bytes(),
+            },
+            Case {
+                text: "界",
+                codepoint: '界' as u32,
+                expected: "\x1B界".as_bytes(),
+            },
+            Case {
+                text: "😀",
+                codepoint: '😀' as u32,
+                expected: "\x1B😀".as_bytes(),
+            },
+        ];
+
+        for case in cases {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Unidentified,
+                    utf8: case.text.as_bytes(),
+                    unshifted_codepoint: case.codepoint,
+                    mods: Mods {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Options {
+                    alt_esc_prefix: true,
+                    macos_option_as_alt: OptionAsAlt::True,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], case.expected);
+        }
+    }
+
+    #[test]
+    fn legacy_alt_unicode_only_unshifted() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Unidentified,
+                unshifted_codepoint: '界' as u32,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b\xe7\x95\x8c");
+    }
+
+    #[test]
+    fn legacy_alt_unicode_without_unshifted() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Unidentified,
+                utf8: b"\xf0\x9f\x98\x80",
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b\xf0\x9f\x98\x80");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn legacy_alt_x_macos() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyC,
+                utf8: b"\xe2\x89\x88",
+                unshifted_codepoint: 'c' as u32,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1bc");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn legacy_shift_alt_macos() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Period,
+                utf8: b">",
+                unshifted_codepoint: '.' as u32,
+                mods: Mods {
+                    alt: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b>");
+    }
+
+    #[test]
+    fn legacy_alt() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyF,
+                utf8: b"\xd1\x84",
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                alt_esc_prefix: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b\xd1\x84");
+    }
+
+    #[test]
+    fn legacy_ctrl_c() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyC,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"c",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x03");
+    }
+
+    #[test]
+    fn legacy_ctrl_space() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Space,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b" ",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x00");
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_backspace() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x08");
+    }
+
+    #[test]
+    fn legacy_ctrl_alt_shift_backspace() {
+        let event = KeyEvent {
+            key: Key::Backspace,
+            mods: Mods {
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(&mut writer, event, Options::default()).unwrap();
+        assert_eq!(&writer[..], b"\x1b\x08");
+
+        writer.clear();
+        legacy(
+            &mut writer,
+            event,
+            Options {
+                modify_other_keys_state_2: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[27;8;127~");
+    }
+
+    #[test]
+    fn legacy_backspace_decbkm_reset() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods::default(),
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x7f");
+    }
+
+    #[test]
+    fn legacy_backspace_decbkm_reset_with_ctrl() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x08");
+    }
+
+    #[test]
+    fn legacy_backspace_decbkm_set() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods::default(),
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x08");
+    }
+
+    #[test]
+    fn legacy_backspace_decbkm_set_with_ctrl() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x7f");
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_char_with_modify_other_state_2() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyH,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"H",
+                ..Default::default()
+            },
+            Options {
+                modify_other_keys_state_2: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[27;6;72~");
+    }
+
+    #[test]
+    fn legacy_ctrl_char_with_modify_other_state_2() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyP,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"p",
+                ..Default::default()
+            },
+            Options {
+                modify_other_keys_state_2: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[27;5;112~");
+    }
+
+    #[test]
+    fn legacy_ctrl_char_without_modify_other_state_2() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyP,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"p",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x10");
+    }
+
+    #[test]
+    fn legacy_ctrl_shift_char_with_modify_other_state_2_and_consumed_mods() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyH,
+                mods: Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                utf8: b"H",
+                ..Default::default()
+            },
+            Options {
+                modify_other_keys_state_2: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[27;6;72~");
+    }
+
+    #[test]
+    fn legacy_alt_digit_with_modify_other_state_2() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Digit8,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods::default(),
+                utf8: b"8",
+                ..Default::default()
+            },
+            Options {
+                modify_other_keys_state_2: true,
+                macos_option_as_alt: OptionAsAlt::True,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[27;3;56~");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_alt_digit_with_modify_other_state_2_and_macos_option_as_alt_false() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Digit8,
+                mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods {
+                    alt: true,
+                    ..Default::default()
+                },
+                utf8: b"[",
+                ..Default::default()
+            },
+            Options {
+                modify_other_keys_state_2: true,
+                macos_option_as_alt: OptionAsAlt::False,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"[");
+    }
+
+    #[test]
+    fn legacy_fixterm_awkward_letters() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::KeyI,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    utf8: b"i",
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[105;5u");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::KeyM,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    utf8: b"m",
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[109;5u");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::BracketLeft,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    utf8: b"[",
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[91;5u");
+        }
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Digit2,
+                    mods: Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                    utf8: b"@",
+                    unshifted_codepoint: '2' as u32,
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[64;5u");
+        }
+    }
+
+    // These tests apply Kitty's behavior to CSIu where ctrl+shift+letter
+    // is sent as the unshifted letter with the shift modifier present.
+    #[test]
+    fn legacy_ctrl_shift_letter_ascii() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::KeyM,
+                    mods: Mods {
+                        ctrl: true,
+                        shift: true,
+                        ..Default::default()
+                    },
+                    utf8: b"M",
+                    unshifted_codepoint: 'm' as u32,
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[109;6u");
+        }
+    }
+
+    #[test]
+    fn legacy_shift_function_key_should_use_all_mods() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::ArrowUp,
+                mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods {
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[1;2A");
+    }
+
+    #[test]
+    fn legacy_keypad_enter() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::NumpadEnter,
+                mods: Mods::default(),
+                consumed_mods: Mods::default(),
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x0d");
+    }
+
+    #[test]
+    fn legacy_keypad_1() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Numpad1,
+                mods: Mods::default(),
+                consumed_mods: Mods::default(),
+                utf8: b"1",
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"1");
+    }
+
+    #[test]
+    fn legacy_keypad_1_with_modify_other_state_2() {
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Numpad1,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    utf8: b"1",
+                    ..Default::default()
+                },
+                Options {
+                    modify_other_keys_state_2: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"1");
+        }
+
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::Numpad1,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    utf8: b"1",
+                    ..Default::default()
+                },
+                Options {
+                    keypad_key_application: true,
+                    modify_other_keys_state_2: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1bO5q");
+        }
+    }
+
+    #[test]
+    fn legacy_keypad_1_with_application_keypad() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Numpad1,
+                mods: Mods::default(),
+                consumed_mods: Mods::default(),
+                utf8: b"1",
+                ..Default::default()
+            },
+            Options {
+                keypad_key_application: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1bOq");
+    }
+
+    #[test]
+    fn legacy_keypad_1_with_application_keypad_and_numlock() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Numpad1,
+                mods: Mods {
+                    num_lock: true,
+                    ..Default::default()
+                },
+                consumed_mods: Mods::default(),
+                utf8: b"1",
+                ..Default::default()
+            },
+            Options {
+                keypad_key_application: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1bOq");
+    }
+
+    #[test]
+    fn legacy_keypad_1_with_application_keypad_and_numlock_ignore() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Numpad1,
+                mods: Mods {
+                    num_lock: false,
+                    ..Default::default()
+                },
+                consumed_mods: Mods::default(),
+                utf8: b"1",
+                ..Default::default()
+            },
+            Options {
+                keypad_key_application: true,
+                ignore_keypad_with_numlock: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"1");
+    }
+
+    #[test]
+    fn legacy_f1() {
+        // F1
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::F1,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    consumed_mods: Mods::default(),
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[1;5P");
+        }
+
+        // F2
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::F2,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    consumed_mods: Mods::default(),
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[1;5Q");
+        }
+
+        // F3
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::F3,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    consumed_mods: Mods::default(),
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[13;5~");
+        }
+
+        // F4
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::F4,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    consumed_mods: Mods::default(),
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[1;5S");
+        }
+
+        // F5 uses new encoding
+        {
+            let mut writer: Vec<u8> = Vec::new();
+            legacy(
+                &mut writer,
+                KeyEvent {
+                    key: Key::F5,
+                    mods: Mods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    consumed_mods: Mods::default(),
+                    ..Default::default()
+                },
+                Options::default(),
+            )
+            .unwrap();
+            assert_eq!(&writer[..], b"\x1b[15;5~");
+        }
+    }
+
+    #[test]
+    fn legacy_f13_through_f25() {
+        let cases: [(Key, u8); 13] = [
+            (Key::F13, 25),
+            (Key::F14, 26),
+            (Key::F15, 28),
+            (Key::F16, 29),
+            (Key::F17, 31),
+            (Key::F18, 32),
+            (Key::F19, 33),
+            (Key::F20, 34),
+            (Key::F21, 42),
+            (Key::F22, 43),
+            (Key::F23, 44),
+            (Key::F24, 45),
+            (Key::F25, 46),
+        ];
+        check_tilde_cases(&cases);
+    }
+
+    /// Shared body of the "f13 through f25" and "help and context menu"
+    /// tests.
+    fn check_tilde_cases(cases: &[(Key, u8)]) {
+        for &(k, code) in cases {
+            {
+                let mut writer: Vec<u8> = Vec::new();
+                legacy(
+                    &mut writer,
+                    KeyEvent {
+                        key: k,
+                        ..Default::default()
+                    },
+                    Options::default(),
+                )
+                .unwrap();
+                let expected = format!("\x1b[{}~", code);
+                assert_eq!(&writer[..], expected.as_bytes());
+            }
+
+            {
+                let mut writer: Vec<u8> = Vec::new();
+                legacy(
+                    &mut writer,
+                    KeyEvent {
+                        key: k,
+                        mods: Mods {
+                            ctrl: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    Options {
+                        modify_other_keys_state_2: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let expected = format!("\x1b[{};5~", code);
+                assert_eq!(&writer[..], expected.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_help_and_context_menu() {
+        let cases: [(Key, u8); 2] = [(Key::Help, 28), (Key::ContextMenu, 29)];
+        check_tilde_cases(&cases);
+    }
+
+    #[test]
+    fn legacy_left_shift_tab() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Tab,
+                mods: Mods {
+                    shift: true,
+                    sides: ModsSide {
+                        shift: ModSide::Left,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[Z");
+    }
+
+    #[test]
+    fn legacy_right_shift_tab() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Tab,
+                mods: Mods {
+                    shift: true,
+                    sides: ModsSide {
+                        shift: ModSide::Right,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x1b[Z");
+    }
+
+    #[test]
+    fn legacy_hu_layout_ctrl_sends_proper_codepoint() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::BracketLeft,
+                mods: Mods {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                utf8: b"\xc5\x91",
+                unshifted_codepoint: 337,
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        let actual = &writer[..];
+        assert_eq!(&actual[1..], b"[337;5u");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_super_only_on_macos_with_text() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyB,
+                utf8: b"b",
+                mods: Mods {
+                    super_: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_super_and_other_mods_on_macos_with_text() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::KeyB,
+                utf8: b"B",
+                mods: Mods {
+                    super_: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Options::default(),
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"");
+    }
+
+    #[test]
+    fn legacy_backspace_with_del_utf8_decbkm_reset() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                utf8: &[0x7F],
+                unshifted_codepoint: 0x08,
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x7f");
+    }
+
+    #[test]
+    fn legacy_backspace_with_del_utf8_decbkm_set() {
+        let mut writer: Vec<u8> = Vec::new();
+        legacy(
+            &mut writer,
+            KeyEvent {
+                key: Key::Backspace,
+                utf8: &[0x7F],
+                unshifted_codepoint: 0x08,
+                ..Default::default()
+            },
+            Options {
+                backarrow_key_mode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&writer[..], b"\x08");
+    }
+
+    #[test]
+    fn ctrlseq_normal_ctrl_c() {
+        let seq = ctrl_seq(
+            Key::Unidentified,
+            b"c",
+            'c' as u32,
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_normal_ctrl_c_right_control() {
+        let seq = ctrl_seq(
+            Key::Unidentified,
+            b"c",
+            'c' as u32,
+            Mods {
+                ctrl: true,
+                sides: ModsSide {
+                    ctrl: ModSide::Right,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_alt_should_be_allowed() {
+        let seq = ctrl_seq(
+            Key::Unidentified,
+            b"c",
+            'c' as u32,
+            Mods {
+                alt: true,
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_no_ctrl_does_nothing() {
+        assert!(ctrl_seq(Key::Unidentified, b"c", 'c' as u32, Mods::default()).is_none());
+    }
+
+    #[test]
+    fn ctrlseq_shifted_non_character() {
+        let seq = ctrl_seq(
+            Key::Unidentified,
+            b"_",
+            '-' as u32,
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x1Fu8);
+    }
+
+    #[test]
+    fn ctrlseq_caps_ascii_letter() {
+        let seq = ctrl_seq(
+            Key::Unidentified,
+            b"C",
+            'c' as u32,
+            Mods {
+                ctrl: true,
+                caps_lock: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_shift_does_not_generate_ctrl_seq() {
+        assert!(ctrl_seq(
+            Key::Unidentified,
+            b"C",
+            'c' as u32,
+            Mods {
+                shift: true,
+                ..Default::default()
+            }
+        )
+        .is_none());
+        assert!(ctrl_seq(
+            Key::Unidentified,
+            b"C",
+            'c' as u32,
+            Mods {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            }
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn ctrlseq_russian_ctrl_c() {
+        let seq = ctrl_seq(
+            Key::KeyC,
+            "с".as_bytes(),
+            0x0441,
+            Mods {
+                ctrl: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_russian_shifted_ctrl_c() {
+        let seq = ctrl_seq(
+            Key::KeyC,
+            "с".as_bytes(),
+            0x0441,
+            Mods {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        );
+        assert!(seq.is_none());
+    }
+
+    #[test]
+    fn ctrlseq_russian_alt_ctrl_c() {
+        let seq = ctrl_seq(
+            Key::KeyC,
+            "с".as_bytes(),
+            0x0441,
+            Mods {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+
+    #[test]
+    fn ctrlseq_right_ctrl_c() {
+        let seq = ctrl_seq(
+            Key::KeyC,
+            "с".as_bytes(),
+            'c' as u32,
+            Mods {
+                ctrl: true,
+                sides: ModsSide {
+                    ctrl: ModSide::Right,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(seq.unwrap(), 0x03u8);
+    }
+}
