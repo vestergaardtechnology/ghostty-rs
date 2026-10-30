@@ -76,6 +76,14 @@ pub struct NoopLibrary {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoopInitError {}
 
+impl std::fmt::Display for NoopInitError {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {}
+    }
+}
+
+impl std::error::Error for NoopInitError {}
+
 impl NoopLibrary {
     pub fn init() -> Result<NoopLibrary, NoopInitError> {
         Ok(NoopLibrary {})
