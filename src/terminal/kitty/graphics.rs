@@ -1,7 +1,6 @@
 //! Port of `src/terminal/kitty/graphics.zig`.
 //!
-//! STATUS: partial — `execute` is re-exported once `graphics_exec` is
-//! ported.
+//! STATUS: ported
 //!
 //! Kitty graphics protocol support.
 //!
@@ -25,6 +24,7 @@ pub use super::graphics_animation as animation;
 pub use super::graphics_pixel as pixel;
 pub use super::graphics_unicode as unicode;
 
+pub use super::graphics_exec::execute;
 pub use self::animation::Animation;
 pub use self::command::Command;
 pub use self::command::Parser as CommandParser;
