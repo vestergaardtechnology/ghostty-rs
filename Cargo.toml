@@ -29,11 +29,39 @@ path = "src/bin/ghostty-build-data.rs"
 name = "ghostty-gen"
 path = "src/bin/ghostty-gen.rs"
 
+[[bin]]
+name = "mdgen_ghostty_1"
+path = "src/build/mdgen/main_ghostty_1.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "mdgen_ghostty_5"
+path = "src/build/mdgen/main_ghostty_5.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_actions"
+path = "src/build/webgen/main_actions.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_commands"
+path = "src/build/webgen/main_commands.rs"
+required-features = ["docs"]
+
+[[bin]]
+name = "webgen_config"
+path = "src/build/webgen/main_config.rs"
+required-features = ["docs"]
+
 [features]
 # The GTK application runtime is the default on Linux; build the
 # runtime-less helper CLI (and the stand-in apprt) with
 # `--no-default-features`.
 default = ["gtk"]
+# The man page (`mdgen_*`) and website reference (`webgen_*`) generators
+# (Zig: `-Demit-docs` / `-Demit-webdata`).
+docs = []
 inspector = []
 # Crash reporting via the Sentry native SDK (links the system `sentry` C library).
 sentry = []
