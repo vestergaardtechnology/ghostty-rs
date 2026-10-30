@@ -5,12 +5,12 @@
 //! Port notes:
 //! * The shaper implementations live in `font::shaper::*` (the Zig files
 //!   are under `font/shaper/`); they are re-exported here like in Zig.
-//! * `RunOptions.cells` is a slice of [`RenderCell`] (the Zig type is a
+//! * `RunOptions.cells` is a [`CellsSlice`] (Zig:
 //!   `std.MultiArrayList(terminal.RenderState.Cell).Slice`).
 
 use crate::config::FontShapingBreak;
 use crate::font::shared_grid::SharedGrid;
-use crate::terminal::page;
+use crate::terminal::render::CellsSlice;
 use crate::terminal::style::Style;
 
 pub use super::shaper::cache::Cache;
@@ -79,27 +79,6 @@ pub struct Options<'a> {
     pub features: &'a [&'a str],
 }
 
-/// One cell of a render state row (Zig `terminal.RenderState.Cell`).
-///
-/// TODO(port-dedupe): replace with crate::terminal::render::RenderState's
-/// `Cell` once `terminal/render.zig` is ported.
-#[derive(Debug, Clone, Default)]
-pub struct RenderCell {
-    /// Always set, this is the raw copied cell data from page.Cell.
-    /// The managed memory (hyperlinks, graphames, etc.) is NOT safe
-    /// to access from here. It is duplicated into the other fields if
-    /// it exists.
-    pub raw: page::Cell,
-
-    /// Grapheme data for the cell. This is undefined unless the
-    /// raw cell's content_tag is `codepoint_grapheme`.
-    pub grapheme: Vec<u32>,
-
-    /// The style data for the cell. This is undefined unless
-    /// the style_id is non-default on raw.
-    pub style: Style,
-}
-
 /// Options for runIterator.
 #[derive(Clone, Copy)]
 pub struct RunOptions<'a> {
@@ -108,7 +87,7 @@ pub struct RunOptions<'a> {
     pub grid: &'a SharedGrid,
 
     /// The cells for the row to shape.
-    pub cells: &'a [RenderCell],
+    pub cells: CellsSlice<'a>,
 
     /// The x boundaries of the selection in this row.
     pub selection: Option<[u16; 2]>,
@@ -124,7 +103,7 @@ impl<'a> RunOptions<'a> {
     pub fn new(grid: &'a SharedGrid) -> RunOptions<'a> {
         RunOptions {
             grid,
-            cells: &[],
+            cells: CellsSlice::EMPTY,
             selection: None,
             cursor_x: None,
         }
