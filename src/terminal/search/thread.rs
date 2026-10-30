@@ -2,3 +2,4 @@
 //!
 //! STATUS: not yet ported.
 
+pub struct Thread;
