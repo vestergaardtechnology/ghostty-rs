@@ -264,7 +264,7 @@ pub unsafe extern "C" fn setopt_from_terminal(encoder_: Encoder, terminal_: Term
     let Some(t) = terminal_.as_ref() else {
         return;
     };
-    let t = &t.terminal;
+    let t = t.terminal();
     wrapper.opts.event = t.flags.mouse_event;
     wrapper.opts.format = t.flags.mouse_format;
     wrapper.last_cell = None;

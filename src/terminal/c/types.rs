@@ -1,13 +1,13 @@
 //! Port of `src/terminal/c/types.zig`.
 //!
 //! STATUS: partial — the manifest registers every public type of the
-//! batch-1 C API files (and the core enums they reference). Types owned by
-//! `c/terminal`, `c/render`, `c/formatter`, `c/grid_ref`, `c/selection`,
-//! `c/selection_gesture`, `c/search`, `c/snapshot`, `c/kitty_graphics` and
-//! the core `point`/`Selection`/`clipboard` status/`device` C types are
-//! TODO(c-api batch 2/3): add their entries to [`type_decls`] when those
-//! files are ported (the manifest tests that inspect them are `#[ignore]`d
-//! until then).
+//! batch-1 and batch-2 C API files (`c/terminal`, `c/grid_ref`,
+//! `c/selection`, `c/paste`, ...) and the core enums/structs they reference
+//! (`point`, `clipboard` statuses, `Selection` order/adjust). Types owned
+//! by `c/render`, `c/formatter`, `c/selection_gesture`, `c/search`,
+//! `c/snapshot` and `c/kitty_graphics` are TODO(c-api batch 3): add their
+//! entries to [`type_decls`] when those files are ported (the manifest
+//! tests that inspect them are `#[ignore]`d until then).
 //!
 //! Comptime-generated ABI metadata for the public libghostty-vt C types.
 //!
@@ -357,6 +357,9 @@ pub enum FieldType {
 /// The public name of `usize` (Zig: `intName(.unsigned, @bitSizeOf(usize))`).
 pub const USIZE: &str = if cfg!(target_pointer_width = "64") { "u64" } else { "u32" };
 
+/// The public name of `isize`.
+pub const ISIZE: &str = if cfg!(target_pointer_width = "64") { "i64" } else { "i32" };
+
 /// Shorthand for [`FieldType::Named`].
 pub const fn named(name: &'static str) -> FieldType {
     FieldType::Named(name)
@@ -625,7 +628,8 @@ fn generated_arms<T: CApiEnum>(rename: impl Fn(c_int) -> Option<&'static str>) -
 /// Zig identifiers are not the C API contract.
 pub fn type_decls() -> Vec<TypeDecl> {
     use super::{build_info, cell, color as color_c, io as io_c, key_encode, modes, mouse_encode};
-    use super::{osc, paste, result, row, sgr, style, sys};
+    use super::{grid_ref, osc, paste, result, row, selection, sgr, style, sys, terminal as term};
+    use crate::terminal::point;
     use crate::lib::allocator as alloc;
     use crate::terminal::color;
 
@@ -661,9 +665,62 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(cell::CellsView, len, named(USIZE)),
             ],
         ),
-        // TODO(c-api batch 2/3): GhosttyClipboardContent, GhosttyClipboardRead,
-        // GhosttyClipboardReadReply, GhosttyClipboardWrite,
-        // GhosttyClipboardWriteReply (c/terminal).
+        TypeDecl::init_struct::<term::ClipboardContent>(
+            "GhosttyClipboardContent",
+            vec![
+                field!(term::ClipboardContent, mime, named("GhosttyString")),
+                field!(term::ClipboardContent, data, named("GhosttyString")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ClipboardRead>(
+            "GhosttyClipboardRead",
+            vec![
+                field!(term::ClipboardRead, size, named(USIZE)),
+                field!(term::ClipboardRead, location, named("GhosttyClipboardLocation")),
+                field!(term::ClipboardRead, mimes, pointer("GhosttyString", true, true)),
+                field!(term::ClipboardRead, mimes_len, named(USIZE)),
+                field!(term::ClipboardRead, list, named("bool")),
+                field!(term::ClipboardRead, name, named("GhosttyString")),
+                field!(term::ClipboardRead, granted, named("bool")),
+                field!(term::ClipboardRead, can_remember, named("bool")),
+                field!(term::ClipboardRead, ctx, pointer("opaque", true, false)),
+                field!(term::ClipboardRead, reply, pointer("function", true, false)),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ClipboardReadReply>(
+            "GhosttyClipboardReadReply",
+            vec![
+                field!(term::ClipboardReadReply, size, named(USIZE)),
+                field!(term::ClipboardReadReply, result, named("GhosttyClipboardReadResult")),
+                field!(term::ClipboardReadReply, contents, pointer("GhosttyClipboardContent", true, true)),
+                field!(term::ClipboardReadReply, contents_len, named(USIZE)),
+                field!(term::ClipboardReadReply, available, pointer("GhosttyString", true, true)),
+                field!(term::ClipboardReadReply, available_len, named(USIZE)),
+                field!(term::ClipboardReadReply, remember, named("bool")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ClipboardWrite>(
+            "GhosttyClipboardWrite",
+            vec![
+                field!(term::ClipboardWrite, size, named(USIZE)),
+                field!(term::ClipboardWrite, location, named("GhosttyClipboardLocation")),
+                field!(term::ClipboardWrite, contents, pointer("GhosttyClipboardContent", true, true)),
+                field!(term::ClipboardWrite, contents_len, named(USIZE)),
+                field!(term::ClipboardWrite, name, named("GhosttyString")),
+                field!(term::ClipboardWrite, granted, named("bool")),
+                field!(term::ClipboardWrite, can_remember, named("bool")),
+                field!(term::ClipboardWrite, ctx, pointer("opaque", true, false)),
+                field!(term::ClipboardWrite, reply, pointer("function", true, false)),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ClipboardWriteReply>(
+            "GhosttyClipboardWriteReply",
+            vec![
+                field!(term::ClipboardWriteReply, size, named(USIZE)),
+                field!(term::ClipboardWriteReply, result, named("GhosttyClipboardWriteResult")),
+                field!(term::ClipboardWriteReply, remember, named("bool")),
+            ],
+        ),
         TypeDecl::init_struct::<Codepoints>(
             "GhosttyCodepoints",
             vec![
@@ -690,11 +747,47 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(color_c::X11Entry, color, named("GhosttyColorRgb")),
             ],
         ),
-        // TODO(c-api batch 2/3): GhosttyDeviceAttributes{,Primary,Secondary,
-        // Tertiary} (c/terminal), GhosttyFormatterScreenExtra,
+        TypeDecl::init_struct::<term::DeviceAttributes>(
+            "GhosttyDeviceAttributes",
+            vec![
+                field!(term::DeviceAttributes, primary, named("GhosttyDeviceAttributesPrimary")),
+                field!(term::DeviceAttributes, secondary, named("GhosttyDeviceAttributesSecondary")),
+                field!(term::DeviceAttributes, tertiary, named("GhosttyDeviceAttributesTertiary")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::DeviceAttributesPrimary>(
+            "GhosttyDeviceAttributesPrimary",
+            vec![
+                field!(term::DeviceAttributesPrimary, conformance_level, named("u16")),
+                field!(term::DeviceAttributesPrimary, features, array("u16", 64)),
+                field!(term::DeviceAttributesPrimary, num_features, named(USIZE)),
+            ],
+        ),
+        TypeDecl::init_struct::<term::DeviceAttributesSecondary>(
+            "GhosttyDeviceAttributesSecondary",
+            vec![
+                field!(term::DeviceAttributesSecondary, device_type, named("u16")),
+                field!(term::DeviceAttributesSecondary, firmware_version, named("u16")),
+                field!(term::DeviceAttributesSecondary, rom_cartridge, named("u16")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::DeviceAttributesTertiary>(
+            "GhosttyDeviceAttributesTertiary",
+            vec![field!(term::DeviceAttributesTertiary, unit_id, named("u32"))],
+        ),
+        // TODO(c-api batch 3): GhosttyFormatterScreenExtra,
         // GhosttyFormatterTerminalExtra, GhosttyFormatterTerminalOptions
-        // (c/formatter), GhosttyGridRef (c/grid_ref),
-        // GhosttyKittyGraphicsPlacementRenderInfo (c/kitty_graphics).
+        // (c/formatter), GhosttyKittyGraphicsPlacementRenderInfo
+        // (c/kitty_graphics).
+        TypeDecl::init_struct::<grid_ref::CGridRef>(
+            "GhosttyGridRef",
+            vec![
+                field!(grid_ref::CGridRef, size, named(USIZE)),
+                field!(grid_ref::CGridRef, node, pointer("opaque", false, true)),
+                field!(grid_ref::CGridRef, x, named("u16")),
+                field!(grid_ref::CGridRef, y, named("u16")),
+            ],
+        ),
         TypeDecl::init_struct::<io_c::MimeReader>(
             "GhosttyMimeReader",
             vec![
@@ -735,8 +828,38 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(paste::Request, allow_unsafe, named("bool")),
             ],
         ),
-        // TODO(c-api batch 2/3): GhosttyPoint, GhosttyPointCoordinate,
-        // GhosttyPointValue (core point C types).
+        TypeDecl::init_tagged_struct::<point::PointC>(
+            "GhosttyPoint",
+            vec![
+                field!(point::PointC, tag, named("GhosttyPointTag")),
+                field!(point::PointC, value, named("GhosttyPointValue")),
+            ],
+            "tag",
+            "value",
+            ArmSource::Generated(
+                ["active", "viewport", "screen", "history"]
+                    .into_iter()
+                    .map(|n| (n.to_string(), Some(n)))
+                    .collect(),
+            ),
+        ),
+        TypeDecl::init_struct::<point::Coordinate>(
+            "GhosttyPointCoordinate",
+            vec![
+                field!(point::Coordinate, x, named("u16")),
+                field!(point::Coordinate, y, named("u32")),
+            ],
+        ),
+        TypeDecl::init_union::<point::PointCValue>(
+            "GhosttyPointValue",
+            vec![
+                field!(union point::PointCValue, active, named("GhosttyPointCoordinate")),
+                field!(union point::PointCValue, viewport, named("GhosttyPointCoordinate")),
+                field!(union point::PointCValue, screen, named("GhosttyPointCoordinate")),
+                field!(union point::PointCValue, history, named("GhosttyPointCoordinate")),
+                field!(union point::PointCValue, _padding, array("u64", 2)),
+            ],
+        ),
         TypeDecl::init_struct::<io_c::Reader>(
             "GhosttyReader",
             vec![
@@ -744,10 +867,26 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(io_c::Reader, userdata, pointer("opaque", false, true)),
             ],
         ),
-        // TODO(c-api batch 2/3): GhosttyRenderState{Colors,Cursor,Overscan,
-        // RowId,RowSelection} (c/render), GhosttySelection,
-        // GhosttySelectionBuffer (c/selection),
+        // TODO(c-api batch 3): GhosttyRenderState{Colors,Cursor,Overscan,
+        // RowId,RowSelection} (c/render),
         // GhosttySelectionGesture{Behaviors,Geometry} (c/selection_gesture).
+        TypeDecl::init_struct::<selection::CSelection>(
+            "GhosttySelection",
+            vec![
+                field!(selection::CSelection, size, named(USIZE)),
+                field!(selection::CSelection, start, named("GhosttyGridRef")),
+                field!(selection::CSelection, end, named("GhosttyGridRef")),
+                field!(selection::CSelection, rectangle, named("bool")),
+            ],
+        ),
+        TypeDecl::init_struct::<selection::CSelectionBuffer>(
+            "GhosttySelectionBuffer",
+            vec![
+                field!(selection::CSelectionBuffer, ptr, pointer("GhosttySelection", false, true)),
+                field!(selection::CSelectionBuffer, cap, named(USIZE)),
+                field!(selection::CSelectionBuffer, len, named(USIZE)),
+            ],
+        ),
         TypeDecl::init_tagged_struct::<sgr::AttributeC>(
             "GhosttySgrAttribute",
             vec![
@@ -838,13 +977,218 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(sys::Image, data_len, named(USIZE)),
             ],
         ),
-        // TODO(c-api batch 2/3): GhosttyTerminal{DesktopNotification,
-        // MemoryUsage,ModeConfig,ProgramStatus,ProgressReport,ResizeWindow,
-        // ResizeWindowGrid,ResizeWindowValue,Scrollbar,SemanticPrompt,
-        // ScrollViewport,ScrollViewportValue,SelectLineOptions,
-        // SelectWordBetweenOptions,SelectWordOptions,SelectionFormatOptions,
-        // UnknownSequence,UnknownOscSequence,UnknownStringSequence,WriteStop,
-        // UnknownSequenceValue} (c/terminal, c/selection).
+        TypeDecl::init_struct::<term::DesktopNotification>(
+            "GhosttyTerminalDesktopNotification",
+            vec![
+                field!(term::DesktopNotification, size, named(USIZE)),
+                field!(term::DesktopNotification, title, named("GhosttyString")),
+                field!(term::DesktopNotification, body, named("GhosttyString")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::TerminalMemoryUsage>("GhosttyTerminalMemoryUsage", {
+            use term::TerminalMemoryUsage as M;
+            vec![
+                field!(M, size, named(USIZE)),
+                field!(M, compression_supported, named("bool")),
+                field!(M, primary_pages, named("u64")),
+                field!(M, primary_virtual_bytes, named("u64")),
+                field!(M, primary_resident_bytes, named("u64")),
+                field!(M, primary_compressed_pages, named("u64")),
+                field!(M, primary_compressed_bytes, named("u64")),
+                field!(M, primary_image_bytes, named("u64")),
+                field!(M, alternate_pages, named("u64")),
+                field!(M, alternate_virtual_bytes, named("u64")),
+                field!(M, alternate_resident_bytes, named("u64")),
+                field!(M, alternate_compressed_pages, named("u64")),
+                field!(M, alternate_compressed_bytes, named("u64")),
+                field!(M, alternate_image_bytes, named("u64")),
+            ]
+        }),
+        TypeDecl::init_struct::<term::ModeConfig>(
+            "GhosttyTerminalModeConfig",
+            vec![
+                field!(term::ModeConfig, mode, named("GhosttyMode")),
+                field!(term::ModeConfig, value, named("bool")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ProgramStatus>(
+            "GhosttyTerminalProgramStatus",
+            vec![
+                field!(term::ProgramStatus, size, named(USIZE)),
+                field!(term::ProgramStatus, state, named("GhosttyProgramStatusState")),
+                field!(term::ProgramStatus, kind, named("GhosttyProgramStatusKind")),
+                field!(term::ProgramStatus, progress, named("i8")),
+                field!(term::ProgramStatus, id, named("GhosttyString")),
+                field!(term::ProgramStatus, app, named("GhosttyString")),
+                field!(term::ProgramStatus, title, named("GhosttyString")),
+                field!(term::ProgramStatus, message, named("GhosttyString")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::ProgressReport>(
+            "GhosttyTerminalProgressReport",
+            vec![
+                field!(term::ProgressReport, size, named(USIZE)),
+                field!(term::ProgressReport, state, named("GhosttyTerminalProgressState")),
+                field!(term::ProgressReport, progress, named("i8")),
+            ],
+        ),
+        TypeDecl::init_tagged_struct::<term::ResizeWindow>(
+            "GhosttyTerminalResizeWindow",
+            vec![
+                field!(term::ResizeWindow, tag, named("GhosttyTerminalResizeWindowTag")),
+                field!(term::ResizeWindow, value, named("GhosttyTerminalResizeWindowValue")),
+            ],
+            "tag",
+            "value",
+            generated_arms::<term::ResizeWindowTag>(|tag| {
+                term::ResizeWindowTag::from_int(tag).and_then(term::ResizeWindow::c_field_rename)
+            }),
+        ),
+        TypeDecl::init_struct::<term::ResizeWindowGrid>(
+            "GhosttyTerminalResizeWindowGrid",
+            vec![
+                field!(term::ResizeWindowGrid, rows, named("u16")),
+                field!(term::ResizeWindowGrid, columns, named("u16")),
+            ],
+        ),
+        TypeDecl::init_union::<term::ResizeWindowValue>(
+            "GhosttyTerminalResizeWindowValue",
+            vec![
+                field!(union term::ResizeWindowValue, grid, named("GhosttyTerminalResizeWindowGrid")),
+                field!(union term::ResizeWindowValue, _padding, array("u64", 2)),
+            ],
+        ),
+        TypeDecl::init_struct::<term::TerminalScrollbar>(
+            "GhosttyTerminalScrollbar",
+            vec![
+                field!(term::TerminalScrollbar, total, named("u64")),
+                field!(term::TerminalScrollbar, offset, named("u64")),
+                field!(term::TerminalScrollbar, len, named("u64")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::SemanticPrompt>(
+            "GhosttyTerminalSemanticPrompt",
+            vec![
+                field!(term::SemanticPrompt, size, named(USIZE)),
+                field!(term::SemanticPrompt, kind, named("GhosttySemanticPromptKind")),
+                field!(term::SemanticPrompt, prompt_kind, named("GhosttySemanticPromptPromptKind")),
+                field!(term::SemanticPrompt, has_exit_code, named("bool")),
+                field!(term::SemanticPrompt, exit_code, named("i32")),
+                field!(term::SemanticPrompt, command, named("GhosttyString")),
+                field!(term::SemanticPrompt, error, named("GhosttyString")),
+            ],
+        ),
+        TypeDecl::init_tagged_struct::<term::ScrollViewport>(
+            "GhosttyTerminalScrollViewport",
+            vec![
+                field!(term::ScrollViewport, tag, named("GhosttyTerminalScrollViewportTag")),
+                field!(term::ScrollViewport, value, named("GhosttyTerminalScrollViewportValue")),
+            ],
+            "tag",
+            "value",
+            ArmSource::Generated(vec![
+                ("top".to_string(), None),
+                ("bottom".to_string(), None),
+                ("delta".to_string(), Some("delta")),
+                ("row".to_string(), Some("row")),
+                ("delta_prompt".to_string(), Some("delta_prompt")),
+            ]),
+        ),
+        TypeDecl::init_union::<crate::terminal::terminal::ScrollViewportCValue>("GhosttyTerminalScrollViewportValue", {
+            use crate::terminal::terminal::ScrollViewportCValue as V;
+            vec![
+                field!(union V, delta, named(ISIZE)),
+                field!(union V, row, named(USIZE)),
+                field!(union V, delta_prompt, named(ISIZE)),
+                field!(union V, _padding, array("u64", 2)),
+            ]
+        }),
+        TypeDecl::init_struct::<selection::SelectLineOptions>(
+            "GhosttyTerminalSelectLineOptions",
+            vec![
+                field!(selection::SelectLineOptions, size, named(USIZE)),
+                field!(selection::SelectLineOptions, r#ref, named("GhosttyGridRef")),
+                field!(selection::SelectLineOptions, whitespace, pointer("u32", true, true)),
+                field!(selection::SelectLineOptions, whitespace_len, named(USIZE)),
+                field!(selection::SelectLineOptions, semantic_prompt_boundary, named("bool")),
+            ],
+        ),
+        TypeDecl::init_struct::<selection::SelectWordBetweenOptions>(
+            "GhosttyTerminalSelectWordBetweenOptions",
+            vec![
+                field!(selection::SelectWordBetweenOptions, size, named(USIZE)),
+                field!(selection::SelectWordBetweenOptions, start, named("GhosttyGridRef")),
+                field!(selection::SelectWordBetweenOptions, end, named("GhosttyGridRef")),
+                field!(selection::SelectWordBetweenOptions, boundary_codepoints, pointer("u32", true, true)),
+                field!(selection::SelectWordBetweenOptions, boundary_codepoints_len, named(USIZE)),
+            ],
+        ),
+        TypeDecl::init_struct::<selection::SelectWordOptions>(
+            "GhosttyTerminalSelectWordOptions",
+            vec![
+                field!(selection::SelectWordOptions, size, named(USIZE)),
+                field!(selection::SelectWordOptions, r#ref, named("GhosttyGridRef")),
+                field!(selection::SelectWordOptions, boundary_codepoints, pointer("u32", true, true)),
+                field!(selection::SelectWordOptions, boundary_codepoints_len, named(USIZE)),
+            ],
+        ),
+        TypeDecl::init_struct::<selection::FormatOptions>(
+            "GhosttyTerminalSelectionFormatOptions",
+            vec![
+                field!(selection::FormatOptions, size, named(USIZE)),
+                field!(selection::FormatOptions, emit, named("GhosttyFormatterFormat")),
+                field!(selection::FormatOptions, unwrap, named("bool")),
+                field!(selection::FormatOptions, trim, named("bool")),
+                field!(selection::FormatOptions, selection, pointer("GhosttySelection", true, true)),
+            ],
+        ),
+        TypeDecl::init_tagged_struct::<term::UnknownSequence>(
+            "GhosttyTerminalUnknownSequence",
+            vec![
+                field!(term::UnknownSequence, tag, named("GhosttyTerminalUnknownSequenceTag")),
+                field!(term::UnknownSequence, value, named("GhosttyTerminalUnknownSequenceValue")),
+            ],
+            "tag",
+            "value",
+            generated_arms::<term::UnknownSequenceTag>(|tag| {
+                term::UnknownSequenceTag::from_int(tag).and_then(term::UnknownSequence::c_field_rename)
+            }),
+        ),
+        TypeDecl::init_struct::<term::UnknownOscSequence>(
+            "GhosttyTerminalUnknownOscSequence",
+            vec![
+                field!(term::UnknownOscSequence, truncated, named("bool")),
+                field!(term::UnknownOscSequence, content, named("GhosttyString")),
+                field!(term::UnknownOscSequence, terminator, named("GhosttyOscTerminator")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::UnknownStringSequence>(
+            "GhosttyTerminalUnknownStringSequence",
+            vec![
+                field!(term::UnknownStringSequence, truncated, named("bool")),
+                field!(term::UnknownStringSequence, content, named("GhosttyString")),
+            ],
+        ),
+        TypeDecl::init_struct::<term::WriteStop>(
+            "GhosttyTerminalWriteStop",
+            vec![
+                field!(term::WriteStop, size, named(USIZE)),
+                field!(term::WriteStop, consumed, named(USIZE)),
+                field!(term::WriteStop, reached, named("u32")),
+                field!(term::WriteStop, kind, named("GhosttyTerminalStringKind")),
+                field!(term::WriteStop, introducer, named("GhosttyTerminalStringIntroducer")),
+                field!(term::WriteStop, end, named("GhosttyTerminalStringEnd")),
+                field!(term::WriteStop, byte, named("u8")),
+            ],
+        ),
+        TypeDecl::init_union::<term::UnknownSequenceValue>(
+            "GhosttyTerminalUnknownSequenceValue",
+            vec![
+                field!(union term::UnknownSequenceValue, apc, named("GhosttyTerminalUnknownStringSequence")),
+                field!(union term::UnknownSequenceValue, osc, named("GhosttyTerminalUnknownOscSequence")),
+                field!(union term::UnknownSequenceValue, _padding, array("u64", 16)),
+            ],
+        ),
         TypeDecl::init_struct::<io_c::Writer>(
             "GhosttyWriter",
             vec![
@@ -898,8 +1242,35 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 )
             },
         ),
-        // TODO(c-api batch 2/3): GhosttyClipboardReadResult,
-        // GhosttyClipboardWriteResult (core clipboard status C enums).
+        TypeDecl::init_enum("GhosttyClipboardReadResult", "GHOSTTY_CLIPBOARD_READ_RESULT_", {
+            use crate::terminal::clipboard::ReadStatus as S;
+            values_of(
+                &[
+                    ("success", S::SUCCESS),
+                    ("denied", S::DENIED),
+                    ("unsupported", S::UNSUPPORTED),
+                    ("busy", S::BUSY),
+                    ("io_error", S::IO_ERROR),
+                ],
+                |(n, _)| n.to_string(),
+                |(_, v)| v.0 as i64,
+            )
+        }),
+        TypeDecl::init_enum("GhosttyClipboardWriteResult", "GHOSTTY_CLIPBOARD_WRITE_RESULT_", {
+            use crate::terminal::clipboard::WriteStatus as S;
+            values_of(
+                &[
+                    ("success", S::SUCCESS),
+                    ("denied", S::DENIED),
+                    ("unsupported", S::UNSUPPORTED),
+                    ("busy", S::BUSY),
+                    ("invalid_data", S::INVALID_DATA),
+                    ("io_error", S::IO_ERROR),
+                ],
+                |(n, _)| n.to_string(),
+                |(_, v)| v.0 as i64,
+            )
+        }),
         TypeDecl::init_enum(
             "GhosttyColorScheme",
             "GHOSTTY_COLOR_SCHEME_",
@@ -994,17 +1365,58 @@ pub fn type_decls() -> Vec<TypeDecl> {
             osc::command_type_values(),
         ),
         TypeDecl::init_enum("GhosttyPasteSource", "GHOSTTY_PASTE_SOURCE_", enum_values::<paste::Source>()),
-        // TODO(c-api batch 2/3): GhosttyPointTag, GhosttyProgramStatus*,
-        // GhosttyRenderState* enums (c/terminal, c/render).
+        TypeDecl::init_enum("GhosttyPointTag", "GHOSTTY_POINT_TAG_", {
+            values_of(
+                &[point::Tag::Active, point::Tag::Viewport, point::Tag::Screen, point::Tag::History],
+                |v| zig_name(&format!("{v:?}")),
+                |v| v as c_int as i64,
+            )
+        }),
+        TypeDecl::init_enum(
+            "GhosttyProgramStatusKind",
+            "GHOSTTY_PROGRAM_STATUS_KIND_",
+            enum_values::<term::ProgramStatusKind>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyProgramStatusState",
+            "GHOSTTY_PROGRAM_STATUS_STATE_",
+            enum_values::<term::ProgramStatusState>(),
+        ),
+        // TODO(c-api batch 3): GhosttyRenderState* enums (c/render).
         TypeDecl::init_enum("GhosttyRowData", "GHOSTTY_ROW_DATA_", enum_values::<row::RowData>()),
         TypeDecl::init_enum(
             "GhosttyRowSemanticPrompt",
             "GHOSTTY_ROW_SEMANTIC_",
             enum_values::<row::SemanticPrompt>(),
         ),
-        // TODO(c-api batch 2/3): GhosttySearch*, GhosttySelection*,
-        // GhosttySemanticPrompt* enums (c/search, c/selection,
-        // c/selection_gesture, c/terminal).
+        // TODO(c-api batch 3): GhosttySearch*, GhosttySelectionGesture*
+        // enums (c/search, c/selection_gesture).
+        TypeDecl::init_enum("GhosttySelectionAdjust", "GHOSTTY_SELECTION_ADJUST_", {
+            use crate::terminal::selection::Adjustment::*;
+            values_of(
+                &[Left, Right, Up, Down, Home, End, PageUp, PageDown, BeginningOfLine, EndOfLine],
+                |v| zig_name(&format!("{v:?}")),
+                |v| v as c_int as i64,
+            )
+        }),
+        TypeDecl::init_enum("GhosttySelectionOrder", "GHOSTTY_SELECTION_ORDER_", {
+            use crate::terminal::selection::Order::*;
+            values_of(
+                &[Forward, Reverse, MirroredForward, MirroredReverse],
+                |v| zig_name(&format!("{v:?}")),
+                |v| v as c_int as i64,
+            )
+        }),
+        TypeDecl::init_enum(
+            "GhosttySemanticPromptKind",
+            "GHOSTTY_SEMANTIC_PROMPT_",
+            enum_values::<term::SemanticPromptKind>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySemanticPromptPromptKind",
+            "GHOSTTY_SEMANTIC_PROMPT_PROMPT_",
+            enum_values::<term::SemanticPromptPromptKind>(),
+        ),
         TypeDecl::init_enum(
             "GhosttySgrAttributeTag",
             "GHOSTTY_SGR_ATTR_",
@@ -1033,7 +1445,67 @@ pub fn type_decls() -> Vec<TypeDecl> {
         ),
         TypeDecl::init_enum("GhosttySysLogLevel", "GHOSTTY_SYS_LOG_LEVEL_", enum_values::<sys::LogLevel>()),
         TypeDecl::init_enum("GhosttySysOption", "GHOSTTY_SYS_OPT_", enum_values::<sys::Option>()),
-        // TODO(c-api batch 2/3): GhosttyTerminal* enums (c/terminal).
+        TypeDecl::init_enum("GhosttyTerminalBoundary", "GHOSTTY_TERMINAL_BOUNDARY_", enum_values::<term::Boundary>()),
+        TypeDecl::init_enum(
+            "GhosttyTerminalCompressionMode",
+            "GHOSTTY_TERMINAL_COMPRESSION_MODE_",
+            enum_values::<term::CompressionMode>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalCompressionResult",
+            "GHOSTTY_TERMINAL_COMPRESSION_RESULT_",
+            enum_values::<term::CompressionResult>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalCursorStyle",
+            "GHOSTTY_TERMINAL_CURSOR_STYLE_",
+            enum_values::<term::TerminalCursorStyle>(),
+        ),
+        TypeDecl::init_enum("GhosttyTerminalData", "GHOSTTY_TERMINAL_DATA_", enum_values::<term::TerminalData>()),
+        TypeDecl::init_enum("GhosttyTerminalOption", "GHOSTTY_TERMINAL_OPT_", enum_values::<term::Option>()),
+        TypeDecl::init_enum(
+            "GhosttyTerminalProgressState",
+            "GHOSTTY_TERMINAL_PROGRESS_STATE_",
+            enum_values::<term::ProgressState>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalScreen",
+            "GHOSTTY_TERMINAL_SCREEN_",
+            enum_values::<term::TerminalScreen>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalResizeWindowTag",
+            "GHOSTTY_TERMINAL_RESIZE_WINDOW_",
+            enum_values::<term::ResizeWindowTag>(),
+        ),
+        TypeDecl::init_enum("GhosttyTerminalScrollViewportTag", "GHOSTTY_SCROLL_VIEWPORT_", {
+            use crate::terminal::terminal::ScrollViewportTag::*;
+            values_of(
+                &[Top, Bottom, Delta, Row, DeltaPrompt],
+                |v| zig_name(&format!("{v:?}")),
+                |v| v as c_int as i64,
+            )
+        }),
+        TypeDecl::init_enum(
+            "GhosttyTerminalStringEnd",
+            "GHOSTTY_TERMINAL_STRING_END_",
+            enum_values::<term::StringEnd>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalStringIntroducer",
+            "GHOSTTY_TERMINAL_STRING_INTRODUCER_",
+            enum_values::<term::StringIntroducer>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalStringKind",
+            "GHOSTTY_TERMINAL_STRING_KIND_",
+            enum_values::<term::StringKind>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyTerminalUnknownSequenceTag",
+            "GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_",
+            enum_values::<term::UnknownSequenceTag>(),
+        ),
         TypeDecl {
             name: "GhosttyCell",
             info: TypeInfo::Packed {
@@ -1700,8 +2172,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(c-api batch 2/3): needs the c/terminal and c/render enums in the manifest"]
-    fn manifest_uses_public_enum_names_terminal_render() {
+    fn manifest_uses_public_enum_names_terminal() {
         let parsed = parsed();
         let manifest_types = obj(&parsed["types"]);
 
@@ -1720,6 +2191,14 @@ mod tests {
 
         let terminal_data_values = obj(&manifest_types["GhosttyTerminalData"]["values"]);
         assert_eq!(41, terminal_data_values["MOUSE_SHAPE"].as_i64().unwrap());
+    }
+
+    /// (The render half of Zig's "manifest uses public enum names" test.)
+    #[test]
+    #[ignore = "TODO(c-api batch 3): needs the c/render enums in the manifest"]
+    fn manifest_uses_public_enum_names_render() {
+        let parsed = parsed();
+        let manifest_types = obj(&parsed["types"]);
 
         let kitty_kind_values = obj(&manifest_types["GhosttyRenderStateKittyPlacementKind"]["values"]);
         assert_eq!(1, kitty_kind_values["RELATIVE"].as_i64().unwrap());

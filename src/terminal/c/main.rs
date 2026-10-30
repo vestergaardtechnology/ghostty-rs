@@ -1,10 +1,10 @@
 //! Port of `src/terminal/c/main.zig`.
 //!
-//! STATUS: partial — the re-exports of the batch-1 C API files are ported;
-//! the `formatter`, `render`, `terminal` (beyond new/free), `selection`,
-//! `selection_gesture`, `search`, `snapshot`, `kitty_graphics`, `grid_ref`,
-//! `grid_ref_tracked` and `terminal_paste` aliases are TODO(c-api batch 2/3)
-//! (marked below).
+//! STATUS: partial — the re-exports of the batch-1 and batch-2 C API files
+//! (including `terminal`, `selection`, `grid_ref`, `grid_ref_tracked` and
+//! `terminal_paste`) are ported; the `formatter`, `render`,
+//! `selection_gesture`, `search`, `snapshot` and `kitty_graphics` aliases
+//! are TODO(c-api batch 3) (marked below).
 //!
 //! The C API of libghostty-vt (`include/ghostty/vt.h`).
 
@@ -173,7 +173,7 @@ pub use self::mouse_encode::setopt_from_terminal as mouse_encoder_setopt_from_te
 
 pub use self::paste::encode as paste_encode;
 pub use self::paste::is_safe as paste_is_safe;
-// TODO(c-api batch 2): terminal_paste (paste.terminal_paste).
+pub use self::paste::terminal_paste;
 
 pub use self::allocator::alloc as alloc_alloc;
 pub use self::allocator::free as alloc_free;
@@ -192,16 +192,50 @@ pub use self::style::style_is_default;
 pub use self::sys::log_stderr as sys_log_stderr;
 pub use self::sys::set as sys_set;
 
+pub use self::terminal::compress as terminal_compress;
+pub use self::terminal::compression_activity as terminal_compression_activity;
+pub use self::terminal::continuation_alloc as terminal_continuation_alloc;
+pub use self::terminal::continuation_buf as terminal_continuation_buf;
+pub use self::terminal::continuation_write as terminal_continuation_write;
 pub use self::terminal::free as terminal_free;
+pub use self::terminal::get as terminal_get;
+pub use self::terminal::get_multi as terminal_get_multi;
 pub use self::terminal::new as terminal_new;
-// TODO(c-api batch 2/3): the rest of the terminal_* API (c/terminal:
-// reset, resize, set, vt_write, vt_write_until, scroll_viewport,
-// compression_activity, compress, get, get_multi, continuation_write,
-// continuation_buf, continuation_alloc, grid_ref, grid_ref_track,
-// point_from_grid_ref), terminal_select_* / terminal_selection_*
-// (c/selection), selection_gesture_* (c/selection_gesture), search_*
-// (c/search), snapshot_* (c/snapshot), kitty_graphics_* (c/kitty_graphics),
-// grid_ref_* (c/grid_ref) and tracked_grid_ref_* (c/grid_ref_tracked).
+pub use self::terminal::reset as terminal_reset;
+pub use self::terminal::resize as terminal_resize;
+pub use self::terminal::scroll_viewport as terminal_scroll_viewport;
+pub use self::terminal::set as terminal_set;
+pub use self::terminal::vt_write as terminal_vt_write;
+pub use self::terminal::vt_write_until as terminal_vt_write_until;
+pub use self::selection::adjust as terminal_selection_adjust;
+pub use self::selection::all as terminal_select_all;
+pub use self::selection::contains as terminal_selection_contains;
+pub use self::selection::equal as terminal_selection_equal;
+pub use self::selection::format_alloc as terminal_selection_format_alloc;
+pub use self::selection::format_buf as terminal_selection_format_buf;
+pub use self::selection::line as terminal_select_line;
+pub use self::selection::order as terminal_selection_order;
+pub use self::selection::ordered as terminal_selection_ordered;
+pub use self::selection::output as terminal_select_output;
+pub use self::selection::word as terminal_select_word;
+pub use self::selection::word_between as terminal_select_word_between;
+// TODO(c-api batch 3): selection_gesture_* (c/selection_gesture),
+// search_* (c/search), snapshot_* (c/snapshot), kitty_graphics_*
+// (c/kitty_graphics).
+pub use self::terminal::grid_ref as terminal_grid_ref;
+pub use self::terminal::grid_ref_track as terminal_grid_ref_track;
+pub use self::terminal::point_from_grid_ref as terminal_point_from_grid_ref;
+
+pub use self::grid_ref::grid_ref_cell;
+pub use self::grid_ref::grid_ref_graphemes;
+pub use self::grid_ref::grid_ref_hyperlink_uri;
+pub use self::grid_ref::grid_ref_row;
+pub use self::grid_ref::grid_ref_style;
+pub use self::grid_ref_tracked::tracked_grid_ref_free;
+pub use self::grid_ref_tracked::tracked_grid_ref_has_value;
+pub use self::grid_ref_tracked::tracked_grid_ref_point;
+pub use self::grid_ref_tracked::tracked_grid_ref_set;
+pub use self::grid_ref_tracked::tracked_grid_ref_snapshot;
 
 pub use self::types::get_json as type_json;
 
@@ -287,6 +321,23 @@ pub(crate) mod tests {
         check_ghostty_h_enum::<mouse_encode::TrackingMode>("GHOSTTY_MOUSE_TRACKING_", &h).unwrap();
         check_ghostty_h_enum::<mouse_encode::Format>("GHOSTTY_MOUSE_FORMAT_", &h).unwrap();
         check_ghostty_h_enum::<paste::Source>("GHOSTTY_PASTE_SOURCE_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::Option>("GHOSTTY_TERMINAL_OPT_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::TerminalData>("GHOSTTY_TERMINAL_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::TerminalScreen>("GHOSTTY_TERMINAL_SCREEN_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::TerminalCursorStyle>("GHOSTTY_TERMINAL_CURSOR_STYLE_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::CompressionMode>("GHOSTTY_TERMINAL_COMPRESSION_MODE_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::CompressionResult>("GHOSTTY_TERMINAL_COMPRESSION_RESULT_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::Boundary>("GHOSTTY_TERMINAL_BOUNDARY_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::StringKind>("GHOSTTY_TERMINAL_STRING_KIND_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::StringIntroducer>("GHOSTTY_TERMINAL_STRING_INTRODUCER_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::StringEnd>("GHOSTTY_TERMINAL_STRING_END_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::ProgressState>("GHOSTTY_TERMINAL_PROGRESS_STATE_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::ProgramStatusState>("GHOSTTY_PROGRAM_STATUS_STATE_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::ProgramStatusKind>("GHOSTTY_PROGRAM_STATUS_KIND_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::SemanticPromptKind>("GHOSTTY_SEMANTIC_PROMPT_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::SemanticPromptPromptKind>("GHOSTTY_SEMANTIC_PROMPT_PROMPT_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::ResizeWindowTag>("GHOSTTY_TERMINAL_RESIZE_WINDOW_", &h).unwrap();
+        check_ghostty_h_enum::<terminal::UnknownSequenceTag>("GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_", &h).unwrap();
     }
 
     /// Rust port: struct layouts against the C declarations in the

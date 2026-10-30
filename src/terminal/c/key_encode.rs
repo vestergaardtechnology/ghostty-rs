@@ -136,7 +136,7 @@ pub unsafe extern "C" fn setopt_from_terminal(encoder_: Encoder, terminal_: Term
     let Some(t) = terminal_.as_ref() else {
         return;
     };
-    wrapper.opts = key_encode::Options::from_terminal(&t.terminal);
+    wrapper.opts = key_encode::Options::from_terminal(t.terminal());
 }
 
 /// C: ghostty_key_encoder_encode
