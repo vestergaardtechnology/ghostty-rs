@@ -2575,3 +2575,864 @@ impl KittyClipboardWriteReplyState {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    use crate::terminal::page::SemanticContent;
+    use crate::terminal::screen_set::Key as ScreenKey;
+    use crate::terminal::stream::Handler as _;
+    use crate::terminal::terminal::{CellSizePx, Options as TerminalOptions, ResizeFailPoint, RESIZE_TW};
+
+    // ----- test helpers (Rust-only) -----
+
+    fn term(cols: u16, rows: u16) -> Terminal {
+        Terminal::init(TerminalOptions::new(cols, rows)).unwrap()
+    }
+
+    /// `Stream.init(.{ .allocator = testing.allocator, .handler = handler })`
+    fn stream(handler: Handler<'_>) -> Stream<'_> {
+        Stream::init(stream::Options {
+            allocator: Some(osc::Allocator::GLOBAL),
+            ..stream::Options::new(handler)
+        })
+    }
+
+    fn plain(t: &Terminal) -> String {
+        t.plain_string().unwrap()
+    }
+
+    /// Byte-string equality with a readable failure message.
+    #[track_caller]
+    fn assert_bytes(expected: &[u8], actual: &[u8]) {
+        if expected != actual {
+            panic!(
+                "expected {:?}, found {:?}",
+                String::from_utf8_lossy(expected),
+                String::from_utf8_lossy(actual)
+            );
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        memchr::memmem::find(haystack, needle).is_some()
+    }
+
+    fn count(haystack: &[u8], needle: &[u8]) -> usize {
+        memchr::memmem::find_iter(haystack, needle).count()
+    }
+
+    fn hex_upper(v: &[u8]) -> String {
+        v.iter().map(|b| format!("{:02X}", b)).collect()
+    }
+
+    fn hex_lower(v: &[u8]) -> String {
+        v.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// The common pty capture: the last write, every write concatenated,
+    /// and the number of writes.
+    #[derive(Default)]
+    struct Pty {
+        last: Option<Vec<u8>>,
+        all: Vec<u8>,
+        calls: usize,
+    }
+
+    thread_local! {
+        static PTY: RefCell<Pty> = RefCell::new(Pty::default());
+    }
+
+    fn pty_write(_: &mut Handler<'_>, data: &[u8]) {
+        PTY.with(|p| {
+            let mut p = p.borrow_mut();
+            p.last = Some(data.to_vec());
+            p.all.extend_from_slice(data);
+            p.calls += 1;
+        });
+    }
+
+    fn pty_reset() {
+        PTY.with(|p| *p.borrow_mut() = Pty::default());
+    }
+
+    fn pty_last() -> Option<Vec<u8>> {
+        PTY.with(|p| p.borrow().last.clone())
+    }
+
+    fn pty_all() -> Vec<u8> {
+        PTY.with(|p| p.borrow().all.clone())
+    }
+
+    fn pty_calls() -> usize {
+        PTY.with(|p| p.borrow().calls)
+    }
+
+    // ----- tests -----
+
+    #[test]
+    fn render_hold_effect_fires_on_synchronized_output_transitions_only() {
+        thread_local! {
+            static EVENTS: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+        }
+        fn hold(_: &mut Handler<'_>, held: bool) {
+            EVENTS.with(|e| e.borrow_mut().push(held));
+        }
+        let events = || EVENTS.with(|e| e.borrow().clone());
+        let clear = || EVENTS.with(|e| e.borrow_mut().clear());
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.render_hold = Some(hold);
+        let mut s = stream(handler);
+
+        // Reset without a hold is ignored
+        s.next_slice(b"\x1b[?2026l");
+        assert!(events().is_empty());
+
+        // A set during a hold is ignored since the screen is half-drawn
+        s.next_slice(b"\x1b[?2026hA\x1b[?2026hB\x1b[?2026l\x1b[?2026l");
+        assert_eq!(vec![true, false], events());
+
+        // Save and restore report the same way as set and reset
+        clear();
+        s.next_slice(b"\x1b[?2026s\x1b[?2026h\x1b[?2026r\x1b[?2026r");
+        assert_eq!(vec![true, false], events());
+        assert!(!s.handler.terminal.modes.get(Mode::SynchronizedOutput));
+
+        // Full reset
+        clear();
+        s.next_slice(b"\x1b[?2026h\x1bc\x1bc");
+        assert_eq!(vec![true, false], events());
+
+        // Resize
+        clear();
+        s.next_slice(b"\x1b[?2026h");
+        s.handler.resize(Resize::new(80, 24)).unwrap();
+        s.handler.resize(Resize::new(80, 24)).unwrap();
+        assert_eq!(vec![true, false], events());
+    }
+
+    #[cfg(any())] // TODO(port-render): enable once render.rs (RenderState) is ported
+    #[test]
+    fn render_hold_effect_can_snapshot_the_frame_when_the_hold_begins() {
+        use crate::terminal::render::RenderState;
+
+        // This is how a renderer is expected to use the effect: capture the
+        // frame when the hold begins and then leave the render state alone
+        // until the hold ends.
+        thread_local! {
+            static STATE: RefCell<RenderState> = RefCell::new(RenderState::empty());
+            static SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
+        }
+        fn hold(h: &mut Handler<'_>, held: bool) {
+            if !held {
+                return;
+            }
+            STATE.with(|s| s.borrow_mut().update(h.terminal).unwrap());
+            SNAPSHOTS.with(|c| c.set(c.get() + 1));
+        }
+        fn char_at(y: usize, x: usize) -> u32 {
+            STATE.with(|s| s.borrow().row_data.cells[y].get(x).raw.codepoint())
+        }
+
+        let mut t = term(10, 3);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.render_hold = Some(hold);
+        let mut s = stream(handler);
+
+        // Normal output, the start of a hold, and part of the next frame all
+        // arrive in one write with no draw in between. The captured frame
+        // must have all of the output before the hold and none after.
+        s.next_slice(b"AB\x1b[?2026h\x1b[HXY");
+        assert_eq!(1, SNAPSHOTS.with(|c| c.get()));
+        assert_eq!('A' as u32, char_at(0, 0));
+        assert_eq!('B' as u32, char_at(0, 1));
+
+        // The frame is finished and the next hold begins before we ever
+        // draw. The finished frame must be captured, not lost.
+        s.next_slice(b"Z\x1b[?2026l\x1b[?2026h\x1b[H123");
+        assert_eq!(2, SNAPSHOTS.with(|c| c.get()));
+        assert_eq!('X' as u32, char_at(0, 0));
+        assert_eq!('Y' as u32, char_at(0, 1));
+        assert_eq!('Z' as u32, char_at(0, 2));
+    }
+
+    #[test]
+    fn resize_clears_synchronized_output_on_unchanged_cell_dimensions() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.handler.terminal.modes.set(Mode::SynchronizedOutput, true);
+        s.handler
+            .resize(Resize {
+                cols: 80,
+                rows: 24,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            })
+            .unwrap();
+        drop(s);
+
+        assert!(!t.modes.get(Mode::SynchronizedOutput));
+        assert_eq!(720u32, t.width_px);
+        assert_eq!(432u32, t.height_px);
+    }
+
+    #[test]
+    fn unknown_apc_effect_callback() {
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+            static OSC_COUNT: Cell<usize> = const { Cell::new(0) };
+            static CONTENT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+            static TRUNCATED: Cell<bool> = const { Cell::new(false) };
+        }
+        fn unknown_sequence(_: &mut Handler<'_>, value: UnknownSequence<'_>) {
+            match value {
+                UnknownSequence::Apc(apc_value) => {
+                    CONTENT.with(|c| *c.borrow_mut() = apc_value.content.to_vec());
+                    TRUNCATED.with(|c| c.set(apc_value.truncated));
+                }
+                UnknownSequence::Osc(_) => OSC_COUNT.with(|c| c.set(c.get() + 1)),
+            }
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.unknown_sequence = Some(unknown_sequence);
+        handler.apc_handler.unknown_max_bytes = 8;
+        let mut s = stream(handler);
+
+        // The APC limit does not enable OSC capture, so unknown OSCs are
+        // still ignored.
+        s.next_slice(b"\x1B]999;abcdef\x07");
+        s.next_slice(b"\x1B_abcd;payload\x1B\\");
+
+        assert_eq!(1, COUNT.with(|c| c.get()));
+        assert_eq!(0, OSC_COUNT.with(|c| c.get()));
+        assert_bytes(b"abcd;pay", &CONTENT.with(|c| c.borrow().clone()));
+        assert!(TRUNCATED.with(|c| c.get()));
+
+        // Aborted unknown APCs are suppressed.
+        s.next_slice(b"\x1B_Xpayload\x18");
+        assert_eq!(1, COUNT.with(|c| c.get()));
+    }
+
+    #[test]
+    fn unknown_osc_effect_callback() {
+        thread_local! {
+            static COUNT: Cell<usize> = const { Cell::new(0) };
+            static CONTENT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+            static TERMINATOR: Cell<Option<osc::Terminator>> = const { Cell::new(None) };
+        }
+        fn unknown_sequence(_: &mut Handler<'_>, value: UnknownSequence<'_>) {
+            let v = match value {
+                UnknownSequence::Osc(v) => v,
+                UnknownSequence::Apc(_) => unreachable!(),
+            };
+            CONTENT.with(|c| *c.borrow_mut() = v.content.to_vec());
+            TERMINATOR.with(|c| c.set(Some(v.terminator)));
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+        let count = || COUNT.with(|c| c.get());
+        let content = || CONTENT.with(|c| c.borrow().clone());
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.unknown_sequence = Some(unknown_sequence);
+        let mut s = Stream::init(stream::Options {
+            allocator: Some(osc::Allocator::GLOBAL),
+            osc_unknown_max_bytes: 24,
+            ..stream::Options::new(handler)
+        });
+
+        // ST through the stream's fast path.
+        s.next_slice(b"\x1B]7400;status=busy\x1B\\");
+        assert_eq!(1, count());
+        assert_bytes(b"7400;status=busy", &content());
+        assert_eq!(Some(osc::Terminator::St), TERMINATOR.with(|c| c.get()));
+
+        // BEL through the stream's fast path.
+        s.next_slice(b"\x1B]7400;?\x07");
+        assert_eq!(2, count());
+        assert_bytes(b"7400;?", &content());
+        assert_eq!(Some(osc::Terminator::Bel), TERMINATOR.with(|c| c.get()));
+
+        // Split across writes.
+        s.next_slice(b"\x1B]74");
+        s.next_slice(b"00;a");
+        s.next_slice(b"b\x07");
+        assert_eq!(3, count());
+        assert_bytes(b"7400;ab", &content());
+
+        // Byte-at-a-time through the scalar path.
+        for &ch in b"\x1B]7400;cd\x1B\\" {
+            s.next(ch);
+        }
+        assert_eq!(4, count());
+        assert_bytes(b"7400;cd", &content());
+
+        // CAN and SUB abort through the generic parser and are suppressed.
+        s.next_slice(b"\x1B]7400;x\x18");
+        s.next_slice(b"\x1B]7400;x\x1A");
+        assert_eq!(4, count());
+
+        // Supported OSCs still take their normal path.
+        s.next_slice(b"\x1B]2;title\x07");
+        assert_eq!(4, count());
+        assert_bytes(b"title", s.handler.terminal.get_title().unwrap());
+
+        // Clearing the limit restores the old behavior.
+        s.parser.osc_parser.unknown_max_bytes = 0;
+        s.next_slice(b"\x1B]7400;x\x07");
+        assert_eq!(4, count());
+    }
+
+    #[test]
+    fn resize_reports_mode_2048_geometry() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.handler.terminal.modes.set(Mode::InBandSizeReports, true);
+        s.handler
+            .resize(Resize {
+                cols: 100,
+                rows: 40,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            })
+            .unwrap();
+
+        assert_bytes(b"\x1B[48;40;100;720;900t", &pty_last().unwrap());
+    }
+
+    #[test]
+    fn resize_suppresses_mode_2048_reports() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Disabled mode suppresses a report even with pixels and a callback.
+        s.handler
+            .resize(Resize {
+                cols: 80,
+                rows: 24,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            })
+            .unwrap();
+        assert_eq!(0, pty_calls());
+
+        // Missing pixel geometry suppresses a report even with the mode enabled.
+        s.handler.terminal.modes.set(Mode::InBandSizeReports, true);
+        s.handler.resize(Resize::new(80, 24)).unwrap();
+        assert_eq!(0, pty_calls());
+
+        // A read-only stream has no write effect and remains successful.
+        let mut readonly_terminal = term(80, 24);
+        readonly_terminal.modes.set(Mode::InBandSizeReports, true);
+        let mut readonly_stream = stream(Handler::init(&mut readonly_terminal));
+        readonly_stream
+            .handler
+            .resize(Resize {
+                cols: 80,
+                rows: 24,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            })
+            .unwrap();
+        assert_eq!(0, pty_calls());
+    }
+
+    #[test]
+    fn resize_failure_preserves_terminal_state_and_does_not_write() {
+        // Port note: the Zig test fails the resize's first allocation with
+        // a FailingAllocator; the equivalent failure (the new tabstops) is
+        // injected with the resize tripwire.
+        pty_reset();
+        let mut t = term(10, 1);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.handler.terminal.modes.set(Mode::SynchronizedOutput, true);
+        s.handler.terminal.modes.set(Mode::InBandSizeReports, true);
+        RESIZE_TW.error_always(ResizeFailPoint::Tabstops, ResizeError::OutOfMemory);
+        assert_eq!(
+            Err(ResizeError::OutOfMemory),
+            s.handler.resize(Resize {
+                cols: 513,
+                rows: 1,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            })
+        );
+        RESIZE_TW.end(tripwire::ResetMode::Reset).unwrap();
+        drop(s);
+
+        assert!(t.modes.get(Mode::SynchronizedOutput));
+        assert_eq!(0, pty_calls());
+        assert_eq!(10, t.cols);
+        assert_eq!(0u32, t.width_px);
+        assert_eq!(0u32, t.height_px);
+    }
+
+    #[test]
+    fn resize_effects_do_not_change_canonical_terminal_state() {
+        fn write_pty(_: &mut Handler<'_>, _: &[u8]) {}
+
+        let mut authoritative = term(10, 5);
+        let mut readonly = term(10, 5);
+        authoritative.modes.set(Mode::InBandSizeReports, true);
+        readonly.modes.set(Mode::InBandSizeReports, true);
+
+        {
+            let mut authoritative_handler = Handler::init(&mut authoritative);
+            authoritative_handler.effects.write_pty = Some(write_pty);
+            let mut authoritative_stream = stream(authoritative_handler);
+            let mut readonly_stream = stream(Handler::init(&mut readonly));
+
+            let value = Resize {
+                cols: 20,
+                rows: 10,
+                cell_size_px: Some(CellSizePx { width: 9, height: 18 }),
+            };
+            authoritative_stream.handler.resize(value).unwrap();
+            readonly_stream.handler.resize(value).unwrap();
+        }
+
+        assert_eq!(authoritative.cols, readonly.cols);
+        assert_eq!(authoritative.rows, readonly.rows);
+        assert_eq!(authoritative.width_px, readonly.width_px);
+        assert_eq!(authoritative.height_px, readonly.height_px);
+        assert_eq!(authoritative.modes, readonly.modes);
+        assert_eq!(authoritative.scrolling_region, readonly.scrolling_region);
+    }
+
+    #[test]
+    fn basic_print() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"Hello");
+        assert_eq!(5, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+
+        assert_eq!("Hello", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn semantic_failure_is_sticky_while_processing_continues() {
+        // Port note: the Zig test fails the title allocation with a
+        // FailingAllocator; the same allocation fails here through the
+        // `VT_TW` tripwire.
+        let mut t = term(10, 2);
+        let mut s = stream(Handler::init(&mut t));
+        assert!(!s.handler.semantic_failure);
+
+        // Setting the title is a terminal-owned semantic update. Force its
+        // allocation to fail at the central vt_fallible boundary.
+        VT_TW.error_always(FailPoint::WindowTitle, OutOfMemory);
+        s.next_slice(b"\x1B]2;unavailable\x1B\\");
+        assert!(s.handler.semantic_failure);
+
+        // Later input and RIS remain best-effort and never clear the diagnostic.
+        VT_TW.end(tripwire::ResetMode::Reset).unwrap();
+        s.next_slice(b"ignored");
+        s.next_slice(b"\x1Bc");
+        s.next_slice(b"OK");
+        assert!(s.handler.semantic_failure);
+
+        assert_eq!("OK", plain(s.handler.terminal));
+        s.deinit();
+        drop(s);
+
+        // A new execution root starts without inheriting the diagnostic.
+        let mut fresh = Handler::init(&mut t);
+        assert!(!fresh.semantic_failure);
+        fresh.deinit();
+    }
+
+    #[test]
+    fn cursor_movement() {
+        let mut t = term(10, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Move cursor using escape sequences
+        s.next_slice(b"Hello\x1B[1;1H");
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+
+        // Move to position 2,3
+        s.next_slice(b"\x1B[2;3H");
+        assert_eq!(2, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(1, s.handler.terminal.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn erase_operations() {
+        let mut t = term(20, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Print some text
+        s.next_slice(b"Hello World");
+        assert_eq!(11, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+
+        // Move cursor to position 1,6 and erase from cursor to end of line
+        s.next_slice(b"\x1B[1;6H");
+        s.next_slice(b"\x1B[K");
+
+        assert_eq!("Hello", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn tabs() {
+        let mut t = term(80, 10);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"A\tB");
+        assert_eq!(9, s.handler.terminal.screens.active.cursor.x);
+
+        assert_eq!("A       B", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn modes_test() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Test wraparound mode
+        assert!(s.handler.terminal.modes.get(Mode::Wraparound));
+        s.next_slice(b"\x1B[?7l"); // Disable wraparound
+        assert!(!s.handler.terminal.modes.get(Mode::Wraparound));
+        s.next_slice(b"\x1B[?7h"); // Enable wraparound
+        assert!(s.handler.terminal.modes.get(Mode::Wraparound));
+    }
+
+    #[test]
+    fn scrolling_regions() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set scrolling region from line 5 to 20
+        s.next_slice(b"\x1B[5;20r");
+        assert_eq!(4, s.handler.terminal.scrolling_region.top);
+        assert_eq!(19, s.handler.terminal.scrolling_region.bottom);
+        assert_eq!(0, s.handler.terminal.scrolling_region.left);
+        assert_eq!(79, s.handler.terminal.scrolling_region.right);
+    }
+
+    #[test]
+    fn charsets() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Configure G0 as DEC special graphics
+        s.next_slice(b"\x1B(0");
+        s.next_slice(b"`"); // Should print diamond character
+
+        assert_eq!("◆", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn alt_screen() {
+        let mut t = term(10, 5);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Write to primary screen
+        s.next_slice(b"Primary");
+        assert_eq!(ScreenKey::Primary, s.handler.terminal.screens.active_key);
+
+        // Switch to alt screen
+        s.next_slice(b"\x1B[?1049h");
+        assert_eq!(ScreenKey::Alternate, s.handler.terminal.screens.active_key);
+
+        // Write to alt screen
+        s.next_slice(b"Alt");
+
+        // Switch back to primary
+        s.next_slice(b"\x1B[?1049l");
+        assert_eq!(ScreenKey::Primary, s.handler.terminal.screens.active_key);
+
+        assert_eq!("Primary", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn cursor_save_and_restore() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Move cursor to 10,15
+        s.next_slice(b"\x1B[10;15H");
+        assert_eq!(14, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(9, s.handler.terminal.screens.active.cursor.y);
+
+        // Save cursor
+        s.next_slice(b"\x1B7");
+
+        // Move cursor elsewhere
+        s.next_slice(b"\x1B[1;1H");
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+
+        // Restore cursor
+        s.next_slice(b"\x1B8");
+        assert_eq!(14, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(9, s.handler.terminal.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn attributes() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Set bold and write text
+        s.next_slice(b"\x1B[1mBold\x1B[0m");
+
+        // Verify we can write attributes - just check the string was written
+        assert_eq!("Bold", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn decrqss_responses() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        #[track_caller]
+        fn expect_response(expected: &[u8]) {
+            assert_eq!(1, pty_calls());
+            assert_bytes(expected, &pty_last().unwrap());
+            pty_reset();
+        }
+
+        // SGR
+        s.next_slice(b"\x1B[1m\x1BP$qm\x1B\\");
+        expect_response(b"\x1BP1$r0;1m\x1B\\");
+
+        // Overline
+        s.next_slice(b"\x1B[0;53m\x1BP$qm\x1B\\");
+        expect_response(b"\x1BP1$r0;53m\x1B\\");
+
+        // Requests larger than the parser's fixed request buffer are ignored,
+        // and the next DCS command must still be processed normally.
+        s.next_slice(b"\x1BP$qfoo\x1B\\");
+        assert_eq!(0, pty_calls());
+        assert!(!s.handler.semantic_failure);
+        s.next_slice(b"\x1BP$qm\x1B\\");
+        expect_response(b"\x1BP1$r0;53m\x1B\\");
+    }
+
+    #[test]
+    fn decrqss_without_write_effect_is_ignored() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(b"\x1BP$qm\x1B\\");
+        assert!(!s.handler.semantic_failure);
+    }
+
+    #[test]
+    fn xtgettcap_responses() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        #[track_caller]
+        fn expect_response(expected: &str) {
+            assert_eq!(1, pty_calls());
+            assert_bytes(expected.as_bytes(), &pty_last().unwrap());
+            pty_reset();
+        }
+
+        // The full capability table comes from the static terminfo map; this
+        // checks the wiring for a valued and a valueless (boolean) capability.
+        s.next_slice(format!("\x1BP+q{}\x1B\\", hex_upper(b"Co")).as_bytes());
+        expect_response(&format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"Co"), hex_upper(b"256")));
+        s.next_slice(format!("\x1BP+q{}\x1B\\", hex_upper(b"am")).as_bytes());
+        expect_response(&format!("\x1BP1+r{}\x1B\\", hex_upper(b"am")));
+
+        // One response per requested key; lowercase hex is normalized by the
+        // DCS parser. The capture holds the last ("Co") reply.
+        s.next_slice(format!("\x1BP+q{};{}\x1B\\", hex_lower(b"am"), hex_lower(b"Co")).as_bytes());
+        assert_eq!(2, pty_calls());
+        assert_bytes(
+            format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"Co"), hex_upper(b"256")).as_bytes(),
+            &pty_last().unwrap(),
+        );
+        pty_reset();
+
+        // Unknown and malformed keys are skipped without an error.
+        s.next_slice(b"\x1BP+qWHO;5;GG\x1B\\");
+        assert_eq!(0, pty_calls());
+        assert!(!s.handler.semantic_failure);
+    }
+
+    #[test]
+    fn xtgettcap_without_write_effect_is_ignored() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        s.next_slice(format!("\x1BP+q{};{}\x1B\\", hex_upper(b"TN"), hex_upper(b"am")).as_bytes());
+        assert!(!s.handler.semantic_failure);
+    }
+
+    #[test]
+    fn xtgettcap_tn_responses() {
+        const MAX_NAME: [u8; MAX_TERMINFO_NAME_BYTES] = [b'a'; MAX_TERMINFO_NAME_BYTES];
+        const LONG_NAME: [u8; MAX_TERMINFO_NAME_BYTES + 1] = [b'a'; MAX_TERMINFO_NAME_BYTES + 1];
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        #[track_caller]
+        fn expect_response(expected: &str) {
+            assert_eq!(1, pty_calls());
+            assert_bytes(expected.as_bytes(), &pty_last().unwrap());
+            pty_reset();
+        }
+
+        let tn_query = format!("\x1BP+q{}\x1B\\", hex_upper(b"TN"));
+
+        // While no name is configured the query goes unanswered.
+        s.next_slice(tn_query.as_bytes());
+        assert_eq!(0, pty_calls());
+
+        // A configured name is reported hex-encoded.
+        s.handler.terminfo_name = Some(b"xterm-256color");
+        s.next_slice(tn_query.as_bytes());
+        expect_response(&format!(
+            "\x1BP1+r{}={}\x1B\\",
+            hex_upper(b"TN"),
+            hex_upper(b"xterm-256color")
+        ));
+
+        // A maximum-length name is still reported in full.
+        s.handler.terminfo_name = Some(&MAX_NAME);
+        s.next_slice(tn_query.as_bytes());
+        expect_response(&format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"TN"), hex_upper(&MAX_NAME)));
+
+        // An empty name is silent; "Co" is still answered.
+        s.handler.terminfo_name = Some(b"");
+        s.next_slice(format!("\x1BP+q{};{}\x1B\\", hex_upper(b"TN"), hex_upper(b"Co")).as_bytes());
+        expect_response(&format!("\x1BP1+r{}={}\x1B\\", hex_upper(b"Co"), hex_upper(b"256")));
+
+        // As are names beyond the maximum length.
+        s.handler.terminfo_name = Some(&LONG_NAME);
+        s.next_slice(tn_query.as_bytes());
+        assert_eq!(0, pty_calls());
+        assert!(!s.handler.semantic_failure);
+    }
+
+    #[test]
+    fn dcs_command_memory_is_released() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // A completed command transfers its allocation to Command; dcs_command
+        // must release it even when there is no write effect.
+        s.next_slice(b"\x1BP+q536D756C78\x1B\\");
+
+        // An incomplete command remains owned by the handler and must be released
+        // when the stream is deinitialized. (Rust frees both on drop.)
+        s.next_slice(b"\x1BP+q536D756C78");
+        s.deinit();
+    }
+
+    #[test]
+    fn decaln_screen_alignment() {
+        let mut t = term(10, 3);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Run DECALN
+        s.next_slice(b"\x1B#8");
+
+        // Verify entire screen is filled with 'E'
+        assert_eq!("EEEEEEEEEE\nEEEEEEEEEE\nEEEEEEEEEE", plain(s.handler.terminal));
+
+        // Cursor should be at 1,1
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.x);
+        assert_eq!(0, s.handler.terminal.screens.active.cursor.y);
+    }
+
+    #[test]
+    fn full_reset() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Make some changes
+        s.next_slice(b"Hello");
+        s.next_slice(b"\x1B[10;20H");
+        s.next_slice(b"\x1B[5;20r"); // Set scroll region
+        s.next_slice(b"\x1B[?7l"); // Disable wraparound
+        s.next_slice(b"\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+        assert!(s.handler.terminal.glyph_glossary.contains(0xE0A0));
+
+        // Full reset
+        s.next_slice(b"\x1Bc");
+
+        // Verify reset state
+        let t = &s.handler.terminal;
+        assert_eq!(0, t.screens.active.cursor.x);
+        assert_eq!(0, t.screens.active.cursor.y);
+        assert_eq!(0, t.scrolling_region.top);
+        assert_eq!(23, t.scrolling_region.bottom);
+        assert!(t.modes.get(Mode::Wraparound));
+        assert!(!t.glyph_glossary.contains(0xE0A0));
+    }
+
+    #[test]
+    fn glyph_protocol_apc_with_write_pty_callback() {
+        if !build_options::GLYPH_PROTOCOL {
+            return;
+        }
+
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1B_25a1;s\x1B\\");
+        assert_bytes(b"\x1B_25a1;s;fmt=glyf\x1B\\", &pty_last().unwrap());
+
+        s.next_slice(b"\x1B_25a1;r;cp=e0a0;AAAAAAAAAAAAAA==\x1B\\");
+        assert_bytes(b"\x1B_25a1;r;cp=e0a0;status=0\x1B\\", &pty_last().unwrap());
+        assert!(s.handler.terminal.glyph_glossary.contains(0xE0A0));
+    }
+
+    #[test]
+    fn ignores_query_actions() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // These should be ignored without error
+        s.next_slice(b"\x1B[c"); // Device attributes
+        s.next_slice(b"\x1B[5n"); // Device status report
+        s.next_slice(b"\x1B[6n"); // Cursor position report
+        s.next_slice(b"\x1B]4;0;?\x1B\\"); // OSC color query
+        s.next_slice(b"\x1B]21;foreground=?\x1B\\"); // Kitty color query
+        s.next_slice(b"\x1B]52;c;%%%invalid-base64%%%\x1B\\");
+        s.next_slice(b"\x1B_Ga=p,i=999\x1B\\"); // Missing Kitty image
+        s.next_slice(b"\x1B_25a1;r;cp=41;%%%invalid%%%\x1B\\"); // Rejected glyph
+
+        // Query, malformed input, protocol failure responses, and external-effect
+        // failures do not imply that terminal-owned semantic state diverged.
+        assert!(!s.handler.semantic_failure);
+
+        // Terminal should still be functional
+        s.next_slice(b"Test");
+        assert_eq!("Test", plain(s.handler.terminal));
+    }
+}
