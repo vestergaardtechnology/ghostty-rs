@@ -34,6 +34,50 @@ shell integration, themes, completions, vim/bat syntax, translations) into
 `<prefix>/share` (default `target/dist/share`), like the Zig build's
 `zig-out/share`.
 
+## libghostty-vt
+
+libghostty-vt is Ghostty's standalone terminal library: the `ghostty_*` C API
+of `src/terminal/c/` declared in `include/ghostty/vt.h`.
+`tools/build_lib_vt.sh [prefix]` builds it like `zig build -Demit-lib-vt`
+(only a C compiler, binutils and cargo are needed; no GTK, FreeType or
+fontconfig) and installs, Zig-style:
+
+```
+<prefix>/lib/libghostty-vt.so.0.1.0   (soname libghostty-vt.so.0, + .so.0/.so symlinks)
+<prefix>/lib/libghostty-vt.a
+<prefix>/include/ghostty/vt.h, include/ghostty/vt/*.h
+<prefix>/share/pkgconfig/libghostty-vt.pc, libghostty-vt-static.pc
+```
+
+The default prefix is `target/lib-vt/out`; `--debug` builds the dev profile
+and `GHOSTTY_LIB_VT_VERSION` overrides the version (Zig's
+`-Dlib-version-string`). Both libraries export only the libghostty-vt C API
+(205 functions, the same set as the Zig library): the crate is built as a
+`staticlib` into `target/lib-vt` with the lib-vt terminal options (no tmux
+control mode, version 0.1.0-dev), partially linked with `--gc-sections`
+from those functions, and every other symbol is made local. The normal
+`cargo build` is unaffected.
+
+```sh
+tools/build_lib_vt.sh /usr/local
+export PKG_CONFIG_PATH=/usr/local/share/pkgconfig
+cc app.c $(pkg-config --cflags --libs libghostty-vt)                            # shared
+cc -DGHOSTTY_STATIC app.c $(pkg-config --cflags --static --libs libghostty-vt-static)  # static
+```
+
+CMake projects can use `CMakeLists.txt` (the upstream wrapper, driving cargo):
+`FetchContent` / `add_subdirectory` gives the `ghostty-vt` and
+`ghostty-vt-static` targets, `cmake --install` plus `find_package(ghostty-vt)`
+gives `ghostty-vt::ghostty-vt`.
+
+`example/` holds upstream's C/C++ examples; `example/build_all.sh` builds the
+library, compiles every example against it with pkg-config (and the CMake
+examples with CMake) and runs them (`--prefix <dir>` runs them against
+another installed libghostty-vt, e.g. Zig's, for comparison). The Zig API
+examples are Rust examples of the crate's API:
+`cargo run --example vt`, `cargo run --example vt_stream`,
+`printf '\e[31mred\n' | cargo run --example formatter`.
+
 ## The macOS app
 
 `macos/` is Ghostty's Swift/AppKit app, unchanged except that it bundles

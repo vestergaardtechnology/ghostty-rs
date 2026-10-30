@@ -125,13 +125,23 @@ if [ ! -s "$work/exports.txt" ]; then
     exit 1
 fi
 
-# Every exported function must be declared by the public headers.
-grep -rhoE '\bghostty_[a-z0-9_]+[[:space:]]*\(' "$ROOT/include/ghostty/vt.h" "$ROOT/include/ghostty/vt" |
-    sed -E 's/[[:space:]]*\($//' | sort -u >"$work/header.txt"
+# Every exported function must be declared (`GHOSTTY_API`) by the public
+# headers, and every declared function must be exported (the Wasm
+# conveniences only exist on wasm32).
+find "$ROOT/include/ghostty/vt.h" "$ROOT/include/ghostty/vt" -name '*.h' -exec cat {} + | tr '\n' ' ' |
+    grep -oE 'GHOSTTY_API[^;(]*\bghostty_[a-z0-9_]+[[:space:]]*\(' |
+    grep -oE 'ghostty_[a-z0-9_]+[[:space:]]*\($' | grep -oE 'ghostty_[a-z0-9_]+' |
+    sort -u >"$work/header.txt"
 undeclared="$(comm -23 "$work/exports.txt" "$work/header.txt")"
 if [ -n "$undeclared" ]; then
     echo "build_lib_vt.sh: exported but not declared in include/ghostty/vt*.h:" >&2
     echo "$undeclared" >&2
+    exit 1
+fi
+missing="$(comm -13 "$work/exports.txt" "$work/header.txt" | grep -v '^ghostty_wasm_' || true)"
+if [ -n "$missing" ]; then
+    echo "build_lib_vt.sh: declared in include/ghostty/vt*.h but not exported:" >&2
+    echo "$missing" >&2
     exit 1
 fi
 
@@ -209,4 +219,4 @@ pc ghostty-vt "Ghostty VT library" "-L\${libdir} -lghostty-vt" \
 pc ghostty-vt-static "Ghostty VT library (static)" "\${libdir}/libghostty-vt.a" \
     >"$prefix/share/pkgconfig/libghostty-vt-static.pc"
 
-echo "libghostty-vt $version: $(wc -l <"$work/exports.txt") exported functions ($(wc -l <"$work/header.txt") declared in the headers) -> $prefix"
+echo "libghostty-vt $version: exports $(wc -l <"$work/exports.txt") functions (the headers declare $(grep -vc '^ghostty_wasm_' "$work/header.txt") + $(grep -c '^ghostty_wasm_' "$work/header.txt") wasm32-only) -> $prefix"

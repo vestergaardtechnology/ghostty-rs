@@ -8,6 +8,15 @@
 //!   style hash is computed from (through [`PackedStyle`]).
 //! - The wasm-specific `default`/`eql` strategies are not needed on the
 //!   native targets the port supports; the native strategy is used.
+//! - Memory layout: the style set lives in page memory, so the size of
+//!   `Style` decides the page layout (how many rows a page of a given
+//!   width holds, and so the memory a terminal uses). Zig's `Style` is 28
+//!   bytes with 4-byte alignment: each `Color` is 8 bytes (a `u8` tag and
+//!   a `packed struct(u24)` RGB payload, which is 4-byte aligned) and
+//!   `Flags` is a `u16`. Rust's `Flags` keeps one field per flag (9
+//!   bytes), so `Color` uses a `u16` tag (6 bytes) and `Style` is
+//!   `align(4)`, which gives `Style` exactly Zig's size and alignment
+//!   (checked at compile time below).
 
 use core::fmt;
 
@@ -26,7 +35,11 @@ pub type Id = size::StyleCountInt;
 pub const DEFAULT_ID: Id = 0;
 
 /// The style attributes for a cell.
+///
+/// `align(4)` (with `Color`'s `u16` tag) gives this Zig's size and
+/// alignment, which page layouts depend on; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(align(4))]
 pub struct Style {
     /// Various colors, all self-explanatory.
     pub fg_color: Color,
@@ -79,7 +92,11 @@ pub enum ColorTag {
 /// The color for an SGR attribute. A color can come from multiple
 /// sources so we use this to track the source plus color value so that
 /// we can properly react to things like palette changes.
+///
+/// The `u16` tag makes this 6 bytes so that [`Style`] has Zig's size; see
+/// the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u16)]
 pub enum Color {
     #[default]
     None,
@@ -723,6 +740,12 @@ impl RefCountedSetContext<Style> for SetContext {
 }
 
 pub type Set = RefCountedSet<Style, Id, size::CellCountInt, SetContext>;
+
+// Zig's `@sizeOf(Style)` / `@alignOf(Style)` and `@sizeOf(Set.Item)`: the
+// style set's item size is part of every page's memory layout.
+const _: () = assert!(core::mem::size_of::<Style>() == 28);
+const _: () = assert!(core::mem::align_of::<Style>() == 4);
+const _: () = assert!(core::mem::size_of::<SetItem>() == 36);
 
 /// The item type of [`Set`] (Zig: `Set.Item`).
 pub type SetItem = ref_counted_set::Item<Style, Id, size::CellCountInt>;

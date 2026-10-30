@@ -16,8 +16,9 @@ format, producing an escape sequence like `\x1b[<0;6;3M`.
 
 ## Usage
 
-Run the program:
+Build and run the program (from the repository root):
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-encode-mouse
+target/examples/bin/c_vt_encode_mouse
 ```

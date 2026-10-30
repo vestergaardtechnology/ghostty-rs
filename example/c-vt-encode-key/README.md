@@ -15,8 +15,9 @@ producing the escape sequence `\x1b[57442;5:3u`.
 
 ## Usage
 
-Run the program:
+Build and run the program (from the repository root):
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-encode-key
+target/examples/bin/c_vt_encode_key
 ```

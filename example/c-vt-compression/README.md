@@ -14,5 +14,6 @@ with other access to the terminal.
 Run the example:
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-compression
+target/examples/bin/c_vt_compression
 ```

@@ -9,15 +9,17 @@ read callback, so only what is actually pasted is ever read, and the
 result streams to the pty in chunks. It also shows the terminal-free
 building blocks for checking paste safety and encoding paste data.
 
-This uses a `build.zig` and `Zig` to build the C program so that we
-can reuse a lot of our build logic and depend directly on our source
-tree, but Ghostty emits a standard C library that can be used with any
+Upstream Ghostty builds this with a `build.zig`; in the Rust port,
+`example/build_all.sh` compiles it with the system C compiler against
+the libghostty-vt built by `tools/build_lib_vt.sh`, found with
+pkg-config. Ghostty emits a standard C library that can be used with any
 C tooling.
 
 ## Usage
 
-Run the program:
+Build and run the program (from the repository root):
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-paste
+target/examples/bin/c_vt_paste
 ```

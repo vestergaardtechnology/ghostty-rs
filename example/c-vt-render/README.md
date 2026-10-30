@@ -5,15 +5,17 @@ to create a render state, update it from terminal content, iterate rows
 and cells, read styles and colors, inspect cursor and row-local selection
 state, and manage dirty tracking.
 
-This uses a `build.zig` and `Zig` to build the C program so that we
-can reuse a lot of our build logic and depend directly on our source
-tree, but Ghostty emits a standard C library that can be used with any
+Upstream Ghostty builds this with a `build.zig`; in the Rust port,
+`example/build_all.sh` compiles it with the system C compiler against
+the libghostty-vt built by `tools/build_lib_vt.sh`, found with
+pkg-config. Ghostty emits a standard C library that can be used with any
 C tooling.
 
 ## Usage
 
-Run the program:
+Build and run the program (from the repository root):
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-render
+target/examples/bin/c_vt_render
 ```

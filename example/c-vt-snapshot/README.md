@@ -13,5 +13,6 @@ consistently on every supported host.
 Run the example:
 
 ```shell-session
-zig build run
+example/build_all.sh c-vt-snapshot
+target/examples/bin/c_vt_snapshot
 ```

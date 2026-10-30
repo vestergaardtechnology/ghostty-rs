@@ -3456,6 +3456,25 @@ mod tests {
     type M1 = Mask<Cell, { field_mask(&[cell_fields::CONTENT_TAG, cell_fields::STYLE_ID]) }, 4>;
     type M2 = Mask<Cell, { field_mask(&[cell_fields::CONTENT_CODEPOINT_DATA]) }, 4>;
 
+    // The page layout must match Zig's byte for byte: it decides how many
+    // rows a page of a given width holds (and so scrollback memory and the
+    // page records of snapshots). Zig: `Page.layout(std_capacity)` with
+    // the non-test grapheme capacity is 401408 bytes and adjusting it to
+    // 215 columns gives 217 rows.
+    #[test]
+    fn std_capacity_layout_matches_zig() {
+        let cap = Capacity {
+            grapheme_bytes: 8192,
+            ..STD_CAPACITY
+        };
+        let meta = MetaLayout::init(cap);
+        assert_eq!(4000, meta.styles_layout.total_size);
+        assert_eq!(26124, meta.total_size);
+        assert_eq!(401408, Page::layout(cap).total_size);
+        let adjusted = cap.adjust(Adjustment { cols: Some(215) }).unwrap();
+        assert_eq!(217, adjusted.rows);
+    }
+
     #[test]
     fn mask() {
         type M = M1;

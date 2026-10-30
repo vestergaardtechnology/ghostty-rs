@@ -12,8 +12,9 @@ mode.
 
 ## Usage
 
-Run the program:
+Build and run the program (from the repository root):
 
 ```shell-session
-zig build run
+example/build_all.sh cpp-vt-stream
+target/examples/bin/cpp_vt_stream
 ```
