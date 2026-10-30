@@ -23,17 +23,20 @@
 //! * The xev callbacks reach the loop through their `&mut Loop` argument
 //!   rather than through `Thread.loop`, since the loop is borrowed by its
 //!   own `run` while they execute.
-//! * On an error, Zig replaces the terminal contents with an error
-//!   message. The terminal is not ported yet, so the message is logged
-//!   (TODO(port-dedupe): write it to the terminal once `Terminal` lands).
+//! * The error messages written to the terminal on an abnormal exit are
+//!   built by [`Thread::error_message`].
 
 use std::fmt;
 
 use crate::crash;
 use crate::global::xev;
+use crate::lib::tinyio::TinyIo;
+use crate::terminal::csi::EraseDisplay;
+use crate::terminal::modes::Mode;
 use crate::renderer;
 use crate::termio::exec;
-use crate::termio::standin::{crash_surface, Error, KittyClipboardDirection, Termio, TermioThreadData};
+use crate::terminal::kitty::clipboard_grants::Direction as KittyClipboardDirection;
+use crate::termio::termio::{crash_surface, Error, Termio, ThreadData as TermioThreadData};
 use crate::termio::{Mailbox, Message};
 
 const LOG: &str = "io_thread";
@@ -209,7 +212,23 @@ impl Thread {
             // the error to the surface thread and let the apprt deal with it
             // in some way but this works for now. Without this, the user would
             // just see a blank terminal window.
-            log::error!(target: LOG, "{}", Self::error_message(err));
+            // SAFETY: `io` and the render state it points to are valid for
+            // the whole call; we hold the renderer state mutex while
+            // touching the terminal.
+            unsafe {
+                let state = &*(*io).renderer_state;
+                let mutex = state.mutex.as_ref();
+                mutex.lock_uncancelable(TinyIo);
+                let t = &mut *state.terminal.as_ptr();
+
+                // Hide the cursor
+                t.modes.set(Mode::CursorVisible, false);
+
+                let str = Self::error_message(err);
+                t.erase_display(EraseDisplay::Complete, false);
+                let _ = t.print_string(str.as_str());
+                mutex.unlock(TinyIo);
+            }
         }
 
         // If our loop is not stopped, then we need to keep running so that
@@ -375,10 +394,7 @@ This terminal is non-functional. Please close it and try again."
                     io.visibility_report(data, visible, force)?
                 }
                 Message::Crash => panic!("crash request, crashing intentionally"),
-                Message::ChangeConfig(mut config) => {
-                    io.change_config(data, &mut config)?;
-                    drop(config);
-                }
+                Message::ChangeConfig(config) => io.change_config(data, *config)?,
                 Message::Inspector(v) => flags.has_inspector = v,
                 // SAFETY: caller guarantee.
                 Message::Resize(v) => unsafe { Self::handle_resize(cb, l, v) },
@@ -677,22 +693,12 @@ mod tests {
 
     use super::*;
     use crate::apprt::surface::Message as SurfaceMessage;
-    use crate::termio::exec::testing::{direct_config, Harness};
+    use crate::termio::exec::testing::{direct_config, grid_size, Harness};
     use crate::termio::message::{KittyClipboardGrant, ScrollViewport, SizeReport};
     use crate::termio::DerivedConfig;
 
     fn size(cols: u32, rows: u32) -> renderer::Size {
-        renderer::Size {
-            screen: renderer::ScreenSize {
-                width: cols * 10,
-                height: rows * 20,
-            },
-            cell: renderer::CellSize {
-                width: 10,
-                height: 20,
-            },
-            padding: renderer::Padding::default(),
-        }
+        grid_size(cols, rows)
     }
 
     fn count(h: &Harness, pred: impl Fn(&SurfaceMessage) -> bool) -> usize {
@@ -713,12 +719,22 @@ mod tests {
         h.send(Message::Resize(size(100, 40)));
         h.send(Message::Resize(size(90, 35)));
         h.send(Message::Resize(size(80, 30)));
-        h.wait_io(|io| !io.resizes.is_empty());
+        h.wait_io(|io| io.terminal.rows == 30);
 
         // Wait out a few more coalesce periods: nothing else arrives.
         std::thread::sleep(Duration::from_millis(Coalesce::MIN_MS * 4));
-        let resizes = h.with_io(|io| io.resizes.clone());
+        h.collect_renderer_messages();
+        let resizes: Vec<renderer::Size> = h
+            .renderer_messages
+            .iter()
+            .filter_map(|m| match m {
+                renderer::Message::Resize(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
         assert_eq!(vec![size(80, 30)], resizes);
+        assert_eq!(size(80, 30), h.with_io(|io| io.size));
+        assert_eq!((80, 30), h.with_io(|io| (io.terminal.cols, io.terminal.rows)));
 
         h.wait_output("30 80");
         h.stop();
@@ -729,9 +745,10 @@ mod tests {
     fn synchronized_output_reset() {
         let mut h = Harness::new(direct_config(&["/bin/sh", "-c", "sleep 30"]));
         h.start();
+        h.with_io(|io| io.terminal.modes.set(Mode::SynchronizedOutput, true));
         let start = Instant::now();
         h.send(Message::StartSynchronizedOutput);
-        h.wait_io(|io| io.synchronized_output_resets == 1);
+        h.wait_io(|io| !io.terminal.modes.get(Mode::SynchronizedOutput));
         assert!(start.elapsed() >= Duration::from_millis(SYNC_RESET_MS - 50));
         h.stop();
     }
@@ -794,8 +811,8 @@ mod tests {
         h.stop();
     }
 
-    // Extra: the remaining messages are handled (stand-in no-ops) and the
-    // flags they control are updated.
+    // Extra: the remaining messages are handled and the flags they
+    // control are updated.
     #[test]
     fn drain_mailbox_messages() {
         let mut h = Harness::new(direct_config(&[
@@ -809,7 +826,9 @@ mod tests {
             visible: true,
             force: false,
         });
-        h.send(Message::ChangeConfig(Box::new(DerivedConfig::default())));
+        h.send(Message::ChangeConfig(Box::new(DerivedConfig::init(
+            &crate::config::Config::default(),
+        ))));
         h.send(Message::Inspector(true));
         h.send(Message::SizeReport(SizeReport::Mode2048));
         h.send(Message::ClearScreen { history: true });
@@ -841,6 +860,11 @@ mod tests {
         }
         h.stop();
         assert!(h.thread.flags.drain);
+
+        // The error is shown in the terminal.
+        let screen = h.screen();
+        assert!(screen.contains("error starting IO thread"), "{screen:?}");
+        assert!(!h.with_io(|io| io.terminal.modes.get(Mode::CursorVisible)));
     }
 
     #[test]

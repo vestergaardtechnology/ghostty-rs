@@ -11,12 +11,12 @@
 //! method at this revision (abnormal exits are handled by `Surface`).
 
 use crate::pty::{ProcessInfo, ProcessInfoValue};
-use crate::renderer::state::standin::Terminal;
+use crate::terminal::Terminal;
 use crate::renderer::{GridSize, ScreenSize};
 use crate::termio::exec::{
     Config as ExecConfig, Error, ThreadData as ExecThreadData,
 };
-use crate::termio::standin::{Termio, TermioDerivedConfig, TermioThreadData};
+use crate::termio::termio::{DerivedConfig as TermioDerivedConfig, Termio, ThreadData as TermioThreadData};
 use crate::termio::Exec;
 
 /// The preallocation size for the write request pool. This should be big

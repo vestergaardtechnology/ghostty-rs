@@ -54,6 +54,16 @@ pub mod standin {
     }
 
     impl Inspector {
+        /// Record data read from the pty (Zig: `Inspector.recordPtyRead`).
+        /// The stand-in records nothing.
+        pub fn record_pty_read(
+            &mut self,
+            _t: &mut crate::terminal::terminal::Terminal,
+            _data: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+
         /// Zig: `Inspector.rendererInfo`.
         pub fn renderer_info(&self) -> &RendererInfo {
             &self.renderer_info
