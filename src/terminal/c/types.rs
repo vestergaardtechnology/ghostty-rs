@@ -1,13 +1,6 @@
 //! Port of `src/terminal/c/types.zig`.
 //!
-//! STATUS: partial — the manifest registers every public type of the
-//! batch-1 and batch-2 C API files (`c/terminal`, `c/grid_ref`,
-//! `c/selection`, `c/paste`, ...) and the core enums/structs they reference
-//! (`point`, `clipboard` statuses, `Selection` order/adjust). Types owned
-//! by `c/render`, `c/formatter`, `c/selection_gesture`, `c/search`,
-//! `c/snapshot` and `c/kitty_graphics` are TODO(c-api batch 3): add their
-//! entries to [`type_decls`] when those files are ported (the manifest
-//! tests that inspect them are `#[ignore]`d until then).
+//! STATUS: ported
 //!
 //! Comptime-generated ABI metadata for the public libghostty-vt C types.
 //!
@@ -629,6 +622,7 @@ fn generated_arms<T: CApiEnum>(rename: impl Fn(c_int) -> Option<&'static str>) -
 pub fn type_decls() -> Vec<TypeDecl> {
     use super::{build_info, cell, color as color_c, io as io_c, key_encode, modes, mouse_encode};
     use super::{grid_ref, osc, paste, result, row, selection, sgr, style, sys, terminal as term};
+    use super::{formatter, kitty_graphics as kitty, render, search, selection_gesture as gesture, snapshot};
     use crate::terminal::point;
     use crate::lib::allocator as alloc;
     use crate::terminal::color;
@@ -775,10 +769,42 @@ pub fn type_decls() -> Vec<TypeDecl> {
             "GhosttyDeviceAttributesTertiary",
             vec![field!(term::DeviceAttributesTertiary, unit_id, named("u32"))],
         ),
-        // TODO(c-api batch 3): GhosttyFormatterScreenExtra,
-        // GhosttyFormatterTerminalExtra, GhosttyFormatterTerminalOptions
-        // (c/formatter), GhosttyKittyGraphicsPlacementRenderInfo
-        // (c/kitty_graphics).
+        TypeDecl::init_struct::<formatter::ScreenOptionsExtra>("GhosttyFormatterScreenExtra", {
+            use formatter::ScreenOptionsExtra as E;
+            vec![
+                field!(E, size, named(USIZE)),
+                field!(E, cursor, named("bool")),
+                field!(E, style, named("bool")),
+                field!(E, hyperlink, named("bool")),
+                field!(E, protection, named("bool")),
+                field!(E, kitty_keyboard, named("bool")),
+                field!(E, charsets, named("bool")),
+            ]
+        }),
+        TypeDecl::init_struct::<formatter::TerminalOptionsExtra>("GhosttyFormatterTerminalExtra", {
+            use formatter::TerminalOptionsExtra as E;
+            vec![
+                field!(E, size, named(USIZE)),
+                field!(E, palette, named("bool")),
+                field!(E, modes, named("bool")),
+                field!(E, scrolling_region, named("bool")),
+                field!(E, tabstops, named("bool")),
+                field!(E, pwd, named("bool")),
+                field!(E, keyboard, named("bool")),
+                field!(E, screen, named("GhosttyFormatterScreenExtra")),
+            ]
+        }),
+        TypeDecl::init_struct::<formatter::TerminalOptions>("GhosttyFormatterTerminalOptions", {
+            use formatter::TerminalOptions as O;
+            vec![
+                field!(O, size, named(USIZE)),
+                field!(O, emit, named("GhosttyFormatterFormat")),
+                field!(O, unwrap, named("bool")),
+                field!(O, trim, named("bool")),
+                field!(O, extra, named("GhosttyFormatterTerminalExtra")),
+                field!(O, selection, pointer("GhosttySelection", true, true)),
+            ]
+        }),
         TypeDecl::init_struct::<grid_ref::CGridRef>(
             "GhosttyGridRef",
             vec![
@@ -788,6 +814,23 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(grid_ref::CGridRef, y, named("u16")),
             ],
         ),
+        TypeDecl::init_struct::<kitty::PlacementRenderInfo>("GhosttyKittyGraphicsPlacementRenderInfo", {
+            use kitty::PlacementRenderInfo as I;
+            vec![
+                field!(I, size, named(USIZE)),
+                field!(I, pixel_width, named("u32")),
+                field!(I, pixel_height, named("u32")),
+                field!(I, grid_cols, named("u32")),
+                field!(I, grid_rows, named("u32")),
+                field!(I, viewport_col, named("i32")),
+                field!(I, viewport_row, named("i32")),
+                field!(I, viewport_visible, named("bool")),
+                field!(I, source_x, named("u32")),
+                field!(I, source_y, named("u32")),
+                field!(I, source_width, named("u32")),
+                field!(I, source_height, named("u32")),
+            ]
+        }),
         TypeDecl::init_struct::<io_c::MimeReader>(
             "GhosttyMimeReader",
             vec![
@@ -867,9 +910,50 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(io_c::Reader, userdata, pointer("opaque", false, true)),
             ],
         ),
-        // TODO(c-api batch 3): GhosttyRenderState{Colors,Cursor,Overscan,
-        // RowId,RowSelection} (c/render),
-        // GhosttySelectionGesture{Behaviors,Geometry} (c/selection_gesture).
+        TypeDecl::init_struct::<render::Colors>("GhosttyRenderStateColors", {
+            use render::Colors as C;
+            vec![
+                field!(C, size, named(USIZE)),
+                field!(C, background, named("GhosttyColorRgb")),
+                field!(C, foreground, named("GhosttyColorRgb")),
+                field!(C, cursor, named("GhosttyColorRgb")),
+                field!(C, cursor_has_value, named("bool")),
+                field!(C, palette, array("GhosttyColorRgb", 256)),
+            ]
+        }),
+        TypeDecl::init_struct::<render::Cursor>("GhosttyRenderStateCursor", {
+            use render::Cursor as C;
+            vec![
+                field!(C, size, named(USIZE)),
+                field!(C, viewport_has_value, named("bool")),
+                field!(C, viewport_x, named("u16")),
+                field!(C, viewport_y, named("u16")),
+                field!(C, wide_tail, named("bool")),
+                field!(C, visible, named("bool")),
+                field!(C, blinking, named("bool")),
+                field!(C, password_input, named("bool")),
+                field!(C, visual_style, named("GhosttyRenderStateCursorVisualStyle")),
+            ]
+        }),
+        TypeDecl::init_struct::<render::Overscan>(
+            "GhosttyRenderStateOverscan",
+            vec![
+                field!(render::Overscan, above, named("u16")),
+                field!(render::Overscan, below, named("u16")),
+            ],
+        ),
+        TypeDecl::init_struct::<render::RowId>(
+            "GhosttyRenderStateRowId",
+            vec![field!(render::RowId, bits, array("u64", 2))],
+        ),
+        TypeDecl::init_struct::<render::RowSelection>(
+            "GhosttyRenderStateRowSelection",
+            vec![
+                field!(render::RowSelection, size, named(USIZE)),
+                field!(render::RowSelection, start_x, named("u16")),
+                field!(render::RowSelection, end_x, named("u16")),
+            ],
+        ),
         TypeDecl::init_struct::<selection::CSelection>(
             "GhosttySelection",
             vec![
@@ -885,6 +969,23 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 field!(selection::CSelectionBuffer, ptr, pointer("GhosttySelection", false, true)),
                 field!(selection::CSelectionBuffer, cap, named(USIZE)),
                 field!(selection::CSelectionBuffer, len, named(USIZE)),
+            ],
+        ),
+        TypeDecl::init_struct::<gesture::Behaviors>(
+            "GhosttySelectionGestureBehaviors",
+            vec![
+                field!(gesture::Behaviors, single_click, named("GhosttySelectionGestureBehavior")),
+                field!(gesture::Behaviors, double_click, named("GhosttySelectionGestureBehavior")),
+                field!(gesture::Behaviors, triple_click, named("GhosttySelectionGestureBehavior")),
+            ],
+        ),
+        TypeDecl::init_struct::<gesture::Geometry>(
+            "GhosttySelectionGestureGeometry",
+            vec![
+                field!(gesture::Geometry, columns, named("u32")),
+                field!(gesture::Geometry, cell_width, named("u32")),
+                field!(gesture::Geometry, padding_left, named("u32")),
+                field!(gesture::Geometry, screen_height, named("u32")),
             ],
         ),
         TypeDecl::init_tagged_struct::<sgr::AttributeC>(
@@ -1285,7 +1386,7 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 |v| v as c_int as i64,
             )
         }),
-        // TODO(c-api batch 2/3): GhosttyImageProtocol (c/render).
+        TypeDecl::init_enum("GhosttyImageProtocol", "GHOSTTY_IMAGE_PROTOCOL_", enum_values::<render::ImageProtocol>()),
         TypeDecl::init_enum("GhosttyKey", "GHOSTTY_KEY_", {
             use crate::input::key::Key;
             values_of(&Key::ALL, |v| v.as_str().to_string(), |v| v as c_int as i64)
@@ -1303,8 +1404,37 @@ pub fn type_decls() -> Vec<TypeDecl> {
             "GHOSTTY_KEY_ENCODER_OPT_",
             enum_values::<key_encode::Option>(),
         ),
-        // TODO(c-api batch 2/3): GhosttyKittyGraphics*, GhosttyKittyImage*,
-        // GhosttyKittyPlacementLayer (c/kitty_graphics).
+        TypeDecl::init_enum("GhosttyKittyGraphicsData", "GHOSTTY_KITTY_GRAPHICS_DATA_", enum_values::<kitty::Data>()),
+        TypeDecl::init_enum(
+            "GhosttyKittyGraphicsImageData",
+            "GHOSTTY_KITTY_IMAGE_DATA_",
+            enum_values::<kitty::ImageData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyKittyGraphicsPlacementData",
+            "GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_",
+            enum_values::<kitty::PlacementData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyKittyGraphicsPlacementIteratorOption",
+            "GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_",
+            enum_values::<kitty::PlacementIteratorOption>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyKittyImageCompression",
+            "GHOSTTY_KITTY_IMAGE_COMPRESSION_",
+            enum_values::<kitty::ImageCompression>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyKittyImageFormat",
+            "GHOSTTY_KITTY_IMAGE_FORMAT_",
+            enum_values::<kitty::ImageFormat>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyKittyPlacementLayer",
+            "GHOSTTY_KITTY_PLACEMENT_LAYER_",
+            enum_values::<kitty::PlacementLayer>(),
+        ),
         TypeDecl::init_enum(
             "GhosttyModeReportState",
             "GHOSTTY_MODE_REPORT_",
@@ -1382,15 +1512,58 @@ pub fn type_decls() -> Vec<TypeDecl> {
             "GHOSTTY_PROGRAM_STATUS_STATE_",
             enum_values::<term::ProgramStatusState>(),
         ),
-        // TODO(c-api batch 3): GhosttyRenderState* enums (c/render).
+        TypeDecl::init_enum(
+            "GhosttyRenderStateCursorVisualStyle",
+            "GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_",
+            enum_values::<render::CursorVisualStyle>(),
+        ),
+        TypeDecl::init_enum("GhosttyRenderStateData", "GHOSTTY_RENDER_STATE_DATA_", enum_values::<render::Data>()),
+        TypeDecl::init_enum("GhosttyRenderStateDirty", "GHOSTTY_RENDER_STATE_DIRTY_", enum_values::<render::Dirty>()),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateImageData",
+            "GHOSTTY_RENDER_STATE_IMAGE_DATA_",
+            enum_values::<render::ImageData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateImageLayer",
+            "GHOSTTY_RENDER_STATE_IMAGE_LAYER_",
+            enum_values::<render::ImageLayer>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateKittyPlacementKind",
+            "GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_",
+            enum_values::<render::KittyPlacementKind>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateOption",
+            "GHOSTTY_RENDER_STATE_OPTION_",
+            enum_values::<render::SetOption>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateRowCellsData",
+            "GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_",
+            enum_values::<render::RowCellsData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateRowData",
+            "GHOSTTY_RENDER_STATE_ROW_DATA_",
+            enum_values::<render::RowData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttyRenderStateRowOption",
+            "GHOSTTY_RENDER_STATE_ROW_OPTION_",
+            enum_values::<render::RowOption>(),
+        ),
         TypeDecl::init_enum("GhosttyRowData", "GHOSTTY_ROW_DATA_", enum_values::<row::RowData>()),
         TypeDecl::init_enum(
             "GhosttyRowSemanticPrompt",
             "GHOSTTY_ROW_SEMANTIC_",
             enum_values::<row::SemanticPrompt>(),
         ),
-        // TODO(c-api batch 3): GhosttySearch*, GhosttySelectionGesture*
-        // enums (c/search, c/selection_gesture).
+        TypeDecl::init_enum("GhosttySearchData", "GHOSTTY_SEARCH_DATA_", enum_values::<search::Data>()),
+        TypeDecl::init_enum("GhosttySearchOption", "GHOSTTY_SEARCH_OPT_", enum_values::<search::Option>()),
+        TypeDecl::init_enum("GhosttySearchScroll", "GHOSTTY_SEARCH_SCROLL_", enum_values::<search::Scroll>()),
+        TypeDecl::init_enum("GhosttySearchStatus", "GHOSTTY_SEARCH_STATUS_", enum_values::<search::Status>()),
         TypeDecl::init_enum("GhosttySelectionAdjust", "GHOSTTY_SELECTION_ADJUST_", {
             use crate::terminal::selection::Adjustment::*;
             values_of(
@@ -1399,6 +1572,31 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 |v| v as c_int as i64,
             )
         }),
+        TypeDecl::init_enum(
+            "GhosttySelectionGestureAutoscroll",
+            "GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_",
+            enum_values::<gesture::Autoscroll>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySelectionGestureBehavior",
+            "GHOSTTY_SELECTION_GESTURE_BEHAVIOR_",
+            enum_values::<gesture::Behavior>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySelectionGestureData",
+            "GHOSTTY_SELECTION_GESTURE_DATA_",
+            enum_values::<gesture::Data>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySelectionGestureEventOption",
+            "GHOSTTY_SELECTION_GESTURE_EVENT_OPT_",
+            enum_values::<gesture::EventOption>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySelectionGestureEventType",
+            "GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_",
+            enum_values::<gesture::EventType>(),
+        ),
         TypeDecl::init_enum("GhosttySelectionOrder", "GHOSTTY_SELECTION_ORDER_", {
             use crate::terminal::selection::Order::*;
             values_of(
@@ -1436,7 +1634,21 @@ pub fn type_decls() -> Vec<TypeDecl> {
                 )
             },
         ),
-        // TODO(c-api batch 2/3): GhosttySnapshotDecoder* enums (c/snapshot).
+        TypeDecl::init_enum(
+            "GhosttySnapshotDecoderData",
+            "GHOSTTY_SNAPSHOT_DECODER_DATA_",
+            enum_values::<snapshot::DecoderData>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySnapshotDecoderOption",
+            "GHOSTTY_SNAPSHOT_DECODER_OPT_",
+            enum_values::<snapshot::DecoderOption>(),
+        ),
+        TypeDecl::init_enum(
+            "GhosttySnapshotDecoderProgressKind",
+            "GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_",
+            enum_values::<snapshot::DecoderProgressKind>(),
+        ),
         TypeDecl::init_enum_sentinel(
             "GhosttyStyleColorTag",
             "GHOSTTY_STYLE_COLOR_",
@@ -1963,7 +2175,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(c-api batch 2/3): needs the c/render types in the manifest"]
     fn manifest_parses_and_is_versioned_render_cursor() {
         let parsed = parsed();
         let manifest_types = obj(&parsed["types"]);
@@ -1989,7 +2200,7 @@ mod tests {
         let manifest_types = obj(&parsed["types"]);
 
         // (Zig checks GhosttyRenderStateData and GhosttyRenderStateColors
-        // here; see the ignored render test below.)
+        // here; see the render test below.)
         let mask = obj(&manifest_types["GhosttyColorPaletteMask"]);
         let bits = obj(&mask["fields"]["bits"]);
         assert_eq!("array", bits["type"].as_str().unwrap());
@@ -2005,7 +2216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(c-api batch 2/3): needs the c/render types in the manifest"]
     fn manifest_describes_enums_arrays_and_tagged_unions_render() {
         let parsed = parsed();
         let manifest_types = obj(&parsed["types"]);
@@ -2022,7 +2232,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "TODO(c-api batch 2/3): needs the c/render types in the manifest"]
     fn manifest_describes_render_state_overscan_types() {
         let parsed = parsed();
         let manifest_types = obj(&parsed["types"]);
@@ -2195,7 +2404,6 @@ mod tests {
 
     /// (The render half of Zig's "manifest uses public enum names" test.)
     #[test]
-    #[ignore = "TODO(c-api batch 3): needs the c/render enums in the manifest"]
     fn manifest_uses_public_enum_names_render() {
         let parsed = parsed();
         let manifest_types = obj(&parsed["types"]);
