@@ -469,8 +469,8 @@ impl Canvas {
 
 /// Replacement for the parts of the `z2d` library used by the sprite
 /// renderer.
-// TODO(port-dedupe): this is a stand-in for the z2d Zig package (no Rust
-// port exists); rasterization is delegated to tiny-skia.
+// NOTE(port): z2d is a third-party Zig package with no Rust port, so this
+// keeps its API shape and delegates rasterization to tiny-skia.
 pub mod z2d {
     use super::DrawError;
 
