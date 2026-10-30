@@ -3049,4 +3049,967 @@ pub(crate) mod tests {
 
     /// `CAllocator.fromZig(&std.mem.Allocator.failing)`.
     pub(crate) static FAILING_C_ALLOCATOR: CAllocator = CAllocator::from_zig(&FAILING_DYN.0);
+
+    // -----------------------------------------------------------------
+    // Rust test helpers (Zig tests spell these out inline).
+
+    use crate::lib::allocator::C_ALLOCATOR;
+    use crate::terminal::c::allocator as allocator_c;
+    use std::cell::{Cell, RefCell};
+
+    fn new_t(cols: CellCountInt, rows: CellCountInt) -> Terminal {
+        let mut t: Terminal = std::ptr::null_mut();
+        assert_eq!(Result::Success, new(Some(&C_ALLOCATOR), &mut t, cols, rows));
+        assert!(!t.is_null());
+        t
+    }
+
+    fn p<T>(v: &T) -> *const c_void {
+        v as *const T as *const c_void
+    }
+
+    fn o<T>(v: &mut T) -> *mut c_void {
+        v as *mut T as *mut c_void
+    }
+
+    fn vw(t: Terminal, data: &[u8]) {
+        unsafe { vt_write(t, data.as_ptr(), data.len()) }
+    }
+
+    fn zt<'a>(t: Terminal) -> &'a mut ZigTerminal {
+        unsafe { zig_terminal(t).unwrap() }
+    }
+
+    fn wr<'a>(t: Terminal) -> &'a mut TerminalWrapper {
+        unsafe { &mut *t }
+    }
+
+    fn plain(t: Terminal) -> String {
+        zt(t).plain_string().unwrap()
+    }
+
+    fn sopt(t: Terminal, option: Option, value: *const c_void) -> Result {
+        unsafe { set(t, option as c_int, value) }
+    }
+
+    fn gdat(t: Terminal, data: TerminalData, out: *mut c_void) -> Result {
+        unsafe { get(t, data as c_int, out) }
+    }
+
+    fn mode_tag(value: u16, ansi: bool) -> ModeTagBacking {
+        ModeTag::new(value, ansi).to_bits()
+    }
+
+    fn enable_continuation(t: Terminal) {
+        let limit: usize = 1024;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&limit)));
+    }
+
+    fn cont_buf(t: Terminal, buf: Option2<&mut [u8]>, written: &mut usize) -> Result {
+        unsafe {
+            match buf {
+                Some(b) => continuation_buf(t, b.as_mut_ptr(), b.len(), written),
+                None => continuation_buf(t, std::ptr::null_mut(), 0, written),
+            }
+        }
+    }
+
+    type Option2<T> = std::option::Option<T>;
+
+    fn sv(t: Terminal, v: ZigScrollViewport) {
+        unsafe { scroll_viewport(t, v.cval()) }
+    }
+
+    fn scrollbar(t: Terminal) -> TerminalScrollbar {
+        let mut s = TerminalScrollbar { total: 0, offset: 0, len: 0 };
+        assert_eq!(Result::Success, gdat(t, TerminalData::Scrollbar, o(&mut s)));
+        s
+    }
+
+    fn viewport_active(t: Terminal) -> bool {
+        let mut v = false;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ViewportActive, o(&mut v)));
+        v
+    }
+
+    // A shared write_pty capture (Zig: each test's `S.writePty`). Tests
+    // run on their own threads, so thread-locals are per test.
+    thread_local! {
+        static LAST: RefCell<Option2<Vec<u8>>> = const { RefCell::new(None) };
+        static ALL: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static LAST_UD: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    unsafe extern "C" fn write_pty_capture(_: Terminal, ud: *mut c_void, ptr: *const u8, len: usize) {
+        let data = std::slice::from_raw_parts(ptr, len);
+        LAST.with(|l| *l.borrow_mut() = Some(data.to_vec()));
+        ALL.with(|a| a.borrow_mut().extend_from_slice(data));
+        CALLS.set(CALLS.get() + 1);
+        LAST_UD.set(ud);
+    }
+
+    fn last() -> Option2<Vec<u8>> {
+        LAST.with(|l| l.borrow().clone())
+    }
+
+    fn clear_last() {
+        LAST.with(|l| *l.borrow_mut() = None);
+    }
+
+    fn all_written() -> Vec<u8> {
+        ALL.with(|a| a.borrow().clone())
+    }
+
+    fn clear_all() {
+        ALL.with(|a| a.borrow_mut().clear());
+    }
+
+    fn set_write_pty(t: Terminal) {
+        assert_eq!(
+            Result::Success,
+            sopt(t, Option::WritePty, write_pty_capture as WritePtyFn as *const c_void)
+        );
+    }
+
+    fn cs(s: LibString) -> Vec<u8> {
+        lib_string_slice(s).to_vec()
+    }
+
+    fn hex_upper(s: &[u8]) -> String {
+        s.iter().map(|b| format!("{b:02X}")).collect()
+    }
+
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn new_free() {
+        let t = new_t(80, 24);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn new_invalid_value() {
+        let mut t: Terminal = std::ptr::null_mut();
+        assert_eq!(Result::InvalidValue, new(Some(&C_ALLOCATOR), &mut t, 0, 24));
+        assert!(t.is_null());
+
+        assert_eq!(Result::InvalidValue, new(Some(&C_ALLOCATOR), &mut t, 80, 0));
+        assert!(t.is_null());
+    }
+
+    #[test]
+    fn continuation_option_and_data() {
+        let t = new_t(80, 24);
+
+        let mut value: usize = 0;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ContinuationMaxBytes, o(&mut value)));
+        assert_eq!(DEFAULT_CONTINUATION_MAX_BYTES, value);
+
+        let custom: usize = 1234;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&custom)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ContinuationMaxBytes, o(&mut value)));
+        assert_eq!(custom, value);
+
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, std::ptr::null()));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ContinuationMaxBytes, o(&mut value)));
+        assert_eq!(DEFAULT_CONTINUATION_MAX_BYTES, value);
+
+        let disabled: usize = 0;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&disabled)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::ContinuationMaxBytes, o(&mut value)));
+        assert_eq!(0, value);
+
+        let mut written: usize = 99;
+        assert_eq!(Result::InvalidValue, cont_buf(t, None, &mut written));
+        assert_eq!(0, written);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn continuation_buffer_and_allocator_export_exact_suffix() {
+        let t = new_t(80, 24);
+        enable_continuation(t);
+
+        vw(t, b"A\x1b[31");
+
+        let mut required: usize = 0;
+        assert_eq!(Result::OutOfSpace, cont_buf(t, None, &mut required));
+        assert_eq!(4, required);
+
+        let mut short = [0u8; 2];
+        assert_eq!(Result::OutOfSpace, cont_buf(t, Some(&mut short), &mut required));
+        assert_eq!(4, required);
+
+        let mut buf = [0u8; 8];
+        let mut written: usize = 0;
+        assert_eq!(Result::Success, cont_buf(t, Some(&mut buf), &mut written));
+        assert_eq!(b"\x1b[31", &buf[..written]);
+
+        unsafe {
+            let mut out_ptr: *mut u8 = std::ptr::null_mut();
+            let mut out_len: usize = 0;
+            assert_eq!(
+                Result::Success,
+                continuation_alloc(t, Some(&C_ALLOCATOR), &mut out_ptr, &mut out_len)
+            );
+            assert!(!out_ptr.is_null());
+            assert_eq!(b"\x1b[31", std::slice::from_raw_parts(out_ptr, out_len));
+            allocator_c::free(Some(&C_ALLOCATOR), out_ptr, out_len);
+
+            vw(t, b"m");
+            assert_eq!(Result::OutOfSpace, cont_buf(t, None, &mut required));
+            assert_eq!(0, required);
+
+            // Completing the sequence must return an empty, allocation-free result.
+            let failing = &FAILING_C_ALLOCATOR;
+            assert_eq!(
+                Result::Success,
+                continuation_alloc(t, Some(failing), &mut out_ptr, &mut out_len)
+            );
+            assert!(out_ptr.is_null());
+            assert_eq!(0, out_len);
+            allocator_c::free(Some(failing), out_ptr, out_len);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn continuation_export_tracks_split_utf8() {
+        let t = new_t(80, 24);
+        enable_continuation(t);
+
+        let prefix = [0xF0u8, 0x9F];
+        vw(t, &prefix);
+
+        let mut buf = [0u8; 4];
+        let mut written: usize = 0;
+        assert_eq!(Result::Success, cont_buf(t, Some(&mut buf), &mut written));
+        assert_eq!(&prefix[..], &buf[..written]);
+
+        let suffix = [0x98u8, 0x80];
+        vw(t, &suffix);
+        assert_eq!(Result::OutOfSpace, cont_buf(t, None, &mut written));
+        assert_eq!(0, written);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn continuation_callback_writer_reports_success_and_failure() {
+        struct Sink {
+            bytes: [u8; 8],
+            len: usize,
+        }
+
+        unsafe extern "C" fn sink_write(userdata: *mut c_void, data: *const u8, len: usize) -> bool {
+            let s = &mut *(userdata as *mut Sink);
+            if len > s.bytes.len() - s.len {
+                return false;
+            }
+            s.bytes[s.len..s.len + len].copy_from_slice(std::slice::from_raw_parts(data, len));
+            s.len += len;
+            true
+        }
+
+        unsafe extern "C" fn sink_fail(_: *mut c_void, _: *const u8, _: usize) -> bool {
+            false
+        }
+
+        let t = new_t(80, 24);
+        enable_continuation(t);
+        vw(t, b"\x1b[31");
+
+        unsafe {
+            let mut sink = Sink { bytes: [0; 8], len: 0 };
+            assert_eq!(
+                Result::Success,
+                continuation_write(
+                    t,
+                    c_io::Writer {
+                        write: Some(sink_write),
+                        userdata: o(&mut sink),
+                    }
+                )
+            );
+            assert_eq!(b"\x1b[31", &sink.bytes[..sink.len]);
+
+            let fail = c_io::Writer {
+                write: Some(sink_fail),
+                userdata: std::ptr::null_mut(),
+            };
+            assert_eq!(Result::IoError, continuation_write(t, fail));
+            assert_eq!(
+                Result::InvalidValue,
+                continuation_write(
+                    t,
+                    c_io::Writer {
+                        write: None,
+                        userdata: std::ptr::null_mut(),
+                    }
+                )
+            );
+            assert_eq!(Result::InvalidValue, continuation_write(std::ptr::null_mut(), fail));
+            free(t);
+        }
+    }
+
+    #[test]
+    fn continuation_runtime_reconfiguration_recovers_safely() {
+        let t = new_t(80, 24);
+
+        let enough: usize = 8;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&enough)));
+        vw(t, b"\x1b[123");
+        let too_small: usize = 2;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&too_small)));
+
+        let mut written: usize = 99;
+        assert_eq!(Result::InvalidValue, cont_buf(t, None, &mut written));
+        assert_eq!(0, written);
+
+        // Raising the limit cannot reconstruct discarded bytes, but a new ESC is
+        // a complete replay start and repairs tracking without first grounding.
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&enough)));
+        vw(t, b"\x1b[");
+        let mut buf = [0u8; 8];
+        assert_eq!(Result::Success, cont_buf(t, Some(&mut buf), &mut written));
+        assert_eq!(b"\x1b[", &buf[..written]);
+
+        let disabled: usize = 0;
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&disabled)));
+        assert_eq!(Result::Success, sopt(t, Option::ContinuationMaxBytes, p(&enough)));
+        assert_eq!(Result::InvalidValue, cont_buf(t, None, &mut written));
+
+        // Completing the sequence reaches ground and resets the broken marker.
+        vw(t, b"m");
+        assert_eq!(Result::OutOfSpace, cont_buf(t, None, &mut written));
+        assert_eq!(0, written);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn continuation_internal_allocation_and_restoration() {
+        let source = new_t(80, 24);
+        enable_continuation(source);
+        vw(source, b"\x1b[31");
+
+        unsafe {
+            let bytes = continuation_alloc_io(source, false).unwrap();
+            assert_eq!(b"\x1b[31", bytes.as_slice());
+
+            let restored = new_t(80, 24);
+            enable_continuation(restored);
+            restore_continuation(restored, &bytes).unwrap();
+
+            let reexported = continuation_alloc_io(restored, false).unwrap();
+            assert_eq!(bytes, reexported);
+
+            let invalid = new_t(80, 24);
+            enable_continuation(invalid);
+            assert_eq!(
+                Err(RestoreContinuationError::InvalidContinuation),
+                restore_continuation(invalid, b"A")
+            );
+
+            free(invalid);
+            free(restored);
+            free(source);
+        }
+    }
+
+    #[test]
+    fn set_scrollback_limits() {
+        let t = new_t(80, 3);
+
+        let primary = zt(t).screens.get(ScreenKey::Primary).unwrap();
+
+        let max_bytes: usize = 0;
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxBytes, p(&max_bytes)));
+        assert_eq!(0, primary.pages.limits.bytes.explicit);
+        assert!(primary.no_scrollback);
+
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxBytes, std::ptr::null()));
+        assert_eq!(usize::MAX, primary.pages.limits.bytes.explicit);
+        assert!(!primary.no_scrollback);
+
+        let max_lines: usize = 12;
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxLines, p(&max_lines)));
+        assert_eq!(max_lines, primary.pages.limits.lines.explicit);
+
+        assert_eq!(Result::Success, sopt(t, Option::ScrollbackMaxLines, std::ptr::null()));
+        assert_eq!(usize::MAX, primary.pages.limits.lines.explicit);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn free_null() {
+        unsafe { free(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn scroll_viewport_test() {
+        let t = new_t(5, 2);
+
+        assert!(viewport_active(t));
+
+        // Write "hello" on the first line
+        vw(t, b"hello");
+
+        // Push "hello" into scrollback with 3 newlines (index = ESC D)
+        vw(t, b"\x1bD\x1bD\x1bD");
+        // Viewport should be empty now since hello scrolled off
+        assert_eq!("", plain(t));
+
+        // Scroll to top: "hello" should be visible again
+        sv(t, ZigScrollViewport::Top);
+        assert!(!viewport_active(t));
+        assert_eq!("hello", plain(t));
+
+        // Scroll to bottom: viewport should be empty again
+        sv(t, ZigScrollViewport::Bottom);
+        assert!(viewport_active(t));
+        assert_eq!("", plain(t));
+
+        // Scroll up by delta to bring "hello" back into view
+        sv(t, ZigScrollViewport::Delta(-3));
+        assert!(!viewport_active(t));
+        assert_eq!("hello", plain(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_row() {
+        let t = new_t(5, 2);
+
+        // Write 4 rows so that rows "1" and "2" are pushed into scrollback:
+        // total rows is 4, viewport length is 2.
+        vw(t, b"1\r\n2\r\n3\r\n4");
+        assert!(viewport_active(t));
+
+        // Row 0 is the top of the scrollback.
+        sv(t, ZigScrollViewport::Row(0));
+        assert!(!viewport_active(t));
+        assert_eq!("1\n2", plain(t));
+
+        // An absolute row within the scrollback becomes the first visible
+        // row and round-trips through the scrollbar offset.
+        sv(t, ZigScrollViewport::Row(1));
+        assert_eq!("2\n3", plain(t));
+        let s = scrollbar(t);
+        assert_eq!(4, s.total);
+        assert_eq!(1, s.offset);
+        assert_eq!(2, s.len);
+
+        // A row past the end clamps to the active area.
+        sv(t, ZigScrollViewport::Row(9999));
+        assert!(viewport_active(t));
+        assert_eq!("3\n4", plain(t));
+        assert_eq!(2, scrollbar(t).offset);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_row_alt_screen() {
+        let t = new_t(5, 2);
+
+        // Enter the alternate screen, which has no scrollback.
+        vw(t, b"\x1b[?1049h");
+        let mut screen = TerminalScreen::Primary;
+        assert_eq!(Result::Success, gdat(t, TerminalData::ActiveScreen, o(&mut screen)));
+        assert_eq!(TerminalScreen::Alternate, screen);
+
+        // Scrolling to any row keeps the viewport on the active area.
+        sv(t, ZigScrollViewport::Row(0));
+        assert!(viewport_active(t));
+        sv(t, ZigScrollViewport::Row(9999));
+        assert!(viewport_active(t));
+
+        // With no scrollback the scrollbar covers exactly the active area.
+        let s = scrollbar(t);
+        assert_eq!(2, s.total);
+        assert_eq!(0, s.offset);
+        assert_eq!(2, s.len);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_delta_prompt() {
+        let t = new_t(80, 2);
+
+        let transcript = concat!(
+            "\x1b]133;P;k=i\x07p1\r\n",
+            "\x1b]133;B\x07cmd1\r\n",
+            "\x1b]133;C\x07out1\r\n",
+            "\x1b]133;P;k=i\x07p2\r\n",
+            "\x1b]133;B\x07cmd2\r\n",
+            "\x1b]133;C\x07out2\r\n",
+            "\x1b]133;P;k=i\x07p3\r\n",
+            "\x1b]133;B\x07cmd3\r\n",
+            "\x1b]133;C\x07out3\r\n",
+            "\x1b]133;P;k=i\x07p4",
+        );
+        vw(t, transcript.as_bytes());
+
+        // A negative count goes to the previous prompt, and a positive count
+        // returns to the next prompt relative to the current viewport top.
+        sv(t, ZigScrollViewport::DeltaPrompt(-1));
+        assert_eq!(6, scrollbar(t).offset);
+        sv(t, ZigScrollViewport::DeltaPrompt(-1));
+        assert_eq!(3, scrollbar(t).offset);
+        sv(t, ZigScrollViewport::DeltaPrompt(1));
+        assert_eq!(6, scrollbar(t).offset);
+
+        // Counts beyond the retained prompt history clamp to the oldest or
+        // newest matching prompt, including the signed minimum boundary.
+        sv(t, ZigScrollViewport::DeltaPrompt(isize::MIN));
+        assert_eq!(0, scrollbar(t).offset);
+        sv(t, ZigScrollViewport::DeltaPrompt(isize::MAX));
+        assert_eq!(8, scrollbar(t).offset);
+
+        // A zero count leaves the selected prompt unchanged.
+        sv(t, ZigScrollViewport::DeltaPrompt(0));
+        assert_eq!(8, scrollbar(t).offset);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_delta_prompt_continuation() {
+        let t = new_t(80, 2);
+
+        let transcript = concat!(
+            "\x1b]133;P;k=i\x07p1\r\n",
+            "\x1b]133;P;k=c\x07p1-continued\r\n",
+            "\x1b]133;B\x07cmd1\r\n",
+            "\x1b]133;C\x07out1\r\n",
+            "\x1b]133;P;k=i\x07p2\r\n",
+            "\x1b]133;B\x07cmd2\r\n",
+            "\x1b]133;C\x07out2",
+        );
+        vw(t, transcript.as_bytes());
+
+        // The continuation row belongs to the first prompt group. Moving
+        // forward from that group lands on the second prompt.
+        sv(t, ZigScrollViewport::Row(0));
+        sv(t, ZigScrollViewport::DeltaPrompt(1));
+        assert_eq!(4, scrollbar(t).offset);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_delta_prompt_final_continuation_snaps_to_active() {
+        let t = new_t(80, 3);
+
+        let transcript = concat!(
+            "\x1b]133;P;k=i\x07prompt\r\n",
+            "\x1b]133;P;k=c\x07continued\r\n",
+            "continued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued",
+        );
+        vw(t, transcript.as_bytes());
+        sv(t, ZigScrollViewport::Row(1));
+        assert_eq!(1, scrollbar(t).offset);
+
+        sv(t, ZigScrollViewport::DeltaPrompt(1));
+        assert_eq!(4, scrollbar(t).offset);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_delta_prompt_no_markers_and_alternate_screen() {
+        let t = new_t(80, 2);
+
+        vw(t, b"one\r\ntwo\r\nthree\r\nfour");
+        sv(t, ZigScrollViewport::Row(0));
+
+        // Without OSC 133 prompt markers, a request leaves the viewport alone.
+        sv(t, ZigScrollViewport::DeltaPrompt(1));
+        assert_eq!(0, scrollbar(t).offset);
+
+        vw(t, b"\x1b[?1049h");
+        sv(t, ZigScrollViewport::DeltaPrompt(-1));
+        let s = scrollbar(t);
+        assert_eq!(0, s.offset);
+        assert_eq!(2, s.total);
+        unsafe { free(t) };
+    }
+
+    fn memory_usage(t: Terminal) -> TerminalMemoryUsage {
+        let mut m = TerminalMemoryUsage::default();
+        assert_eq!(Result::Success, gdat(t, TerminalData::MemoryUsage, o(&mut m)));
+        m
+    }
+
+    fn compressible_history() -> Vec<u8> {
+        let line = b"repeated and compressible terminal history\r\n";
+        line.repeat(4_000)
+    }
+
+    #[test]
+    fn get_memory_usage() {
+        let t = new_t(80, 24);
+
+        let fresh = memory_usage(t);
+        assert_eq!(std::mem::size_of::<TerminalMemoryUsage>(), fresh.size);
+        assert_eq!(
+            terminal_mem::can_reclaim(terminal_mem::DecommitMode::Strict),
+            fresh.compression_supported
+        );
+        assert!(fresh.primary_pages > 0);
+        assert!(fresh.primary_virtual_bytes > 0);
+        assert!(fresh.primary_resident_bytes <= fresh.primary_virtual_bytes);
+        assert_eq!(0, fresh.primary_compressed_pages);
+        assert_eq!(0, fresh.primary_compressed_bytes);
+        assert_eq!(0, fresh.primary_image_bytes);
+
+        // The alternate screen doesn't exist yet.
+        assert_eq!(0, fresh.alternate_pages);
+        assert_eq!(0, fresh.alternate_virtual_bytes);
+        assert_eq!(0, fresh.alternate_resident_bytes);
+        assert_eq!(0, fresh.alternate_compressed_pages);
+        assert_eq!(0, fresh.alternate_compressed_bytes);
+        assert_eq!(0, fresh.alternate_image_bytes);
+
+        // Write compressible history.
+        vw(t, &compressible_history());
+
+        let history = memory_usage(t);
+        assert!(history.primary_pages > fresh.primary_pages);
+        assert!(history.primary_resident_bytes > fresh.primary_resident_bytes);
+
+        let mut compression_result = CompressionResult::Unsupported;
+        assert_eq!(Result::Success, unsafe {
+            compress(t, CompressionMode::Full as c_int, &mut compression_result)
+        });
+        assert_eq!(
+            history.compression_supported,
+            compression_result == CompressionResult::Complete
+        );
+
+        let compressed = memory_usage(t);
+        assert_eq!(history.primary_pages, compressed.primary_pages);
+        assert_eq!(history.primary_virtual_bytes, compressed.primary_virtual_bytes);
+        if compressed.compression_supported {
+            assert!(compressed.primary_compressed_pages > 0);
+            assert!(compressed.primary_compressed_bytes > 0);
+            assert!(compressed.primary_resident_bytes < history.primary_resident_bytes);
+        } else {
+            assert_eq!(0, compressed.primary_compressed_pages);
+        }
+
+        // The query never restores a compressed page.
+        let again = memory_usage(t);
+        assert_eq!(compressed, again);
+
+        // Kitty images are counted separately from pages.
+        if build_options::KITTY_GRAPHICS {
+            // 1x2 RGB image, 6 bytes of pixel data.
+            vw(t, b"\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\");
+            let images = memory_usage(t);
+            assert!(images.primary_image_bytes > 0);
+
+            vw(t, b"\x1b_Ga=d,d=I,i=1\x1b\\");
+            let images = memory_usage(t);
+            assert_eq!(0, images.primary_image_bytes);
+        }
+
+        // Entering the alternate screen creates it.
+        vw(t, b"\x1b[?1049h");
+        let alternate = memory_usage(t);
+        assert!(alternate.alternate_pages > 0);
+        assert!(alternate.alternate_virtual_bytes > 0);
+        assert!(alternate.alternate_resident_bytes > 0);
+        assert!(alternate.alternate_resident_bytes <= alternate.alternate_virtual_bytes);
+        assert_eq!(compressed.primary_pages, alternate.primary_pages);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn get_memory_usage_size_rule() {
+        let t = new_t(80, 24);
+
+        // A size smaller than the first layout is rejected and nothing is
+        // written.
+        let mut small = TerminalMemoryUsage {
+            size: std::mem::size_of::<TerminalMemoryUsage>() - 1,
+            primary_pages: 1234,
+            ..Default::default()
+        };
+        assert_eq!(Result::InvalidValue, gdat(t, TerminalData::MemoryUsage, o(&mut small)));
+        assert_eq!(std::mem::size_of::<TerminalMemoryUsage>() - 1, small.size);
+        assert_eq!(1234, small.primary_pages);
+
+        // A size larger than ours, from a caller built against a newer
+        // layout, gets the known prefix and the rest is left untouched.
+        #[repr(C)]
+        struct Larger {
+            usage: TerminalMemoryUsage,
+            extra: u64,
+        }
+        let mut large = Larger {
+            usage: TerminalMemoryUsage {
+                size: std::mem::size_of::<Larger>(),
+                ..Default::default()
+            },
+            extra: 0xDEADBEEF,
+        };
+        assert_eq!(Result::Success, gdat(t, TerminalData::MemoryUsage, o(&mut large)));
+        assert_eq!(std::mem::size_of::<Larger>(), large.usage.size);
+        assert!(large.usage.primary_pages > 0);
+        assert_eq!(0xDEADBEEF, large.extra);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn scroll_viewport_null() {
+        sv(std::ptr::null_mut(), ZigScrollViewport::Top);
+        sv(std::ptr::null_mut(), ZigScrollViewport::Row(1));
+    }
+
+    #[test]
+    fn compression_invalid_arguments() {
+        unsafe {
+            let mut activity: u64 = 0;
+            let mut compression_result = CompressionResult::Unsupported;
+
+            assert_eq!(
+                Result::InvalidValue,
+                compression_activity(std::ptr::null_mut(), &mut activity)
+            );
+            assert_eq!(
+                Result::InvalidValue,
+                compress(
+                    std::ptr::null_mut(),
+                    CompressionMode::Incremental as c_int,
+                    &mut compression_result
+                )
+            );
+
+            let t = new_t(80, 24);
+
+            assert_eq!(Result::InvalidValue, compression_activity(t, std::ptr::null_mut()));
+            assert_eq!(
+                Result::InvalidValue,
+                compress(t, CompressionMode::Incremental as c_int, std::ptr::null_mut())
+            );
+            assert_eq!(Result::InvalidValue, compress(t, -1, &mut compression_result));
+            free(t);
+        }
+    }
+
+    #[test]
+    fn compression_activity_and_incremental_scheduling() {
+        unsafe {
+            let t = new_t(80, 24);
+
+            let mut initial_activity: u64 = 0;
+            assert_eq!(Result::Success, compression_activity(t, &mut initial_activity));
+
+            vw(t, &compressible_history());
+
+            let mut activity: u64 = 0;
+            assert_eq!(Result::Success, compression_activity(t, &mut activity));
+            assert_ne!(activity, initial_activity);
+
+            let mut compression_result = CompressionResult::Unsupported;
+            let mut done = false;
+            for _ in 0..1_000 {
+                assert_eq!(
+                    Result::Success,
+                    compress(t, CompressionMode::Incremental as c_int, &mut compression_result)
+                );
+
+                match compression_result {
+                    CompressionResult::Pending => continue,
+                    CompressionResult::Complete => {
+                        done = true;
+                        break;
+                    }
+                    CompressionResult::Unsupported => unreachable!(),
+                }
+            }
+            assert!(done, "TestUnexpectedResult");
+
+            // Compression changes storage representation, not the activity token.
+            let mut final_activity: u64 = 0;
+            assert_eq!(Result::Success, compression_activity(t, &mut final_activity));
+            assert_eq!(activity, final_activity);
+
+            assert_eq!(
+                Result::Success,
+                compress(t, CompressionMode::Full as c_int, &mut compression_result)
+            );
+            assert_eq!(CompressionResult::Complete, compression_result);
+            free(t);
+        }
+    }
+
+    #[test]
+    fn reset_test() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+        unsafe { reset(t) };
+        assert_eq!("", plain(t));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn reset_null() {
+        unsafe { reset(std::ptr::null_mut()) };
+    }
+
+    #[test]
+    fn resize_test() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::Success, unsafe { resize(t, 40, 12, 9, 18) });
+        assert_eq!(40, zt(t).cols);
+        assert_eq!(12, zt(t).rows);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_null() {
+        assert_eq!(Result::InvalidValue, unsafe { resize(std::ptr::null_mut(), 80, 24, 9, 18) });
+    }
+
+    #[test]
+    fn resize_invalid_value() {
+        let t = new_t(80, 24);
+        assert_eq!(Result::InvalidValue, unsafe { resize(t, 0, 24, 9, 18) });
+        assert_eq!(Result::InvalidValue, unsafe { resize(t, 80, 0, 9, 18) });
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn resize_shrinks_both_axes_with_cursor_at_bottom() {
+        let t = new_t(80, 24);
+
+        // CSI 24;1H -> park the cursor on the bottom row (1-based).
+        vw(t, b"\x1b[24;1H");
+
+        // Shrink both axes; pre-resize cursor.y sits past the new bottom row.
+        // Previously this underflowed in PageList.resizeCols.
+        assert_eq!(Result::Success, unsafe { resize(t, 79, 23, 8, 16) });
+        assert_eq!(79, zt(t).cols);
+        assert_eq!(23, zt(t).rows);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_and_get_mode() {
+        let t = new_t(80, 24);
+
+        // DEC mode 25 (cursor_visible) defaults to true
+        let mut config = ModeConfig {
+            mode: mode_tag(25, false),
+            value: false,
+        };
+        assert_eq!(Result::Success, gdat(t, TerminalData::Mode, o(&mut config)));
+        assert!(config.value);
+
+        // Set it to false
+        config.value = false;
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::Mode, o(&mut config)));
+        assert!(!config.value);
+
+        // ANSI mode 4 (insert) defaults to false
+        config.mode = mode_tag(4, true);
+        assert_eq!(Result::Success, gdat(t, TerminalData::Mode, o(&mut config)));
+        assert!(!config.value);
+
+        config.value = true;
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        assert_eq!(Result::Success, gdat(t, TerminalData::Mode, o(&mut config)));
+        assert!(config.value);
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_mode_default_updates_current_and_reset_value() {
+        let t = new_t(80, 24);
+
+        let mut config = ModeConfig {
+            mode: mode_tag(2027, false),
+            value: true,
+        };
+        assert_eq!(Result::Success, sopt(t, Option::ModeDefault, p(&config)));
+        assert!(zt(t).modes.get(Mode::GraphemeCluster));
+        assert!(zt(t).modes.default.get(Mode::GraphemeCluster));
+
+        config.value = false;
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        assert!(!zt(t).modes.get(Mode::GraphemeCluster));
+        assert!(zt(t).modes.default.get(Mode::GraphemeCluster));
+
+        // Setting the default also unconditionally replaces the current value.
+        config.value = true;
+        assert_eq!(Result::Success, sopt(t, Option::ModeDefault, p(&config)));
+        assert!(zt(t).modes.get(Mode::GraphemeCluster));
+
+        config.value = false;
+        assert_eq!(Result::Success, sopt(t, Option::Mode, p(&config)));
+        vw(t, b"\x1bc");
+        assert!(zt(t).modes.get(Mode::GraphemeCluster));
+
+        config.value = false;
+        assert_eq!(Result::Success, sopt(t, Option::ModeDefault, p(&config)));
+        assert!(!zt(t).modes.get(Mode::GraphemeCluster));
+        assert!(!zt(t).modes.default.get(Mode::GraphemeCluster));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_mode_default_validates_configuration() {
+        let t = new_t(80, 24);
+
+        assert_eq!(Result::InvalidValue, sopt(t, Option::ModeDefault, std::ptr::null()));
+
+        let mut config = ModeConfig {
+            mode: mode_tag(9999, false),
+            value: true,
+        };
+        assert_eq!(Result::InvalidValue, sopt(t, Option::ModeDefault, p(&config)));
+
+        config.mode = mode_tag(1047, false);
+        assert_eq!(Result::InvalidValue, sopt(t, Option::ModeDefault, p(&config)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn set_and_get_mode_null() {
+        let mut config = ModeConfig {
+            mode: mode_tag(25, false),
+            value: true,
+        };
+        assert_eq!(Result::InvalidValue, sopt(std::ptr::null_mut(), Option::Mode, p(&config)));
+        assert_eq!(
+            Result::InvalidValue,
+            gdat(std::ptr::null_mut(), TerminalData::Mode, o(&mut config))
+        );
+    }
+
+    #[test]
+    fn set_and_get_mode_validate_configuration() {
+        let t = new_t(80, 24);
+
+        assert_eq!(Result::InvalidValue, sopt(t, Option::Mode, std::ptr::null()));
+        assert_eq!(Result::InvalidValue, gdat(t, TerminalData::Mode, std::ptr::null_mut()));
+
+        let mut config = ModeConfig {
+            mode: mode_tag(9999, false),
+            value: true,
+        };
+        assert_eq!(Result::InvalidValue, sopt(t, Option::Mode, p(&config)));
+        assert_eq!(Result::InvalidValue, gdat(t, TerminalData::Mode, o(&mut config)));
+        unsafe { free(t) };
+    }
+
+    #[test]
+    fn vt_write_test() {
+        let t = new_t(80, 24);
+        vw(t, b"Hello");
+        assert_eq!("Hello", plain(t));
+        unsafe { free(t) };
+    }
+
+    // CHUNK2
 }
