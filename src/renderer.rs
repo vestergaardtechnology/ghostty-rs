@@ -112,33 +112,6 @@ crate::lib_enum! {
     }
 }
 
-/// Stand-ins for types whose Zig files are not ported yet, and aliases
-/// kept for modules that still name the former stand-ins.
-pub mod standin {
-    use crate::apprt;
-
-    pub use super::generic::{
-        AnimationWake, AnimationWakeKind, AtomicHealth, DerivedConfig as RendererDerivedConfig, Error,
-        GraphicsApi, InitError, LatestFrame,
-    };
-
-    /// The surface recorded in the crash thread state (Zig:
-    /// `surface_mailbox.surface`).
-    pub fn crash_surface(mailbox: &apprt::surface::Mailbox) -> *const crate::surface::Surface {
-        mailbox.surface
-    }
-
-    /// The type used for sending messages to the renderer thread.
-    pub type ThreadMailbox = super::thread::Mailbox;
-
-    /// Zig: `Thread.DerivedConfig`.
-    pub type ThreadDerivedConfig = super::thread::DerivedConfig;
-
-    pub type SharedGrid = crate::font::SharedGrid;
-    pub type SharedGridSet = crate::font::SharedGridSet;
-    pub type SharedGridSetKey = crate::font::shared_grid_set::Key;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

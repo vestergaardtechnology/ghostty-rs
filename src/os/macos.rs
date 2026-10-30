@@ -12,8 +12,8 @@ use crate::build_config::BUNDLE_ID;
 
 /// Minimal Objective-C runtime bindings used by the `os` module.
 ///
-/// TODO(port-dedupe): replace with the `objc` bindings from `pkg/macos`
-/// once ported (owned by another port).
+/// NOTE(port): Zig uses the third-party zig-objc package, which has no
+/// Rust port (`pkg/macos` has no objc bindings); only the calls `os` needs.
 pub mod objc {
     use std::ffi::{c_char, c_void, CStr};
 

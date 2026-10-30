@@ -10,11 +10,12 @@
 //!   Rust port has no such package yet, so [`objc`] below is a minimal
 //!   zig-objc-shaped binding (objects, classes, selectors, `msgSend`,
 //!   properties, instance variables, runtime subclasses, blocks and
-//!   autorelease pools) over libobjc (TODO(port-dedupe): move to a
-//!   shared `pkg/objc` when one exists).
-//! * The embedded apprt surface is not ported; its content scale and
-//!   view are read through the [`EmbeddedSurface`] stand-in trait
-//!   (TODO(port-dedupe)).
+//!   autorelease pools) over libobjc (NOTE(port): zig-objc is a
+//!   third-party Zig package with no Rust port in this repository).
+//! * The embedded apprt surface's content scale and view are read through
+//!   the [`EmbeddedSurface`] trait (NOTE(port): test builds use the
+//!   recording `apprt::standin::Surface`, so Metal cannot name
+//!   `apprt::embedded::Surface` fields directly).
 //! * `loopEnter` receives the renderer pointer explicitly (Zig:
 //!   `@fieldParentPtr("api", self)`).
 //! * The allocator parameters are dropped. iOS is not supported (the
@@ -639,7 +640,8 @@ pub(crate) fn check_error(err: objc::Id) -> Result<(), Error> {
 
 /// A minimal zig-objc-shaped Objective-C runtime binding.
 ///
-/// TODO(port-dedupe): replace with a shared `pkg/objc` port.
+/// NOTE(port): zig-objc is a third-party Zig package with no Rust port;
+/// this binding is shared by the Metal renderer and the embedded apprt.
 pub mod objc {
     use std::ffi::{c_char, c_int, c_ulong, c_void, CStr, CString};
 

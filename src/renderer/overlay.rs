@@ -35,14 +35,9 @@ use crate::terminal::page::{SemanticContent, SemanticPrompt};
 
 use crate::terminal::render::RenderState;
 
-use self::standin::{Pending, PixelFormat};
+use crate::renderer::image::{Pending, PixelFormat};
 
 const LOG: &str = "renderer_overlay";
-
-/// The pending image types this overlay produces (formerly stand-ins).
-pub mod standin {
-    pub use crate::renderer::image::{Pending, PixelFormat};
-}
 
 /// An RGB pixel (z2d `pixel.RGB`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

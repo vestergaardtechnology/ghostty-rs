@@ -27,7 +27,6 @@ use crate::global::xev;
 use crate::lib::tinyio::TinyIo;
 use crate::renderer::message::Message;
 use crate::renderer::generic::AnimationWakeKind;
-use crate::renderer::standin::crash_surface;
 use crate::renderer::{Renderer, State};
 use crate::terminal::mem::{can_reclaim, DecommitMode};
 use crate::apprt;
@@ -309,7 +308,7 @@ impl Thread {
         // Setup our crash metadata
         crash::sentry::set_thread_state(Some(crash::sentry::ThreadState {
             r#type: crash::sentry::ThreadType::Renderer,
-            surface: crash_surface(unsafe { &(*renderer).surface_mailbox }),
+            surface: unsafe { (*renderer).surface_mailbox.surface },
         }));
         struct CrashGuard;
         impl Drop for CrashGuard {
