@@ -790,28 +790,18 @@ impl Surface {
 
         // We want a config pointer for everything so we get that either
         // based on our conditional state or the original config.
-        let config: &Config = match config_ {
-            Some(mut c) => {
+        let mut config_ = config_;
+        let config: &Config = match &mut config_ {
+            Some(c) => {
                 // We want to preserve our original working directory. We
                 // don't need to dupe memory here because termio will derive
                 // it. We preserve this so directory inheritance works.
                 c.working_directory = config_original.working_directory.clone();
-                Box::leak(Box::new(c))
+                c
             }
             None => config_original,
         };
-        // (The leaked conditional config is reclaimed at the end of init.)
-        let config_owned: Option<*mut Config> = if std::ptr::eq(config, config_original) {
-            None
-        } else {
-            Some(config as *const Config as *mut Config)
-        };
-        let result = Self::init_with_config(config, app, rt_app, rt_surface, app_ref, rt_surface_ref);
-        if let Some(c) = config_owned {
-            // SAFETY: leaked above and no longer referenced.
-            drop(unsafe { Box::from_raw(c) });
-        }
-        result
+        Self::init_with_config(config, app, rt_app, rt_surface, app_ref, rt_surface_ref)
     }
 
     fn init_with_config(
