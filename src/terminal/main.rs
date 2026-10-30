@@ -141,6 +141,7 @@ pub use self::point::Point;
 pub use self::screen::Screen;
 pub use self::screen_set::ScreenSet;
 pub use self::selection::Selection;
+pub use self::selection_gesture::SelectionGesture;
 pub use self::string_map::StringMap;
 pub use self::style::Style;
 pub use self::terminal::Terminal;
