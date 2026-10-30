@@ -1,10 +1,6 @@
 //! Port of `src/terminal/c/main.zig`.
 //!
-//! STATUS: partial — the re-exports of the batch-1 and batch-2 C API files
-//! (including `terminal`, `selection`, `grid_ref`, `grid_ref_tracked` and
-//! `terminal_paste`) are ported; the `formatter`, `render`,
-//! `selection_gesture`, `search`, `snapshot` and `kitty_graphics` aliases
-//! are TODO(c-api batch 3) (marked below).
+//! STATUS: ported
 //!
 //! The C API of libghostty-vt (`include/ghostty/vt.h`).
 
@@ -82,6 +78,24 @@ pub mod unicode;
 
 pub use self::build_info::get as build_info;
 
+pub use self::kitty_graphics::animation_tick as kitty_graphics_animation_tick;
+pub use self::kitty_graphics::get as kitty_graphics_get;
+pub use self::kitty_graphics::image_get as kitty_graphics_image_get;
+pub use self::kitty_graphics::image_get_handle as kitty_graphics_image;
+pub use self::kitty_graphics::image_get_multi as kitty_graphics_image_get_multi;
+pub use self::kitty_graphics::placement_get as kitty_graphics_placement_get;
+pub use self::kitty_graphics::placement_get_multi as kitty_graphics_placement_get_multi;
+pub use self::kitty_graphics::placement_grid_size as kitty_graphics_placement_grid_size;
+pub use self::kitty_graphics::placement_iterator_free as kitty_graphics_placement_iterator_free;
+pub use self::kitty_graphics::placement_iterator_new as kitty_graphics_placement_iterator_new;
+pub use self::kitty_graphics::placement_iterator_next as kitty_graphics_placement_next;
+pub use self::kitty_graphics::placement_iterator_set as kitty_graphics_placement_iterator_set;
+pub use self::kitty_graphics::placement_pixel_size as kitty_graphics_placement_pixel_size;
+pub use self::kitty_graphics::placement_rect as kitty_graphics_placement_rect;
+pub use self::kitty_graphics::placement_render_info as kitty_graphics_placement_render_info;
+pub use self::kitty_graphics::placement_source_rect as kitty_graphics_placement_source_rect;
+pub use self::kitty_graphics::placement_viewport_pos as kitty_graphics_placement_viewport_pos;
+
 pub use self::osc::command_data as osc_command_data;
 pub use self::osc::command_type as osc_command_type;
 pub use self::osc::end as osc_end;
@@ -109,15 +123,39 @@ pub use self::focus::encode as focus_encode;
 
 pub use self::modes::report_encode as mode_report_encode;
 
-// TODO(c-api batch 2/3): formatter_terminal_new, formatter_format,
-// formatter_format_buf, formatter_format_alloc, formatter_free
-// (c/formatter).
+pub use self::formatter::format as formatter_format;
+pub use self::formatter::format_alloc as formatter_format_alloc;
+pub use self::formatter::format_buf as formatter_format_buf;
+pub use self::formatter::free as formatter_free;
+pub use self::formatter::terminal_new as formatter_terminal_new;
 
-// TODO(c-api batch 2/3): render_state_* (c/render): new, free, update,
-// begin_update, end_update, clean, get, get_multi, set,
-// row_iterator_new/next/next_dirty/free, row_get, row_get_multi, row_set,
-// row_cells_new/next/select/get/get_multi/free,
-// image_iterator_new/next/free, image_get, image_get_multi.
+pub use self::render::begin_update as render_state_begin_update;
+pub use self::render::clean as render_state_clean;
+pub use self::render::end_update as render_state_end_update;
+pub use self::render::free as render_state_free;
+pub use self::render::get as render_state_get;
+pub use self::render::get_multi as render_state_get_multi;
+pub use self::render::image_get as render_state_image_get;
+pub use self::render::image_get_multi as render_state_image_get_multi;
+pub use self::render::image_iterator_free as render_state_image_iterator_free;
+pub use self::render::image_iterator_new as render_state_image_iterator_new;
+pub use self::render::image_iterator_next as render_state_image_iterator_next;
+pub use self::render::new as render_state_new;
+pub use self::render::row_cells_free as render_state_row_cells_free;
+pub use self::render::row_cells_get as render_state_row_cells_get;
+pub use self::render::row_cells_get_multi as render_state_row_cells_get_multi;
+pub use self::render::row_cells_new as render_state_row_cells_new;
+pub use self::render::row_cells_next as render_state_row_cells_next;
+pub use self::render::row_cells_select as render_state_row_cells_select;
+pub use self::render::row_get as render_state_row_get;
+pub use self::render::row_get_multi as render_state_row_get_multi;
+pub use self::render::row_iterator_free as render_state_row_iterator_free;
+pub use self::render::row_iterator_new as render_state_row_iterator_new;
+pub use self::render::row_iterator_next as render_state_row_iterator_next;
+pub use self::render::row_iterator_next_dirty as render_state_row_iterator_next_dirty;
+pub use self::render::row_set as render_state_row_set;
+pub use self::render::set as render_state_set;
+pub use self::render::update as render_state_update;
 
 pub use self::sgr::attribute_tag as sgr_attribute_tag;
 pub use self::sgr::attribute_value as sgr_attribute_value;
@@ -219,9 +257,23 @@ pub use self::selection::ordered as terminal_selection_ordered;
 pub use self::selection::output as terminal_select_output;
 pub use self::selection::word as terminal_select_word;
 pub use self::selection::word_between as terminal_select_word_between;
-// TODO(c-api batch 3): selection_gesture_* (c/selection_gesture),
-// search_* (c/search), snapshot_* (c/snapshot), kitty_graphics_*
-// (c/kitty_graphics).
+pub use self::selection_gesture::event_free as selection_gesture_event_free;
+pub use self::selection_gesture::event_new as selection_gesture_event_new;
+pub use self::selection_gesture::event_set as selection_gesture_event_set;
+pub use self::selection_gesture::free as selection_gesture_free;
+pub use self::selection_gesture::get as selection_gesture_get;
+pub use self::selection_gesture::get_multi as selection_gesture_get_multi;
+pub use self::selection_gesture::handle_event as selection_gesture_event;
+pub use self::selection_gesture::new as selection_gesture_new;
+pub use self::selection_gesture::reset as selection_gesture_reset;
+pub use self::search::feed as search_feed;
+pub use self::search::free as search_free;
+pub use self::search::get as search_get;
+pub use self::search::get_multi as search_get_multi;
+pub use self::search::new as search_new;
+pub use self::search::run as search_run;
+pub use self::search::set as search_set;
+pub use self::search::tick as search_tick;
 pub use self::terminal::grid_ref as terminal_grid_ref;
 pub use self::terminal::grid_ref_track as terminal_grid_ref_track;
 pub use self::terminal::point_from_grid_ref as terminal_point_from_grid_ref;
@@ -236,6 +288,19 @@ pub use self::grid_ref_tracked::tracked_grid_ref_has_value;
 pub use self::grid_ref_tracked::tracked_grid_ref_point;
 pub use self::grid_ref_tracked::tracked_grid_ref_set;
 pub use self::grid_ref_tracked::tracked_grid_ref_snapshot;
+
+pub use self::snapshot::decoder_decode as snapshot_decoder_decode;
+pub use self::snapshot::decoder_free as snapshot_decoder_free;
+pub use self::snapshot::decoder_get as snapshot_decoder_get;
+pub use self::snapshot::decoder_get_multi as snapshot_decoder_get_multi;
+pub use self::snapshot::decoder_new as snapshot_decoder_new;
+pub use self::snapshot::decoder_new_buf as snapshot_decoder_new_buf;
+pub use self::snapshot::decoder_next as snapshot_decoder_next;
+pub use self::snapshot::decoder_ready as snapshot_decoder_ready;
+pub use self::snapshot::decoder_set as snapshot_decoder_set;
+pub use self::snapshot::encode as snapshot_encode;
+pub use self::snapshot::encode_alloc as snapshot_encode_alloc;
+pub use self::snapshot::encode_buf as snapshot_encode_buf;
 
 pub use self::types::get_json as type_json;
 
@@ -338,6 +403,41 @@ pub(crate) mod tests {
         check_ghostty_h_enum::<terminal::SemanticPromptPromptKind>("GHOSTTY_SEMANTIC_PROMPT_PROMPT_", &h).unwrap();
         check_ghostty_h_enum::<terminal::ResizeWindowTag>("GHOSTTY_TERMINAL_RESIZE_WINDOW_", &h).unwrap();
         check_ghostty_h_enum::<terminal::UnknownSequenceTag>("GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_", &h).unwrap();
+
+        check_ghostty_h_enum::<render::Dirty>("GHOSTTY_RENDER_STATE_DIRTY_", &h).unwrap();
+        check_ghostty_h_enum::<render::CursorVisualStyle>("GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_", &h).unwrap();
+        check_ghostty_h_enum::<render::Data>("GHOSTTY_RENDER_STATE_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<render::SetOption>("GHOSTTY_RENDER_STATE_OPTION_", &h).unwrap();
+        check_ghostty_h_enum::<render::RowCellsData>("GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<render::RowData>("GHOSTTY_RENDER_STATE_ROW_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<render::RowOption>("GHOSTTY_RENDER_STATE_ROW_OPTION_", &h).unwrap();
+        check_ghostty_h_enum::<render::ImageProtocol>("GHOSTTY_IMAGE_PROTOCOL_", &h).unwrap();
+        check_ghostty_h_enum::<render::ImageLayer>("GHOSTTY_RENDER_STATE_IMAGE_LAYER_", &h).unwrap();
+        check_ghostty_h_enum::<render::KittyPlacementKind>("GHOSTTY_RENDER_STATE_KITTY_PLACEMENT_KIND_", &h).unwrap();
+        check_ghostty_h_enum::<render::ImageData>("GHOSTTY_RENDER_STATE_IMAGE_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<search::Status>("GHOSTTY_SEARCH_STATUS_", &h).unwrap();
+        check_ghostty_h_enum::<search::Scroll>("GHOSTTY_SEARCH_SCROLL_", &h).unwrap();
+        check_ghostty_h_enum::<search::Data>("GHOSTTY_SEARCH_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<search::Option>("GHOSTTY_SEARCH_OPT_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::Data>("GHOSTTY_KITTY_GRAPHICS_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::PlacementData>("GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::PlacementLayer>("GHOSTTY_KITTY_PLACEMENT_LAYER_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::PlacementIteratorOption>(
+            "GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_",
+            &h,
+        )
+        .unwrap();
+        check_ghostty_h_enum::<kitty_graphics::ImageFormat>("GHOSTTY_KITTY_IMAGE_FORMAT_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::ImageCompression>("GHOSTTY_KITTY_IMAGE_COMPRESSION_", &h).unwrap();
+        check_ghostty_h_enum::<kitty_graphics::ImageData>("GHOSTTY_KITTY_IMAGE_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<selection_gesture::Behavior>("GHOSTTY_SELECTION_GESTURE_BEHAVIOR_", &h).unwrap();
+        check_ghostty_h_enum::<selection_gesture::Autoscroll>("GHOSTTY_SELECTION_GESTURE_AUTOSCROLL_", &h).unwrap();
+        check_ghostty_h_enum::<selection_gesture::Data>("GHOSTTY_SELECTION_GESTURE_DATA_", &h).unwrap();
+        check_ghostty_h_enum::<selection_gesture::EventType>("GHOSTTY_SELECTION_GESTURE_EVENT_TYPE_", &h).unwrap();
+        check_ghostty_h_enum::<selection_gesture::EventOption>("GHOSTTY_SELECTION_GESTURE_EVENT_OPT_", &h).unwrap();
+        check_ghostty_h_enum::<snapshot::DecoderOption>("GHOSTTY_SNAPSHOT_DECODER_OPT_", &h).unwrap();
+        check_ghostty_h_enum::<snapshot::DecoderProgressKind>("GHOSTTY_SNAPSHOT_DECODER_PROGRESS_KIND_", &h).unwrap();
+        check_ghostty_h_enum::<snapshot::DecoderData>("GHOSTTY_SNAPSHOT_DECODER_DATA_", &h).unwrap();
     }
 
     /// Rust port: struct layouts against the C declarations in the
@@ -393,6 +493,36 @@ pub(crate) mod tests {
         assert_eq!(ptr, offset_of!(paste::Request, location));
         assert_eq!(ptr + 4, offset_of!(paste::Request, source));
         assert_eq!(ptr + 8, offset_of!(paste::Request, mimes));
+        // GhosttyFormatter{Screen,Terminal}Extra / GhosttyFormatterTerminalOptions
+        assert_eq!(2 * ptr, size_of::<formatter::ScreenOptionsExtra>());
+        assert_eq!(ptr, offset_of!(formatter::TerminalOptionsExtra, palette));
+        assert_eq!(2 * ptr, offset_of!(formatter::TerminalOptionsExtra, screen));
+        assert_eq!(4 * ptr, size_of::<formatter::TerminalOptionsExtra>());
+        assert_eq!(ptr, offset_of!(formatter::TerminalOptions, emit));
+        assert_eq!(ptr + 4, offset_of!(formatter::TerminalOptions, unwrap));
+        assert_eq!(ptr + 8, offset_of!(formatter::TerminalOptions, extra));
+        assert_eq!(ptr + 8 + 4 * ptr, offset_of!(formatter::TerminalOptions, selection));
+        // GhosttyKittyGraphicsPlacementRenderInfo
+        assert_eq!(ptr, offset_of!(kitty_graphics::PlacementRenderInfo, pixel_width));
+        assert_eq!(ptr + 24, offset_of!(kitty_graphics::PlacementRenderInfo, viewport_visible));
+        assert_eq!(ptr + 28, offset_of!(kitty_graphics::PlacementRenderInfo, source_x));
+        assert_eq!((ptr + 44).next_multiple_of(ptr), size_of::<kitty_graphics::PlacementRenderInfo>());
+        // GhosttyRenderState{RowSelection,Overscan,RowId,Cursor,Colors}
+        assert_eq!(2 * ptr, size_of::<render::RowSelection>());
+        assert_eq!(4, size_of::<render::Overscan>());
+        assert_eq!(16, size_of::<render::RowId>());
+        assert_eq!(ptr, offset_of!(render::Cursor, viewport_has_value));
+        assert_eq!(ptr + 2, offset_of!(render::Cursor, viewport_x));
+        assert_eq!(ptr + 4, offset_of!(render::Cursor, viewport_y));
+        assert_eq!(ptr + 6, offset_of!(render::Cursor, wide_tail));
+        assert_eq!(ptr + 12, offset_of!(render::Cursor, visual_style));
+        assert_eq!(ptr, offset_of!(render::Colors, background));
+        assert_eq!(ptr + 9, offset_of!(render::Colors, cursor_has_value));
+        assert_eq!(ptr + 10, offset_of!(render::Colors, palette));
+        assert_eq!((ptr + 10 + 3 * 256).next_multiple_of(ptr), size_of::<render::Colors>());
+        // GhosttySelectionGesture{Behaviors,Geometry}
+        assert_eq!(12, size_of::<selection_gesture::Behaviors>());
+        assert_eq!(16, size_of::<selection_gesture::Geometry>());
         // Enums are C ints.
         assert_eq!(size_of::<c_int>(), size_of::<result::Result>());
         assert_eq!(size_of::<c_int>(), size_of::<sgr::AttributeTag>());
