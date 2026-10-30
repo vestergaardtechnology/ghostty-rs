@@ -29,6 +29,7 @@ fn main() {
         stb();
     }
     dcimgui();
+    app_version();
     if std::env::var_os("CARGO_FEATURE_GTK").is_some() {
         gtk_resources();
     }
@@ -275,4 +276,85 @@ fn dcimgui() {
 /// be compiled for that target here, and nothing is linked anyway.
 fn cross_checking_macos() -> bool {
     std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" && !cfg!(target_os = "macos")
+}
+
+/// The app version (`src/build/Config.zig` + `GitVersion.zig`): the
+/// `Cargo.toml` version (Zig: `appVersion`), with git's branch as the
+/// pre-release and its short hash as build metadata on untagged builds.
+/// `GHOSTTY_VERSION_STRING` overrides it (Zig: `-Dversion-string`). Sets
+/// `GHOSTTY_VERSION_PRE` and `GHOSTTY_VERSION_BUILD` for `build_config`.
+fn app_version() {
+    println!("cargo:rerun-if-env-changed=GHOSTTY_VERSION_STRING");
+    let (pre, build) = match std::env::var("GHOSTTY_VERSION_STRING") {
+        // If an explicit version is given, we always use it.
+        Ok(v) => {
+            let (rest, build) = match v.split_once('+') {
+                Some((rest, build)) => (rest.to_string(), build.to_string()),
+                None => (v.clone(), String::new()),
+            };
+            let pre = rest.split_once('-').map(|(_, pre)| pre.to_string()).unwrap_or_default();
+            let core = rest.split('-').next().unwrap_or_default();
+            assert_eq!(
+                core,
+                format!(
+                    "{}.{}.{}",
+                    std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
+                    std::env::var("CARGO_PKG_VERSION_MINOR").unwrap(),
+                    std::env::var("CARGO_PKG_VERSION_PATCH").unwrap()
+                ),
+                "GHOSTTY_VERSION_STRING must match the Cargo.toml version"
+            );
+            (pre, build)
+        }
+        Err(_) => git_version(),
+    };
+    println!("cargo:rustc-env=GHOSTTY_VERSION_PRE={pre}");
+    println!("cargo:rustc-env=GHOSTTY_VERSION_BUILD={build}");
+}
+
+/// `GitVersion.detect` reduced to the version Zig builds from it: `(pre,
+/// build)`. Without git or a repository this is an unknown dev version.
+fn git_version() -> (String, String) {
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let unknown = ("dev".to_string(), "0000000".to_string());
+
+    let Some(git_dir) = git(&["rev-parse", "--git-dir"]) else {
+        return unknown;
+    };
+    // Rebuild when HEAD moves (a commit or checkout).
+    println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&["rev-parse", "--git-path", &head_ref]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+
+    let Some(branch) = git(&["rev-parse", "--abbrev-ref", "HEAD"]) else {
+        return unknown;
+    };
+    let branch: String = branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    let short_hash = git(&["-c", "log.showSignature=false", "log", "--pretty=format:%h", "-n", "1"])
+        .unwrap_or_default();
+
+    if let Some(tag) = git(&["describe", "--exact-match", "--tags"]) {
+        // Tip releases behave just like any other pre-release so we skip.
+        if tag != "tip" {
+            let expected = format!(
+                "v{}.{}.{}",
+                std::env::var("CARGO_PKG_VERSION_MAJOR").unwrap(),
+                std::env::var("CARGO_PKG_VERSION_MINOR").unwrap(),
+                std::env::var("CARGO_PKG_VERSION_PATCH").unwrap()
+            );
+            assert_eq!(tag, expected, "tagged releases must be in vX.Y.Z format matching Cargo.toml");
+            return (String::new(), String::new());
+        }
+    }
+
+    (branch, short_hash)
 }

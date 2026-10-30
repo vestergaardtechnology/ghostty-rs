@@ -1,6 +1,6 @@
 [package]
 name = "ghostty"
-version = "1.3.0-dev"
+version = "1.4.1"
 edition = "2021"
 description = "Rust port of the Ghostty terminal emulator"
 license = "MIT"

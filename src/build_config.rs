@@ -108,10 +108,52 @@ pub const VERSION: SemanticVersion = SemanticVersion {
     major: parse_usize(env!("CARGO_PKG_VERSION_MAJOR")),
     minor: parse_usize(env!("CARGO_PKG_VERSION_MINOR")),
     patch: parse_usize(env!("CARGO_PKG_VERSION_PATCH")),
-    pre: non_empty(env!("CARGO_PKG_VERSION_PRE")),
-    build: None,
+    pre: non_empty(env!("GHOSTTY_VERSION_PRE")),
+    build: non_empty(env!("GHOSTTY_VERSION_BUILD")),
 };
-pub const VERSION_STRING: &str = env!("CARGO_PKG_VERSION");
+
+/// `VERSION` formatted (Zig: `std.fmt.comptimePrint("{f}", .{version})`).
+pub const VERSION_STRING: &str = {
+    const CORE: &str = concat!(
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        ".",
+        env!("CARGO_PKG_VERSION_MINOR"),
+        ".",
+        env!("CARGO_PKG_VERSION_PATCH")
+    );
+    match (VERSION.pre, VERSION.build) {
+        (None, None) => CORE,
+        (Some(_), None) => concat!(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_MINOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_PATCH"),
+            "-",
+            env!("GHOSTTY_VERSION_PRE")
+        ),
+        (None, Some(_)) => concat!(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_MINOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_PATCH"),
+            "+",
+            env!("GHOSTTY_VERSION_BUILD")
+        ),
+        (Some(_), Some(_)) => concat!(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_MINOR"),
+            ".",
+            env!("CARGO_PKG_VERSION_PATCH"),
+            "-",
+            env!("GHOSTTY_VERSION_PRE"),
+            "+",
+            env!("GHOSTTY_VERSION_BUILD")
+        ),
+    }
+};
 
 /// The release channel for this build.
 pub const RELEASE_CHANNEL: ReleaseChannel = match VERSION.pre {

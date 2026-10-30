@@ -442,14 +442,15 @@ const fn non_empty(s: &'static str) -> Option<&'static str> {
     }
 }
 
-/// The application version, taken from Cargo's package version (the Zig build
-/// derives it from `build.zig.zon` and git).
+/// The application version (`build_config::VERSION`: the Cargo package
+/// version plus git's branch and hash, as the Zig build derives it from
+/// `build.zig.zon` and git).
 const APP_VERSION: SemanticVersion = SemanticVersion {
     major: parse_usize(env!("CARGO_PKG_VERSION_MAJOR")),
     minor: parse_usize(env!("CARGO_PKG_VERSION_MINOR")),
     patch: parse_usize(env!("CARGO_PKG_VERSION_PATCH")),
-    pre: non_empty(env!("CARGO_PKG_VERSION_PRE")),
-    build: None,
+    pre: non_empty(env!("GHOSTTY_VERSION_PRE")),
+    build: non_empty(env!("GHOSTTY_VERSION_BUILD")),
 };
 
 const fn env_or(value: Option<&'static str>, default: &'static str) -> &'static str {
@@ -533,7 +534,7 @@ pub const KITTY_GRAPHICS: bool = OPTIONS.kitty_graphics_current_target();
 pub const VERSION_STRING: &str = if cfg!(ghostty_lib_vt) {
     LIB_VERSION_STRING
 } else {
-    env!("CARGO_PKG_VERSION")
+    crate::build_config::VERSION_STRING
 };
 /// `terminal_options.version_major`.
 pub const VERSION_MAJOR: usize = OPTIONS.version.major;

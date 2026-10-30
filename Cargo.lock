@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "ghostty"
-version = "1.3.0-dev"
+version = "1.4.1"
 dependencies = [
  "base64",
  "bitflags",
