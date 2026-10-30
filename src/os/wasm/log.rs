@@ -2,6 +2,8 @@
 //!
 //! STATUS: ported (wasm32-only; not compiled on Linux)
 
+#![cfg(target_arch = "wasm32")]
+
 use std::fmt::{self, Write as _};
 
 /// A log function that discards everything. In Zig the format string and

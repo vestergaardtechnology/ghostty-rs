@@ -1,6 +1,6 @@
 //! Port of `src/os/wasm/target.zig`.
 //!
-//! STATUS: ported (wasm32-only; not compiled on Linux)
+//! STATUS: ported
 
 /// The wasm target platform. This is used to toggle certain features
 /// on and off since the standard triple target is often not specific
@@ -12,8 +12,9 @@ pub enum Target {
 
 /// Our specific target platform.
 ///
-/// TODO(port-dedupe): replace with the build option once build_config is
-/// ported (Zig: `options.wasm_target`, default `.browser`).
+/// NOTE(port): Zig reads the `wasm_target` build option; the Rust port has
+/// no build-options step (PORTING.md), so wasm32 uses its default
+/// (`.browser`).
 pub const TARGET: Option<Target> = if cfg!(target_arch = "wasm32") {
     Some(Target::Browser)
 } else {
