@@ -1,11 +1,12 @@
 //! Port of `src/terminal/search/terminal.zig`.
 //!
-//! STATUS: partial — everything is ported; the test "feed after complete
-//! discovers prepended snapshot history" needs `terminal::snapshot`
-//! (encode + incremental `Decoder`), which is still a stub, so it is
-//! compiled out (`#[cfg(any())]`, TODO(port-dedupe)).
+//! STATUS: ported
 //!
 //! Notes on the port:
+//! - The test "feed after complete discovers prepended snapshot history"
+//!   uses a test-only stand-in for `terminal::snapshot` (encode +
+//!   incremental `Decoder`), which is not ported yet
+//!   (TODO(port-dedupe)).
 //! - `std.EnumMap(ScreenSet.Key, T)` is a `[Option<T>; Key::COUNT]` array
 //!   indexed by the key.
 //! - `deinit` stays explicit because it needs the (possibly already
@@ -605,6 +606,201 @@ mod tests {
         // search-owned memory without touching the terminal.
         drop(t);
         search.deinit(None);
+    }
+
+    /// TODO(port-dedupe): replace with `crate::terminal::snapshot`
+    /// (`encode`, `Decoder::ready`, `Decoder::next`) once the snapshot
+    /// port lands. This test-only stand-in models what the test relies on:
+    /// READY yields a terminal holding the pages from the active area down,
+    /// and `next` prepends the remaining history pages one at a time,
+    /// newest first, through `PageList::allocate_page` +
+    /// `PageAllocation::finalize(.prepend)`.
+    mod snapshot {
+        use crate::terminal::page::{Capacity, Cell};
+        use crate::terminal::page_list::{FinalizeOptions, Location};
+        use crate::terminal::point::{Coordinate, Point, Tag};
+        use crate::terminal::search::testing::terminal;
+        use crate::terminal::size::CellCountInt;
+        use crate::terminal::terminal::Terminal;
+
+        struct PendingPage {
+            cols: CellCountInt,
+            rows: CellCountInt,
+            cells: Vec<Cell>,
+            wraps: Vec<(bool, bool)>,
+        }
+
+        pub struct ProgressPage {
+            pub rows: CellCountInt,
+        }
+
+        pub struct Progress {
+            pub page: ProgressPage,
+        }
+
+        pub struct Decoder {
+            /// History pages still to restore, newest first.
+            pending: Vec<PendingPage>,
+        }
+
+        /// Encode `source` and decode it through READY.
+        pub fn encode_ready(source: &Terminal) -> (Terminal, Decoder) {
+            let mut t = terminal(source.cols, source.rows, Some(usize::MAX));
+            let source_screen: &crate::terminal::screen::Screen = &source.screens.active;
+            let cloned = source_screen
+                .clone(Point::Screen(Coordinate::default()), None)
+                .unwrap();
+            *t.screens.active = cloned;
+
+            let list = &mut t.screens.active.pages;
+            let active_node = list.get_top_left(Tag::Active).node;
+            let mut pending = Vec::new();
+            let mut history_rows: u32 = 0;
+            let mut node = list.pages.first.unwrap();
+            while node != active_node {
+                // SAFETY: live node of the cloned list.
+                let n = unsafe { &mut *node.as_ptr() };
+                let rows = n.rows();
+                let cols = n.cols();
+                let page = n.page();
+                let mut cells = Vec::new();
+                let mut wraps = Vec::new();
+                for y in 0..rows as usize {
+                    // SAFETY: in-bounds rows/cells.
+                    unsafe {
+                        let row = &*page.get_row(y);
+                        wraps.push((row.wrap(), row.wrap_continuation()));
+                        for x in 0..cols as usize {
+                            cells.push(*page.get_row_and_cell(x, y).cell);
+                        }
+                    }
+                }
+                pending.push(PendingPage { cols, rows, cells, wraps });
+                history_rows += rows as u32;
+                node = n.next.unwrap();
+            }
+            pending.reverse();
+
+            if history_rows > 0 {
+                list.erase_history(Some(Point::History(Coordinate {
+                    x: 0,
+                    y: history_rows - 1,
+                })));
+            }
+            assert_eq!(Some(active_node), list.pages.first);
+
+            (t, Decoder { pending })
+        }
+
+        impl Decoder {
+            /// Restore the next (older) history page into `t`.
+            pub fn next(&mut self, t: &mut Terminal) -> Option<Progress> {
+                if self.pending.is_empty() {
+                    return None;
+                }
+                let p = self.pending.remove(0);
+                let list = &mut t.screens.active.pages;
+                let mut allocation = list.allocate_page(Capacity::new(p.cols, p.rows)).unwrap();
+                let page = allocation.page();
+                page.size.rows = p.rows;
+                for y in 0..p.rows as usize {
+                    // SAFETY: in-bounds rows/cells of the detached page.
+                    unsafe {
+                        let row = &mut *page.get_row(y);
+                        row.set_wrap(p.wraps[y].0);
+                        row.set_wrap_continuation(p.wraps[y].1);
+                        for x in 0..p.cols as usize {
+                            let c = p.cells[y * p.cols as usize + x];
+                            *page.get_row_and_cell(x, y).cell = Cell::init(c.codepoint());
+                        }
+                    }
+                }
+                allocation.finalize(Location::Prepend, FinalizeOptions::default()).unwrap();
+                Some(Progress {
+                    page: ProgressPage { rows: p.rows },
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn feed_after_complete_discovers_prepended_snapshot_history() {
+        // A source terminal with several pages of scrollback where every line
+        // is a match, so the expected total is simply the number of lines.
+        let mut source = terminal(10, 2, Some(usize::MAX));
+        let mut needle_count: usize = 0;
+        while source.screens.active.pages.total_pages() < 4 {
+            next_slice(&mut source, b"needle\r\n");
+            needle_count += 1;
+        }
+
+        // Restore only through READY. The terminal is usable while its history
+        // pages are still in flight.
+        let (mut t, mut decoder) = snapshot::encode_ready(&source);
+        drop(source);
+        let pages_at_ready = t.screens.active.pages.total_pages();
+
+        // Search the READY state to completion and select the oldest match.
+        let mut search = TerminalSearch::init(Allocator::GLOBAL, b"needle").unwrap();
+        pump(&mut search, &mut t);
+        let partial = search.active_screen_search().unwrap().matches_len();
+        assert!(partial > 0);
+        assert!(partial < needle_count);
+        assert!(search.select(&mut t, Select::Prev, SelectScroll::None).unwrap());
+        let selected_idx = search.active_screen_search().unwrap().selected.unwrap().idx;
+        assert_eq!(partial - 1, selected_idx);
+        let selected_before = search
+            .active_screen_search()
+            .unwrap()
+            .selected_match()
+            .unwrap()
+            .untracked();
+
+        // Restore every history page below the live terminal.
+        let mut restored_pages: usize = 0;
+        while let Some(progress) = decoder.next(&mut t) {
+            assert!(progress.page.rows > 0);
+            restored_pages += 1;
+        }
+        assert!(restored_pages > 0);
+        assert_eq!(
+            pages_at_ready + restored_pages,
+            t.screens.active.pages.total_pages()
+        );
+
+        // Refresh the existing search the way ghostty_search_run does: feed,
+        // then tick to completion. It must now cover the restored history.
+        search.feed(&mut t, true);
+        pump(&mut search, &mut t);
+        let screen_search = search.active_screen_search().unwrap();
+        assert_eq!(needle_count, screen_search.matches_len());
+
+        // Restored results are older than everything already cached, so the
+        // selection keeps both its index and its target.
+        assert_eq!(selected_idx, screen_search.selected.unwrap().idx);
+        let selected_after = screen_search.selected_match().unwrap().untracked();
+        assert!(selected_before.start.eql(selected_after.start));
+        assert!(selected_before.end.eql(selected_after.end));
+
+        // Results stay ordered newest to oldest, ending at the very first line.
+        let matches = screen_search.matches(Allocator::GLOBAL).unwrap();
+        let pages = &t.screens.active.pages;
+        let mut prev_y: Option<u32> = None;
+        for hl in &matches {
+            let pt = pages.point_from_pin(Tag::Screen, hl.start_pin()).unwrap();
+            if let Some(y) = prev_y {
+                assert!(pt.coord().y < y);
+            }
+            prev_y = Some(pt.coord().y);
+        }
+        assert_eq!(Some(0), prev_y);
+
+        // A search created after the restore agrees with the refreshed one.
+        let mut fresh = TerminalSearch::init(Allocator::GLOBAL, b"needle").unwrap();
+        pump(&mut fresh, &mut t);
+        assert_eq!(needle_count, fresh.active_screen_search().unwrap().matches_len());
+        fresh.deinit(Some(&t));
+        search.deinit(Some(&t));
     }
 
     #[test]
