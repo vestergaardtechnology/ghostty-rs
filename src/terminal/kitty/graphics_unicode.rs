@@ -1,20 +1,320 @@
 //! Port of `src/terminal/kitty/graphics_unicode.zig`.
 //!
-//! STATUS: partial — `Placement` (with `renderPlacement`/`grid`) and the
-//! three "unicode render placement" tests are pending: they need
-//! `terminal.Pin` (PageList), `ImageStorage`/`Image`/`RenderPlacement`
-//! (kitty/graphics_storage, graphics_image, graphics_render) and
-//! `Terminal`, none of which are ported yet.
+//! STATUS: ported
 //!
 //! This file contains various logic and data for working with the
 //! Kitty graphics protocol unicode placeholder, virtual placement feature.
 
+use std::fmt;
+
+use crate::terminal::kitty::graphics_image::Image;
+use crate::terminal::kitty::graphics_render::Placement as RenderPlacement;
+use crate::terminal::kitty::graphics_storage::Placement as StoragePlacement;
+use crate::terminal::page_list::Pin;
+use crate::terminal::size::CellCountInt;
 use crate::terminal::style::{Color, Style};
 
 const LOG_TARGET: &str = "kitty_gfx";
 
 /// Codepoint for the unicode placeholder character.
 pub const PLACEHOLDER: u32 = 0x10EEEE;
+
+/// A virtual placement in the terminal. This can represent more than
+/// one cell if the cells combine to be a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement {
+    /// The top-left pin of the placement. This can be used to get the
+    /// screen x/y.
+    pub pin: Pin,
+
+    /// The image ID and placement ID for this virtual placement. The
+    /// image ID is encoded in the fg color (plus optional a 8-bit high
+    /// value in the 3rd diacritic). The placement ID is encoded in the
+    /// underline color (optionally).
+    pub image_id: u32,
+    pub placement_id: u32,
+
+    /// Starting row/col index for the image itself. This is the "fragment"
+    /// of the image we want to show in this placement. This is 0-indexed.
+    pub col: u32,
+    pub row: u32,
+
+    /// The width/height in cells of this placement.
+    pub width: u32,
+    pub height: u32,
+}
+
+/// `Placement.Error`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementError {
+    PlacementGridOutOfBounds,
+}
+
+impl fmt::Display for PlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+impl std::error::Error for PlacementError {}
+
+/// The grid size computed by [`Placement::grid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grid {
+    rows: u32,
+    columns: u32,
+}
+
+impl Placement {
+    /// Take this virtual placement and convert it to a render placement.
+    /// `target` is the virtual placement that the cells show, from
+    /// `ImageStorage.placeholderTarget`.
+    pub fn render_placement(
+        &self,
+        target: &StoragePlacement,
+        img: &Image,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Result<RenderPlacement, PlacementError> {
+        // In this function, there is a variable naming convention to try
+        // to make it slightly less confusing. The prefix will tell you what
+        // coordinate/size space a variable lives in:
+        // - img_* is for the original image
+        // - p_* is for the final placement
+        // - vp_* is for the virtual placement
+
+        // Determine the grid size that this virtual placement fits into.
+        let p_grid = Self::grid(target, img, cell_width, cell_height)?;
+
+        // From here on out we switch to floating point math. These are
+        // constants that we'll reference repeatedly.
+        let img_width_f64: f64 = img.width as f64;
+        let img_height_f64: f64 = img.height as f64;
+
+        // Next we have to fit the source image into the grid size while preserving
+        // aspect ratio. We will center the image horizontally/vertically if
+        // necessary.
+        //
+        // The offsets are pixels from the top-left of the placement-sized
+        // image in order to center the image as necessary. The multipliers
+        // are applied to the width/height of the original image size in
+        // order to reach the placement size.
+        struct PScale {
+            x_offset: f64,
+            y_offset: f64,
+            x_scale: f64,
+            y_scale: f64,
+        }
+        let p_scale: PScale = {
+            let p_rows_px: f64 = (p_grid.rows * cell_height) as f64;
+            let p_cols_px: f64 = (p_grid.columns * cell_width) as f64;
+            if img_width_f64 * p_rows_px > img_height_f64 * p_cols_px {
+                // Image is wider than the grid, fit width and center height
+                let x_scale = p_cols_px / img_width_f64.max(1.0);
+                let y_scale = x_scale;
+                let y_offset = (p_rows_px - img_height_f64 * y_scale) / 2.0;
+                PScale {
+                    x_offset: 0.0,
+                    y_offset,
+                    x_scale,
+                    y_scale,
+                }
+            } else {
+                // Image is taller than the grid, fit height and center width
+                let y_scale = p_rows_px / img_height_f64.max(1.0);
+                let x_scale = y_scale;
+                let x_offset = (p_cols_px - img_width_f64 * x_scale) / 2.0;
+                PScale {
+                    x_offset,
+                    y_offset: 0.0,
+                    x_scale,
+                    y_scale,
+                }
+            }
+        };
+
+        // Scale our original image according to the aspect ratio
+        // and padding calculated for p_scale.
+        struct ImgScaled {
+            x_offset: f64,
+            y_offset: f64,
+            width: f64,
+            height: f64,
+        }
+        let img_scaled: ImgScaled = {
+            let x_offset: f64 = p_scale.x_offset / p_scale.x_scale;
+            let y_offset: f64 = p_scale.y_offset / p_scale.y_scale;
+            let width: f64 = img_width_f64 + (x_offset * 2.0);
+            let height: f64 = img_height_f64 + (y_offset * 2.0);
+            ImgScaled {
+                x_offset,
+                y_offset,
+                width,
+                height,
+            }
+        };
+
+        // Calculate the source rectangle for the scaled image. These
+        // coordinates are in the scaled image space.
+        struct Rect {
+            x: f64,
+            y: f64,
+            width: f64,
+            height: f64,
+        }
+        let mut img_scale_source: Rect = {
+            // Float-converted values we already have
+            let vp_width: f64 = self.width as f64;
+            let vp_height: f64 = self.height as f64;
+            let vp_col: f64 = self.col as f64;
+            let vp_row: f64 = self.row as f64;
+            let p_grid_cols: f64 = p_grid.columns as f64;
+            let p_grid_rows: f64 = p_grid.rows as f64;
+
+            // Calculate the scaled source rectangle for the image, undoing
+            // the aspect ratio scaling as necessary.
+            let width: f64 = img_scaled.width * (vp_width / p_grid_cols);
+            let height: f64 = img_scaled.height * (vp_height / p_grid_rows);
+            let x: f64 = img_scaled.width * (vp_col / p_grid_cols);
+            let y: f64 = img_scaled.height * (vp_row / p_grid_rows);
+
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            }
+        };
+
+        // The destination rectangle. The x/y is specified by offsets from
+        // the top-left since that's how our RenderPlacement works.
+        let p_dest: Rect = {
+            let mut x_offset: f64 = 0.0;
+            let mut y_offset: f64 = 0.0;
+            let mut width: f64 = (self.width * cell_width) as f64;
+            let mut height: f64 = (self.height * cell_height) as f64;
+
+            if img_scale_source.y < img_scaled.y_offset {
+                // If our source rect y is within the offset area, we need to
+                // adjust our source rect and destination since the source texture
+                // doesn't actually have the offset area blank.
+                let offset: f64 = img_scaled.y_offset - img_scale_source.y;
+                img_scale_source.height -= offset;
+                y_offset = offset;
+                height -= offset * p_scale.y_scale;
+                img_scale_source.y = 0.0;
+
+                // If our height is greater than our original height,
+                // bring it back down. This addresses the case where the top
+                // and bottom offsets are both used.
+                if img_scale_source.height > img_height_f64 {
+                    img_scale_source.height = img_height_f64;
+                    height = img_height_f64 * p_scale.y_scale;
+                }
+            } else if img_scale_source.y + img_scale_source.height
+                > img_scaled.height - img_scaled.y_offset
+            {
+                // if our y is in our bottom offset area, we need to shorten the
+                // source to fit in the cell.
+                img_scale_source.y -= img_scaled.y_offset;
+                img_scale_source.height =
+                    img_scaled.height - img_scaled.y_offset - img_scale_source.y;
+                img_scale_source.height -= img_scaled.y_offset;
+                height = img_scale_source.height * p_scale.y_scale;
+            } else {
+                img_scale_source.y -= img_scaled.y_offset;
+            }
+
+            if img_scale_source.x < img_scaled.x_offset {
+                // If our source rect x is within the offset area, we need to
+                // adjust our source rect and destination since the source texture
+                // doesn't actually have the offset area blank.
+                let offset: f64 = img_scaled.x_offset - img_scale_source.x;
+                img_scale_source.width -= offset;
+                x_offset = offset;
+                width -= offset * p_scale.x_scale;
+                img_scale_source.x = 0.0;
+
+                // If our width is greater than our original width,
+                // bring it back down. This addresses the case where the left
+                // and right offsets are both used.
+                if img_scale_source.width > img_width_f64 {
+                    img_scale_source.width = img_width_f64;
+                    width = img_width_f64 * p_scale.x_scale;
+                }
+            } else if img_scale_source.x + img_scale_source.width
+                > img_scaled.width - img_scaled.x_offset
+            {
+                // if our x is in our right offset area, we need to shorten the
+                // source to fit in the cell.
+                img_scale_source.x -= img_scaled.x_offset;
+                img_scale_source.width =
+                    img_scaled.width - img_scaled.x_offset - img_scale_source.x;
+                img_scale_source.width -= img_scaled.x_offset;
+                width = img_scale_source.width * p_scale.x_scale;
+            } else {
+                img_scale_source.x -= img_scaled.x_offset;
+            }
+
+            // If our modified source width/height is less than zero then
+            // we render nothing because it means we're rendering outside
+            // of the visible image.
+            if img_scale_source.width <= 0.0 || img_scale_source.height <= 0.0 {
+                return Ok(RenderPlacement::new(self.pin));
+            }
+
+            Rect {
+                x: x_offset * p_scale.x_scale,
+                y: y_offset * p_scale.y_scale,
+                width,
+                height,
+            }
+        };
+
+        Ok(RenderPlacement {
+            top_left: self.pin,
+            offset_x: p_dest.x.round() as u32,
+            offset_y: p_dest.y.round() as u32,
+            source_x: img_scale_source.x.round() as u32,
+            source_y: img_scale_source.y.round() as u32,
+            source_width: img_scale_source.width.round() as u32,
+            source_height: img_scale_source.height.round() as u32,
+            dest_width: p_dest.width.round() as u32,
+            dest_height: p_dest.height.round() as u32,
+        })
+    }
+
+    // Calculate the grid size for the placement. For virtual placements,
+    // we use the requested row/cols. If either isn't specified, we choose
+    // the best size based on the image size to fit the entire image in its
+    // original size.
+    //
+    // This part of the code does NOT do preserve any aspect ratios. Its
+    // dumbly fitting the image into the grid size -- possibly user specified.
+    fn grid(
+        placement: &StoragePlacement,
+        image: &Image,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> Result<Grid, PlacementError> {
+        // Use requested rows/columns if specified
+        // For unspecified rows/columns, calculate based on the image size.
+        let mut rows = placement.rows;
+        let mut columns = placement.columns;
+        if rows == 0 {
+            rows = (image.height + cell_height - 1) / cell_height;
+        }
+        if columns == 0 {
+            columns = (image.width + cell_width - 1) / cell_width;
+        }
+        Ok(Grid {
+            rows: CellCountInt::try_from(rows)
+                .map_err(|_| PlacementError::PlacementGridOutOfBounds)? as u32,
+            columns: CellCountInt::try_from(columns)
+                .map_err(|_| PlacementError::PlacementGridOutOfBounds)? as u32,
+        })
+    }
+}
 
 /// IncompletePlacement is the placement information present in a single
 /// cell. It is "incomplete" because the specification allows for missing
@@ -327,7 +627,139 @@ mod tests {
         assert!(!run.append(&bad));
     }
 
-    // TODO: "unicode render placement: dog 4x2", "dog 2x2 with blank
-    // cells" and "dog 1x1" need Terminal, ImageStorage and Placement
-    // (see the STATUS header).
+    use crate::terminal::kitty::graphics_storage::test_util::init;
+    use crate::terminal::kitty::graphics_storage::{ImageStorage, Location};
+
+    /// Shared setup of the "unicode render placement" tests: a 100x100
+    /// terminal with a 500x306 image (id 1) and a virtual placement of
+    /// `columns`x`rows` cells. Returns the render placement of row `row`
+    /// of a 4-cell-wide run at the cursor.
+    fn dog_render_placement(columns: u32, rows: u32, row: u32) -> RenderPlacement {
+        let cell_width = 36;
+        let cell_height = 80;
+
+        let mut t = init(100, 100);
+        let mut s = ImageStorage::default();
+
+        let image = Image {
+            id: 1,
+            width: 500,
+            height: 306,
+            ..Default::default()
+        };
+        s.add_image(&mut t.screens.active.pages, image.clone())
+            .unwrap();
+        s.add_placement(
+            &mut t.screens.active.pages,
+            1,
+            0,
+            StoragePlacement {
+                columns,
+                rows,
+                ..StoragePlacement::new(Location::Virtual)
+            },
+        )
+        .unwrap();
+
+        // SAFETY: the cursor pin is tracked by the screen.
+        let pin = unsafe { *t.screens.active.cursor.page_pin.as_ptr() };
+        let p = Placement {
+            pin,
+            image_id: 1,
+            placement_id: 0,
+            col: 0,
+            row,
+            width: 4,
+            height: 1,
+        };
+        let rp = p
+            .render_placement(
+                &s.placeholder_target(1, 0).unwrap().placement,
+                &image,
+                cell_width,
+                cell_height,
+            )
+            .unwrap();
+        s.deinit(&mut t.screens.active.pages);
+        rp
+    }
+
+    #[test]
+    fn unicode_render_placement_dog_4x2() {
+        // Row 1
+        {
+            let rp = dog_render_placement(4, 2, 0);
+            assert_eq!(0, rp.offset_x);
+            assert_eq!(36, rp.offset_y);
+            assert_eq!(0, rp.source_x);
+            assert_eq!(0, rp.source_y);
+            assert_eq!(500, rp.source_width);
+            assert_eq!(153, rp.source_height);
+            assert_eq!(144, rp.dest_width);
+            assert_eq!(44, rp.dest_height);
+        }
+        // Row 2
+        {
+            let rp = dog_render_placement(4, 2, 1);
+            assert_eq!(0, rp.offset_x);
+            assert_eq!(0, rp.offset_y);
+            assert_eq!(0, rp.source_x);
+            assert_eq!(153, rp.source_y);
+            assert_eq!(500, rp.source_width);
+            assert_eq!(153, rp.source_height);
+            assert_eq!(144, rp.dest_width);
+            assert_eq!(44, rp.dest_height);
+        }
+    }
+
+    // Fish:
+    // printf "\033_Gf=100,i=1,t=f,q=2;$(printf dog.png | base64)\033\\"
+    // printf "\e[38;5;1m\U10EEEE\U0305\U0305\U10EEEE\U0305\U030D\U10EEEE\U0305\U030E\U10EEEE\U0305\U0310\e[39m\n"
+    // printf "\e[38;5;1m\U10EEEE\U030D\U0305\U10EEEE\U030D\U030D\U10EEEE\U030D\U030E\U10EEEE\U030D\U0310\e[39m\n"
+    // printf "\033_Ga=p,i=1,U=1,q=2,c=2,r=2\033\\"
+    #[test]
+    fn unicode_render_placement_dog_2x2_with_blank_cells() {
+        // Row 1
+        {
+            let rp = dog_render_placement(2, 2, 0);
+            assert_eq!(0, rp.offset_x);
+            assert_eq!(58, rp.offset_y);
+            assert_eq!(0, rp.source_x);
+            assert_eq!(0, rp.source_y);
+            assert_eq!(500, rp.source_width);
+            assert_eq!(153, rp.source_height);
+            assert_eq!(72, rp.dest_width);
+            assert_eq!(22, rp.dest_height);
+        }
+        // Row 2
+        {
+            let rp = dog_render_placement(2, 2, 1);
+            assert_eq!(0, rp.offset_x);
+            assert_eq!(0, rp.offset_y);
+            assert_eq!(0, rp.source_x);
+            assert_eq!(153, rp.source_y);
+            assert_eq!(500, rp.source_width);
+            assert_eq!(153, rp.source_height);
+            assert_eq!(72, rp.dest_width);
+            assert_eq!(22, rp.dest_height);
+        }
+    }
+
+    // Fish:
+    // printf "\033_Gf=100,i=1,t=f,q=2;$(printf dog.png | base64)\033\\"
+    // printf "\e[38;5;1m\U10EEEE\U0305\U0305\U10EEEE\U0305\U030D\U10EEEE\U0305\U030E\U10EEEE\U0305\U0310\e[39m\n"
+    // printf "\033_Ga=p,i=1,U=1,q=2,c=1,r=1\033\\"
+    #[test]
+    fn unicode_render_placement_dog_1x1() {
+        // Row 1
+        let rp = dog_render_placement(1, 1, 0);
+        assert_eq!(0, rp.offset_x);
+        assert_eq!(29, rp.offset_y);
+        assert_eq!(0, rp.source_x);
+        assert_eq!(0, rp.source_y);
+        assert_eq!(500, rp.source_width);
+        assert_eq!(306, rp.source_height);
+        assert_eq!(36, rp.dest_width);
+        assert_eq!(22, rp.dest_height);
+    }
 }
