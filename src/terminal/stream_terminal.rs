@@ -6176,4 +6176,909 @@ mod tests {
             assert!(storage.image_by_id(7).is_none());
         }
     }
+
+    #[test]
+    fn continuation_reconstructs_standard_stream_without_duplicate_effects() {
+        #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+        struct Counts {
+            bell: usize,
+            title: usize,
+            write: usize,
+            notification: usize,
+            clipboard: usize,
+        }
+        thread_local! {
+            static COUNTS: Cell<Counts> = Cell::new(Counts::default());
+        }
+        fn bump(f: impl FnOnce(&mut Counts)) {
+            COUNTS.with(|c| {
+                let mut v = c.get();
+                f(&mut v);
+                c.set(v);
+            });
+        }
+        fn bell(_: &mut Handler<'_>) {
+            bump(|c| c.bell += 1);
+        }
+        fn title_changed(_: &mut Handler<'_>) {
+            bump(|c| c.title += 1);
+        }
+        fn write_pty(_: &mut Handler<'_>, _: &[u8]) {
+            bump(|c| c.write += 1);
+        }
+        fn desktop_notification(_: &mut Handler<'_>, _: stream::ShowDesktopNotification<'_>) {
+            bump(|c| c.notification += 1);
+        }
+        fn clipboard_write(_: &mut Handler<'_>, write: clipboard::Write<'_>) {
+            bump(|c| c.clipboard += 1);
+            write.reply(clipboard::WriteResult::Success(Default::default()));
+        }
+        fn with_effects(t: &mut Terminal) -> Stream<'_> {
+            let mut handler = Handler::init(t);
+            handler.effects.bell = Some(bell);
+            handler.effects.title_changed = Some(title_changed);
+            handler.effects.write_pty = Some(write_pty);
+            handler.effects.desktop_notification = Some(desktop_notification);
+            handler.effects.clipboard_write = Some(clipboard_write);
+            Stream::init(stream::Options {
+                allocator: Some(osc::Allocator::GLOBAL),
+                continuation_max_bytes: Some(1024),
+                ..stream::Options::new(handler)
+            })
+        }
+        let counts = || COUNTS.with(|c| c.get());
+        COUNTS.with(|c| c.set(Counts::default()));
+
+        let committed: &[u8] = b"A\n\x07\x1b]2;title\x1b\\\x1b[5n\x1b]9;body\x1b\\\x1b]52;c;aA==\x1b\\";
+
+        let mut source_terminal = term(80, 24);
+        let mut source = with_effects(&mut source_terminal);
+
+        // Terminal mutation and all callbacks have already committed. The
+        // unfinished CSI is the only input needed to recreate the stream state.
+        let mut input = committed.to_vec();
+        input.extend_from_slice(b"\x1b[31");
+        source.next_slice(&input);
+        assert_eq!(
+            Counts {
+                bell: 1,
+                title: 1,
+                write: 1,
+                notification: 1,
+                clipboard: 1,
+            },
+            counts()
+        );
+
+        let mut continuation: Vec<u8> = Vec::new();
+        source.write_continuation(&mut continuation).unwrap();
+        assert_bytes(b"\x1b[31", &continuation);
+
+        let mut restored_terminal = term(80, 24);
+
+        // Stand in for restoring the already-committed terminal snapshot.
+        {
+            let mut snapshot_stream = stream(Handler::init(&mut restored_terminal));
+            snapshot_stream.next_slice(committed);
+        }
+
+        let before = plain(&restored_terminal);
+        let before_x = restored_terminal.screens.active.cursor.x;
+        let before_y = restored_terminal.screens.active.cursor.y;
+        let before_style = restored_terminal.screens.active.cursor.style_id;
+        let before_title = restored_terminal.get_title().unwrap().to_vec();
+
+        let mut restored = with_effects(&mut restored_terminal);
+
+        COUNTS.with(|c| c.set(Counts::default()));
+        restored.next_slice(&continuation);
+        assert_eq!(Counts::default(), counts());
+        let rt = &restored.handler.terminal;
+        assert_eq!(before, plain(rt));
+        assert_eq!(before_x, rt.screens.active.cursor.x);
+        assert_eq!(before_y, rt.screens.active.cursor.y);
+        assert_eq!(before_style, rt.screens.active.cursor.style_id);
+        assert_bytes(&before_title, rt.get_title().unwrap());
+
+        source.next_slice(b"mB");
+        restored.next_slice(b"mB");
+        assert_eq!(plain(source.handler.terminal), plain(restored.handler.terminal));
+        assert_eq!(
+            source.handler.terminal.screens.active.cursor.style_id,
+            restored.handler.terminal.screens.active.cursor.style_id
+        );
+    }
+
+    #[test]
+    fn kitty_dnd_query_response() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        s.next_slice(b"\x1B]72;t=q:i=3\x1B\\");
+        assert_bytes(b"\x1b]72;t=q:i=3\x1b\\", &pty_all());
+    }
+
+    #[test]
+    fn kitty_dnd_register_drop_and_serve_data() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Client registers to accept drops.
+        s.next_slice(b"\x1B]72;t=a;text/plain text/uri-list\x1B\\");
+        assert_bytes(b"", &pty_all());
+        assert!(s.handler.terminal.kitty_dnd.is_some());
+
+        // A native drop arrives; the embedder feeds it to the terminal
+        // state and delivers the produced event bytes itself.
+        {
+            let mut aw: Vec<u8> = Vec::new();
+            s.handler
+                .terminal
+                .kitty_dnd
+                .as_mut()
+                .unwrap()
+                .drag_drop(
+                    &mut aw,
+                    kitty_dnd::MoveEvent {
+                        cell_x: 2,
+                        cell_y: 1,
+                        pixel_x: 20,
+                        pixel_y: 18,
+                        operations: kitty_dnd::Operations {
+                            copy: true,
+                            r#move: false,
+                        },
+                    },
+                    &[kitty_dnd::Item {
+                        mime: b"text/plain",
+                        data: b"hello",
+                    }],
+                )
+                .unwrap();
+            assert_bytes(b"\x1b]72;t=M:x=2:y=1:X=20:Y=18:o=1:m=0;text/plain \x1b\\", &aw);
+        }
+
+        // The client requests the data and concludes.
+        s.next_slice(b"\x1B]72;t=r:x=1\x1B\\");
+        assert_bytes(b"\x1b]72;t=r:x=1:m=0;aGVsbG8=\x1b\\\x1b]72;t=r:x=1\x1b\\", &pty_all());
+        pty_reset();
+
+        s.next_slice(b"\x1B]72;t=r\x1B\\");
+        assert_bytes(b"", &pty_all());
+        assert!(s.handler.terminal.kitty_dnd.as_ref().unwrap().drop.items.is_none());
+    }
+
+    #[test]
+    fn kitty_dnd_state_updates_work_without_write_pty_effect() {
+        let mut t = term(80, 24);
+        let mut s = stream(Handler::init(&mut t));
+
+        // Queries produce no output (nowhere to write) but registration
+        // state still updates.
+        s.next_slice(b"\x1B]72;t=q\x1B\\");
+        s.next_slice(b"\x1B]72;t=a\x1B\\");
+        assert!(s.handler.terminal.kitty_dnd.is_some());
+
+        // The terminal remains functional.
+        s.next_slice(b"ok");
+        assert_eq!("ok", plain(s.handler.terminal));
+    }
+
+    #[test]
+    fn kitty_dnd_registration_survives_terminal_reset() {
+        pty_reset();
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pty_write);
+        let mut s = stream(handler);
+
+        // Start a chunked command, then reset mid-chunk.
+        s.next_slice(b"\x1B]72;t=a:i=5\x1B\\");
+        s.next_slice(b"\x1B]72;t=m:o=1:m=1;text/pl\x1B\\");
+        s.next_slice(b"\x1Bc");
+
+        // Registration survives (matching kitty), chunking was interrupted
+        // so a new command is not treated as a continuation.
+        assert!(s.handler.terminal.kitty_dnd.is_some());
+        assert!(!s.handler.terminal.kitty_dnd.as_ref().unwrap().chunking.active);
+        s.next_slice(b"\x1B]72;t=q\x1B\\");
+        assert_bytes(b"\x1b]72;t=q\x1b\\", &pty_all());
+    }
+
+    #[test]
+    fn kitty_dnd_effect_reports_registration_acceptance_and_conclusion() {
+        thread_local! {
+            static EVENTS: RefCell<Vec<kitty_dnd::Event>> = const { RefCell::new(Vec::new()) };
+            static MIMES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        fn drag_and_drop(handler: &mut Handler<'_>, ev: kitty_dnd::Event) {
+            EVENTS.with(|e| e.borrow_mut().push(ev));
+            // Registration details are read from the terminal state.
+            if ev == kitty_dnd::Event::Registration {
+                MIMES.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.clear();
+                    let Some(state) = handler.terminal.kitty_dnd.as_ref() else {
+                        return;
+                    };
+                    for mime in state.registered_mimes() {
+                        m.extend_from_slice(mime);
+                        m.push(b',');
+                    }
+                });
+            }
+        }
+        let events = || EVENTS.with(|e| e.borrow().clone());
+        let mimes = || MIMES.with(|m| m.borrow().clone());
+
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.drag_and_drop = Some(drag_and_drop);
+        let mut s = stream(handler);
+
+        // Registration with a MIME list, read back from the state.
+        s.next_slice(b"\x1B]72;t=a;image/png text/plain\x1B\\");
+        assert_eq!(1, events().len());
+        assert_eq!(kitty_dnd::Event::Registration, events()[0]);
+        assert_bytes(b"image/png,text/plain,", &mimes());
+
+        // A native drag and the client's answer.
+        {
+            let mut aw: Vec<u8> = Vec::new();
+            s.handler
+                .terminal
+                .kitty_dnd
+                .as_mut()
+                .unwrap()
+                .drag_drop(
+                    &mut aw,
+                    kitty_dnd::MoveEvent {
+                        operations: kitty_dnd::Operations {
+                            copy: true,
+                            r#move: false,
+                        },
+                        ..Default::default()
+                    },
+                    &[kitty_dnd::Item {
+                        mime: b"text/plain",
+                        data: b"x",
+                    }],
+                )
+                .unwrap();
+        }
+        s.next_slice(b"\x1B]72;t=m:o=2;text/plain\x1B\\");
+        assert_eq!(2, events().len());
+        assert_eq!(kitty_dnd::Event::Acceptance, events()[1]);
+
+        // Conclusion carries the performed operation.
+        s.next_slice(b"\x1B]72;t=r:o=2\x1B\\");
+        assert_eq!(3, events().len());
+        assert_eq!(kitty_dnd::Event::ConcludedMove, events()[2]);
+
+        // Unregistration reports with the state gone.
+        s.next_slice(b"\x1B]72;t=A\x1B\\");
+        assert_eq!(4, events().len());
+        assert_eq!(kitty_dnd::Event::Registration, events()[3]);
+        assert!(s.handler.terminal.kitty_dnd.is_none());
+        assert_bytes(b"", &mimes());
+    }
+
+    /// Capture state for the Handler.paste tests below: every pty write and
+    /// the clipboard reads the program makes afterwards.
+    #[derive(Default)]
+    struct PasteCapture {
+        written: Vec<u8>,
+        write_count: usize,
+        read_count: usize,
+        read_granted_count: usize,
+        last_read_granted: bool,
+        last_read_name: Vec<u8>,
+    }
+
+    thread_local! {
+        static PC: RefCell<PasteCapture> = RefCell::new(PasteCapture::default());
+    }
+
+    fn pc<R>(f: impl FnOnce(&mut PasteCapture) -> R) -> R {
+        PC.with(|c| f(&mut c.borrow_mut()))
+    }
+
+    fn pc_reset() {
+        pc(|c| *c = PasteCapture::default());
+    }
+
+    fn pc_written() -> Vec<u8> {
+        pc(|c| c.written.clone())
+    }
+
+    fn pc_write_count() -> usize {
+        pc(|c| c.write_count)
+    }
+
+    fn pc_write_pty(_: &mut Handler<'_>, data: &[u8]) {
+        pc(|c| {
+            c.written.extend_from_slice(data);
+            c.write_count += 1;
+        });
+    }
+
+    fn pc_clipboard_read(_: &mut Handler<'_>, read: clipboard::Read<'_>) {
+        pc(|c| {
+            c.read_count += 1;
+            c.last_read_granted = read.granted;
+            if read.granted {
+                c.read_granted_count += 1;
+            }
+            c.last_read_name = read.name.to_vec();
+        });
+        const GHOSTTY: &[clipboard::Content<'static>] = &[clipboard::Content {
+            mime: b"text/plain",
+            data: b"Ghostty",
+        }];
+        read.reply(clipboard::ReadResult::Success(clipboard::ReadSuccess {
+            contents: GHOSTTY,
+            ..Default::default()
+        }));
+    }
+
+    fn mem_paste<'a>(contents: &'a [clipboard::Content<'a>]) -> Paste<'a> {
+        Paste::new(paste_pkg::Contents::Memory(contents))
+    }
+
+    fn text_plain(data: &[u8]) -> [clipboard::Content<'_>; 1] {
+        [clipboard::Content {
+            mime: b"text/plain",
+            data,
+        }]
+    }
+
+    #[test]
+    fn paste_no_write_pty_effect_is_an_error() {
+        let mut t = term(80, 24);
+        let mut handler = Handler::init(&mut t);
+        assert_eq!(
+            Err(PasteError::NoWritePty),
+            handler.paste(mem_paste(&text_plain(b"hello")))
+        );
+        handler.deinit();
+    }
+
+    #[test]
+    fn paste_plain_text_converts_newlines_and_strips_unsafe_bytes() {
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        // Newlines are unsafe unbracketed; the embedder confirmed.
+        assert!(handler
+            .paste(Paste {
+                allow_unsafe: true,
+                ..mem_paste(&text_plain(b"hel\x1blo\nwor\x00ld"))
+            })
+            .unwrap());
+        assert_bytes(b"hel lo\rwor ld", &pc_written());
+        assert_eq!(1, pc_write_count());
+
+        // The first text representation is used; others are ignored.
+        pc_reset();
+        let contents = [
+            clipboard::Content {
+                mime: b"image/png",
+                data: b"\x89PNG",
+            },
+            clipboard::Content {
+                mime: b"UTF8_STRING",
+                data: b"hi",
+            },
+            clipboard::Content {
+                mime: b"text/plain",
+                data: b"ignored",
+            },
+        ];
+        assert!(handler.paste(mem_paste(&contents)).unwrap());
+        assert_bytes(b"hi", &pc_written());
+        assert_eq!(1, pc_write_count());
+    }
+
+    #[test]
+    fn paste_unsafe_text_is_refused_unless_allowed() {
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        assert_eq!(
+            Err(PasteError::UnsafePaste),
+            handler.paste(mem_paste(&text_plain(b"rm -rf /\n")))
+        );
+        assert_eq!(0, pc_write_count());
+
+        assert!(handler
+            .paste(Paste {
+                allow_unsafe: true,
+                ..mem_paste(&text_plain(b"rm -rf /\n"))
+            })
+            .unwrap());
+        assert_bytes(b"rm -rf /\r", &pc_written());
+
+        // A carriage return is the Enter key on the input stream, so it
+        // is refused exactly like a newline.
+        pc_reset();
+        assert_eq!(
+            Err(PasteError::UnsafePaste),
+            handler.paste(mem_paste(&text_plain(b"rm -rf /\r")))
+        );
+        assert_eq!(0, pc_write_count());
+
+        assert!(handler
+            .paste(Paste {
+                allow_unsafe: true,
+                ..mem_paste(&text_plain(b"rm -rf /\r"))
+            })
+            .unwrap());
+        assert_bytes(b"rm -rf /\r", &pc_written());
+    }
+
+    #[test]
+    fn paste_bracketed_paste_frames_the_text() {
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::BracketedPaste, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        // Line terminators are safe inside the frame and are preserved.
+        assert!(handler.paste(mem_paste(&text_plain(b"hello\nworld"))).unwrap());
+        assert_bytes(b"\x1b[200~hello\nworld\x1b[201~", &pc_written());
+        assert_eq!(1, pc_write_count());
+
+        pc_reset();
+        assert!(handler.paste(mem_paste(&text_plain(b"hello\r\nworld"))).unwrap());
+        assert_bytes(b"\x1b[200~hello\r\nworld\x1b[201~", &pc_written());
+
+        // The frame terminator is not.
+        pc_reset();
+        assert_eq!(
+            Err(PasteError::UnsafePaste),
+            handler.paste(mem_paste(&text_plain(b"he\x1b[201~llo")))
+        );
+        assert_eq!(0, pc_write_count());
+
+        // Allowed, the stripper still defuses it: ESC becomes a space.
+        assert!(handler
+            .paste(Paste {
+                allow_unsafe: true,
+                ..mem_paste(&text_plain(b"he\x1b[201~llo"))
+            })
+            .unwrap());
+        assert_bytes(b"\x1b[200~he [201~llo\x1b[201~", &pc_written());
+    }
+
+    #[test]
+    fn paste_no_text_representation_writes_nothing() {
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        let png = [clipboard::Content {
+            mime: b"image/png",
+            data: b"\x89PNG",
+        }];
+        assert!(!handler.paste(mem_paste(&png)).unwrap());
+        assert!(!handler.paste(mem_paste(&[])).unwrap());
+        assert!(!handler.paste(mem_paste(&text_plain(b""))).unwrap());
+        assert_eq!(0, pc_write_count());
+    }
+
+    #[test]
+    fn paste_large_text_streams_to_the_pty_in_chunks() {
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::BracketedPaste, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        // Two full chunks and a partial one with the frame, never the
+        // whole thing at once.
+        let data = [b'x'; 10_000];
+        assert!(handler.paste(mem_paste(&text_plain(&data))).unwrap());
+        let total = data.len() + b"\x1b[200~\x1b[201~".len();
+        assert_eq!(total.div_ceil(PASTE_CHUNK_SIZE), pc_write_count());
+        let written = pc_written();
+        assert_eq!(total, written.len());
+        assert!(written.starts_with(b"\x1b[200~xxx"));
+        assert!(written.ends_with(b"xxx\x1b[201~"));
+    }
+
+    /// A paste contents reader for the tests: serves fixed data per MIME
+    /// type in pieces, counting the reads of each representation.
+    struct PasteReader {
+        mimes: &'static [&'static [u8]],
+        data: &'static [&'static [u8]],
+        piece: usize,
+        reads: [usize; 4],
+        /// Fail after this many bytes of a read.
+        fail_after: Option<usize>,
+    }
+
+    impl PasteReader {
+        fn new(mimes: &'static [&'static [u8]], data: &'static [&'static [u8]]) -> PasteReader {
+            PasteReader {
+                mimes,
+                data,
+                piece: 3,
+                reads: [0; 4],
+                fail_after: None,
+            }
+        }
+
+        fn contents(&mut self) -> paste_pkg::Contents<'static> {
+            paste_pkg::Contents::Reader(paste_pkg::Reader {
+                mimes: self.mimes,
+                read: clipboard::MimeReader {
+                    ctx: self as *mut PasteReader as *mut c_void,
+                    read_fn: PasteReader::read,
+                },
+            })
+        }
+
+        fn read(
+            ctx: *mut c_void,
+            mime: &[u8],
+            sink: &mut dyn std::io::Write,
+        ) -> Result<(), clipboard::MimeReaderError> {
+            // SAFETY: `contents` passes a pointer to a live reader.
+            let this = unsafe { &mut *(ctx as *mut PasteReader) };
+            let Some(index) = this.mimes.iter().position(|m| *m == mime) else {
+                return Err(clipboard::MimeReaderError::ReadFailed);
+            };
+            this.reads[index] += 1;
+            let data = this.data[index];
+            let mut offset: usize = 0;
+            while offset < data.len() {
+                if let Some(limit) = this.fail_after {
+                    if offset >= limit {
+                        return Err(clipboard::MimeReaderError::ReadFailed);
+                    }
+                }
+                let n = this.piece.min(data.len() - offset);
+                sink.write_all(&data[offset..offset + n])?;
+                offset += n;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paste_reader_contents_are_read_on_demand() {
+        let _guard = sys::RANDOM_SECURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+
+        // Unsafe text is refused from one read with nothing written; the
+        // image is never read.
+        let mut reader = PasteReader::new(&[b"image/png", b"text/plain"], &[b"\x89PNG", b"echo hi\nrm -rf /\n"]);
+        assert_eq!(Err(PasteError::UnsafePaste), handler.paste(Paste::new(reader.contents())));
+        assert_eq!(0, pc_write_count());
+        assert_eq!(0, reader.reads[0]);
+        assert_eq!(1, reader.reads[1]);
+
+        // Allowed, the text is read once, encoded.
+        reader.reads = [0; 4];
+        assert!(handler
+            .paste(Paste {
+                allow_unsafe: true,
+                ..Paste::new(reader.contents())
+            })
+            .unwrap());
+        assert_bytes(b"echo hi\rrm -rf /\r", &pc_written());
+        assert_eq!(0, reader.reads[0]);
+        assert_eq!(1, reader.reads[1]);
+
+        // Safe text is read once too: buffered for the check, then written.
+        pc_reset();
+        let mut reader = PasteReader::new(&[b"text/plain"], &[b"hello world"]);
+        assert!(handler.paste(Paste::new(reader.contents())).unwrap());
+        assert_bytes(b"hello world", &pc_written());
+        assert_eq!(1, reader.reads[0]);
+
+        // Empty text is nothing to paste, found on the one read.
+        pc_reset();
+        let mut reader = PasteReader::new(&[b"text/plain"], &[b""]);
+        assert!(!handler.paste(Paste::new(reader.contents())).unwrap());
+        assert_eq!(0, pc_write_count());
+        assert_eq!(1, reader.reads[0]);
+
+        // A paste event lists the types and reads nothing at all.
+        pc_reset();
+        handler.terminal.modes.set(Mode::KittyPasteEvents, true);
+        let mut reader = PasteReader::new(&[b"text/plain", b"image/png"], &[b"secret", b"\x89PNG"]);
+        assert!(handler.paste(Paste::new(reader.contents())).unwrap());
+        let written = pc_written();
+        assert!(contains(&written, b";dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\"));
+        assert!(!contains(&written, b"secret"));
+        assert_eq!(0, reader.reads[0]);
+        assert_eq!(0, reader.reads[1]);
+    }
+
+    #[test]
+    fn paste_reader_failure_writes_nothing() {
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::BracketedPaste, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        // The read is buffered whole before anything is written, so a
+        // mid-read failure discards the buffer, checked or not.
+        let mut reader = PasteReader::new(&[b"text/plain"], &[b"hello world"]);
+        reader.fail_after = Some(6);
+        assert_eq!(Err(PasteError::ReadFailed), handler.paste(Paste::new(reader.contents())));
+        assert_eq!(0, pc_write_count());
+
+        assert_eq!(
+            Err(PasteError::ReadFailed),
+            handler.paste(Paste {
+                allow_unsafe: true,
+                ..Paste::new(reader.contents())
+            })
+        );
+        assert_eq!(0, pc_write_count());
+    }
+
+    #[test]
+    fn paste_mode_5522_sends_an_event_the_program_can_read_with() {
+        let _guard = sys::RANDOM_SECURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::KittyPasteEvents, true);
+        t.modes.set(Mode::BracketedPaste, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+        let mut s = stream(handler);
+
+        // Every representation is listed, the data is never written, and
+        // the one-time password rides on every packet.
+        let contents = [
+            clipboard::Content {
+                mime: b"text/plain",
+                data: b"secret",
+            },
+            clipboard::Content {
+                mime: b"image/png",
+                data: b"",
+            },
+        ];
+        assert!(s.handler.paste(mem_paste(&contents)).unwrap());
+        assert_eq!(1, pc_write_count());
+        let written = pc_written();
+        assert_eq!(3, count(&written, b"\x1b]5522;"));
+        assert!(!contains(&written, b"secret"));
+        assert!(!contains(&written, b"\x1b[200~"));
+
+        // OK packet: parse the (base64) password out.
+        let ok_prefix: &[u8] = b"\x1b]5522;type=read:status=OK:pw=";
+        assert!(written.starts_with(ok_prefix));
+        let pw_end = ok_prefix.len() + memchr::memmem::find(&written[ok_prefix.len()..], b"\x1b\\").unwrap();
+        // Copied out since the capture buffer is reused below.
+        let pw_b64 = String::from_utf8(written[ok_prefix.len()..pw_end].to_vec()).unwrap();
+        assert_eq!(kitty_clipboard::OTP_LEN.div_ceil(3) * 4, pw_b64.len());
+
+        // Listing packet: base64 of "text/plain image/png\n".
+        let expected = format!(
+            "\x1b]5522;type=read:status=OK:pw={pw}\x1b\\\
+             \x1b]5522;type=read:status=DATA:mime=Lg==:pw={pw};dGV4dC9wbGFpbiBpbWFnZS9wbmcK\x1b\\\
+             \x1b]5522;type=read:status=DONE:pw={pw}\x1b\\",
+            pw = pw_b64
+        );
+        assert_bytes(expected.as_bytes(), &written);
+
+        // The program reads with the password and the name "Paste event":
+        // the read arrives granted, exactly once.
+        let read = format!(
+            "\x1b]5522;type=read:pw={}:name=UGFzdGUgZXZlbnQ=;dGV4dC9wbGFpbg==\x1b\\",
+            pw_b64
+        );
+        pc_reset();
+        s.next_slice(read.as_bytes());
+        assert_eq!(1, pc(|c| c.read_count));
+        assert!(pc(|c| c.last_read_granted));
+        assert_bytes(b"Paste event", &pc(|c| c.last_read_name.clone()));
+        assert_bytes(
+            b"\x1b]5522;type=read:status=OK\x1b\\\
+              \x1b]5522;type=read:status=DATA:mime=dGV4dC9wbGFpbg==;R2hvc3R0eQ==\x1b\\\
+              \x1b]5522;type=read:status=DONE\x1b\\",
+            &pc_written(),
+        );
+
+        // The password was one-time: a second read is not granted.
+        pc_reset();
+        s.next_slice(read.as_bytes());
+        assert_eq!(1, pc(|c| c.read_count));
+        assert!(!pc(|c| c.last_read_granted));
+        assert_eq!(0, pc(|c| c.read_granted_count));
+
+        // Every event mints a fresh password.
+        pc_reset();
+        assert!(s.handler.paste(mem_paste(&text_plain(b"secret"))).unwrap());
+        assert!(!contains(&pc_written(), pw_b64.as_bytes()));
+    }
+
+    #[test]
+    fn paste_mode_5522_reports_the_selection_as_primary() {
+        let _guard = sys::RANDOM_SECURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::KittyPasteEvents, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+
+        for location in [clipboard::Location::PRIMARY, clipboard::Location::SELECTION] {
+            pc_reset();
+            assert!(handler
+                .paste(Paste {
+                    source: paste_pkg::Source::Clipboard(location),
+                    ..mem_paste(&text_plain(b"x"))
+                })
+                .unwrap());
+            let written = pc_written();
+            assert!(written.starts_with(b"\x1b]5522;type=read:status=OK:loc=primary:pw="));
+            // Only on the OK packet.
+            assert_eq!(1, count(&written, b"loc=primary"));
+        }
+
+        pc_reset();
+        assert!(handler
+            .paste(Paste {
+                source: paste_pkg::Source::Clipboard(clipboard::Location::STANDARD),
+                ..mem_paste(&text_plain(b"x"))
+            })
+            .unwrap());
+        assert!(!contains(&pc_written(), b"loc="));
+    }
+
+    #[test]
+    fn paste_mode_5522_without_clipboard_read_pastes_text() {
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::KittyPasteEvents, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+
+        assert!(handler.paste(mem_paste(&text_plain(b"hello"))).unwrap());
+        assert_bytes(b"hello", &pc_written());
+        assert_eq!(0, handler.kitty_clipboard_grants.len());
+    }
+
+    #[test]
+    fn paste_text_source_never_becomes_an_event() {
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::KittyPasteEvents, true);
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+
+        assert!(handler
+            .paste(Paste {
+                source: paste_pkg::Source::Text,
+                ..mem_paste(&text_plain(b"committed"))
+            })
+            .unwrap());
+        assert_bytes(b"committed", &pc_written());
+        assert_eq!(0, handler.kitty_clipboard_grants.len());
+    }
+
+    #[test]
+    fn paste_mode_5522_without_entropy_fails_and_records_no_grant() {
+        // Port note: Zig initializes the terminal with `std.Io.failing`;
+        // the handler's entropy source (`Handler::io`) fails here instead.
+        fn failing(_: &mut [u8]) -> Result<(), sys::RandomSecureError> {
+            Err(sys::RandomSecureError::EntropyUnavailable)
+        }
+
+        let _guard = sys::RANDOM_SECURE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = term(80, 24);
+        pc_reset();
+        t.modes.set(Mode::KittyPasteEvents, true);
+        let mut handler = Handler::init(&mut t);
+        handler.io = failing;
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+
+        assert_eq!(
+            Err(PasteError::EntropyUnavailable),
+            handler.paste(mem_paste(&text_plain(b"secret")))
+        );
+        assert_eq!(0, pc_write_count());
+        assert_eq!(0, handler.kitty_clipboard_grants.len());
+
+        // Text pastes need no entropy and still work.
+        assert!(handler
+            .paste(Paste {
+                source: paste_pkg::Source::Text,
+                ..mem_paste(&text_plain(b"hello"))
+            })
+            .unwrap());
+        assert_bytes(b"hello", &pc_written());
+    }
+
+    #[test]
+    fn paste_mode_5522_decrqm_requires_clipboard_read_effect() {
+        if build_options::ARTIFACT != build_options::Artifact::Lib {
+            return;
+        }
+
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        let mut s = stream(handler);
+
+        // A paste event is unusable if its follow-up read can't be served, so
+        // the mode isn't advertised without a clipboard read effect.
+        s.next_slice(b"\x1B[?5522$p");
+        assert_bytes(b"\x1B[?5522;0$y", &pc_written());
+
+        pc_reset();
+        s.next_slice(b"\x1B[?5522h");
+        assert!(s.handler.terminal.modes.get(Mode::KittyPasteEvents));
+        s.next_slice(b"\x1B[?5522$p");
+        assert_bytes(b"\x1B[?5522;0$y", &pc_written());
+
+        // Installing the effect makes the current mode state reportable.
+        pc_reset();
+        s.handler.effects.clipboard_read = Some(pc_clipboard_read);
+        s.next_slice(b"\x1B[?5522$p");
+        assert_bytes(b"\x1B[?5522;1$y", &pc_written());
+
+        pc_reset();
+        s.next_slice(b"\x1B[?5522l");
+        assert!(!s.handler.terminal.modes.get(Mode::KittyPasteEvents));
+        s.next_slice(b"\x1B[?5522$p");
+        assert_bytes(b"\x1B[?5522;2$y", &pc_written());
+
+        // Removing the effect stops advertising the capability again.
+        pc_reset();
+        s.handler.effects.clipboard_read = None;
+        s.next_slice(b"\x1B[?5522$p");
+        assert_bytes(b"\x1B[?5522;0$y", &pc_written());
+    }
+
+    #[test]
+    fn full_reset_drops_kitty_clipboard_grants() {
+        let mut t = term(80, 24);
+        pc_reset();
+        let mut handler = Handler::init(&mut t);
+        handler.effects.write_pty = Some(pc_write_pty);
+        handler.effects.clipboard_read = Some(pc_clipboard_read);
+        let mut s = stream(handler);
+
+        s.handler.kitty_clipboard_grants.grant(b"pw", GrantDirection::Read, false);
+        assert_eq!(1, s.handler.kitty_clipboard_grants.len());
+
+        s.next_slice(b"\x1Bc");
+        assert_eq!(0, s.handler.kitty_clipboard_grants.len());
+
+        // A read with the old password is no longer granted, and the
+        // handler keeps working (grants can be recorded again).
+        pc_reset();
+        s.next_slice(b"\x1b]5522;type=read:pw=cHc=:name=YXBw;dGV4dC9wbGFpbg==\x1b\\");
+        assert_eq!(1, pc(|c| c.read_count));
+        assert!(!pc(|c| c.last_read_granted));
+        s.handler.kitty_clipboard_grants.grant(b"pw", GrantDirection::Read, false);
+    }
 }
