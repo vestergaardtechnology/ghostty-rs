@@ -1,6 +1,6 @@
 //! Port of `src/terminal/tmux.zig`.
 //!
-//! STATUS: partial — `Viewer` re-export pending (tmux/viewer.zig not yet ported).
+//! STATUS: ported
 //!
 //! Types and functions related to tmux protocols.
 
@@ -18,4 +18,4 @@ pub mod viewer;
 pub use control::Notification as ControlNotification;
 pub use control::Parser as ControlParser;
 pub use layout::Layout;
-// TODO: `pub use viewer::Viewer;` once tmux/viewer.zig is ported.
+pub use viewer::Viewer;
